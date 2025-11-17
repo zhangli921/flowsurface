@@ -14,6 +14,7 @@ pub trait Indicator: PartialEq + Display + 'static {
 pub enum KlineIndicator {
     Volume,
     OpenInterest,
+    CumulativeDelta,
 }
 
 impl Indicator for KlineIndicator {
@@ -29,9 +30,13 @@ impl KlineIndicator {
     // Indicator togglers on UI menus depend on these arrays.
     // Every variant needs to be in either SPOT, PERPS or both.
     /// Indicators that can be used with spot market tickers
-    const FOR_SPOT: [KlineIndicator; 1] = [KlineIndicator::Volume];
+    const FOR_SPOT: [KlineIndicator; 2] = [KlineIndicator::Volume, KlineIndicator::CumulativeDelta];
     /// Indicators that can be used with perpetual swap market tickers
-    const FOR_PERPS: [KlineIndicator; 2] = [KlineIndicator::Volume, KlineIndicator::OpenInterest];
+    const FOR_PERPS: [KlineIndicator; 3] = [
+        KlineIndicator::Volume,
+        KlineIndicator::OpenInterest,
+        KlineIndicator::CumulativeDelta,
+    ];
 }
 
 impl Display for KlineIndicator {
@@ -39,6 +44,7 @@ impl Display for KlineIndicator {
         match self {
             KlineIndicator::Volume => write!(f, "Volume"),
             KlineIndicator::OpenInterest => write!(f, "Open Interest"),
+            KlineIndicator::CumulativeDelta => write!(f, "Cumulative Delta"),
         }
     }
 }

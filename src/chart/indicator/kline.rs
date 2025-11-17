@@ -6,6 +6,7 @@ use data::chart::kline::KlineDataPoint;
 use exchange::fetcher::FetchRange;
 use exchange::{Kline, Timeframe, Trade};
 
+pub mod cumulative_delta;
 pub mod open_interest;
 pub mod volume;
 
@@ -62,6 +63,9 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         KlineIndicator::Volume => Box::new(super::kline::volume::VolumeIndicator::new()),
         KlineIndicator::OpenInterest => {
             Box::new(super::kline::open_interest::OpenInterestIndicator::new())
+        }
+        KlineIndicator::CumulativeDelta => {
+            Box::new(super::kline::cumulative_delta::CumulativeDeltaIndicator::new())
         }
     }
 }

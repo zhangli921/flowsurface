@@ -9,6 +9,7 @@ use crate::chart::{
     ViewState,
     indicator::plot::{Plot, PlotTooltip, Series, TooltipFn, YScale},
 };
+use data::chart::Basis;
 
 pub struct LinePlot<V, T> {
     pub value: V,
@@ -124,19 +125,33 @@ where
             color,
         );
 
+        let expected_interval_ms = if let Basis::Time(tf) = ctx.basis {
+            tf.to_milliseconds()
+        } else {
+            0
+        };
+
         // Polyline
-        let mut prev: Option<(f32, f32)> = None;
-        datapoints.for_each_in(range.clone(), |x, y| {
-            let sx = ctx.interval_to_x(x) - (ctx.cell_width / 2.0);
+        let mut prev: Option<(u64, f32, f32)> = None;
+        datapoints.for_each_in(range.clone(), |x_timestamp, y| {
+            let sx = ctx.interval_to_x(x_timestamp) - (ctx.cell_width / 2.0);
             let vy = (self.value)(y);
             let sy = scale.to_y(vy);
-            if let Some((px, py)) = prev {
-                frame.stroke(
-                    &Path::line(iced::Point::new(px, py), iced::Point::new(sx, sy)),
-                    stroke,
-                );
+            if let Some((prev_timestamp, px, py)) = prev {
+                let time_diff = x_timestamp.saturating_sub(prev_timestamp);
+                
+                // If the time gap between points is more than 1.5x the expected interval,
+                // do not draw a connecting line. This prevents vertical lines on data gaps.
+                if expected_interval_ms > 0 && time_diff > expected_interval_ms + (expected_interval_ms / 2) {
+                    // Gap detected, do nothing
+                } else {
+                    frame.stroke(
+                        &Path::line(iced::Point::new(px, py), iced::Point::new(sx, sy)),
+                        stroke,
+                    );
+                }
             }
-            prev = Some((sx, sy));
+            prev = Some((x_timestamp, sx, sy));
         });
 
         if self.show_points {
