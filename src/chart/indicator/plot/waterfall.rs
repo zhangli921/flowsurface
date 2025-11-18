@@ -45,27 +45,36 @@ where
     fn y_extents(&self, datapoints: &S, range: RangeInclusive<u64>) -> Option<(f32, f32)> {
         let mut min_v = f32::MAX;
         let mut max_v = f32::MIN;
-        let mut n = 0u32;
+        let mut has_data = false;
 
-        // The extents are based on the cumulative value
-        datapoints.for_each_in(range, |_, y| {
-            let (_, cumulative) = (self.value)(y);
-            if cumulative < min_v {
-                min_v = cumulative;
+        let mut update_extents = |val| {
+            if val < min_v {
+                min_v = val;
             }
-            if cumulative > max_v {
-                max_v = cumulative;
+            if val > max_v {
+                max_v = val;
             }
-            n += 1;
-        });
+            has_data = true;
+        };
 
-        if n == 0 {
-            return None;
+        // The extents are based on the cumulative value.
+        // We must also consider the cumulative value of the point just before the
+        // visible range, as it's used as the baseline for the first bar.
+        if let Some(start_key) = range.start().checked_sub(1) {
+            if let Some(y) = datapoints.at(start_key) {
+                let (_, cumulative) = (self.value)(y);
+                update_extents(cumulative);
+            }
         }
 
-        // Also consider the baseline of the first bar, which is 0
-        min_v = min_v.min(0.0);
-        max_v = max_v.max(0.0);
+        datapoints.for_each_in(range, |_, y| {
+            let (_, cumulative) = (self.value)(y);
+            update_extents(cumulative);
+        });
+
+        if !has_data {
+            return None;
+        }
 
         Some((min_v, max_v))
     }
