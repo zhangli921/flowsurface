@@ -10,6 +10,7 @@ use std::ops::RangeInclusive;
 
 pub mod bar;
 pub mod line;
+pub mod waterfall;
 
 pub trait Series {
     type Y;

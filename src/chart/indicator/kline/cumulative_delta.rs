@@ -4,8 +4,8 @@ use crate::chart::{
         indicator_row,
         kline::KlineIndicatorImpl,
         plot::{
+            waterfall::WaterfallPlot, // Use the new plot type
             PlotTooltip,
-            line::LinePlot,
         },
     },
 };
@@ -19,7 +19,8 @@ use std::ops::RangeInclusive;
 
 pub struct CumulativeDeltaIndicator {
     cache: Caches,
-    data: BTreeMap<u64, f32>,
+    // Store (delta, cumulative_delta)
+    data: BTreeMap<u64, (f32, f32)>,
 }
 
 impl CumulativeDeltaIndicator {
@@ -35,11 +36,13 @@ impl CumulativeDeltaIndicator {
         main_chart: &'a ViewState,
         visible_range: RangeInclusive<u64>,
     ) -> iced::Element<'a, Message> {
-        let tooltip = |&value: &f32, _next: Option<&f32>| {
-            PlotTooltip::new(format!("Cumulative Delta: {}", format_with_commas(value)))
+        let tooltip = |&(delta, cum_delta): &(f32, f32), _next: Option<&(f32, f32)>| {
+            let delta_t = format!("Delta: {}", format_with_commas(delta));
+            let cum_delta_t = format!("Cumulative Delta: {}", format_with_commas(cum_delta));
+            PlotTooltip::new(format!("{delta_t}\n{cum_delta_t}"))
         };
 
-        let plot = LinePlot::new(|&v: &f32| v)
+        let plot = WaterfallPlot::new(|v: &(f32, f32)| *v)
             .with_tooltip(tooltip);
 
         indicator_row(main_chart, &self.cache, plot, &self.data, visible_range)
@@ -79,7 +82,7 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
                 buy_vol - sell_vol
             };
             cumulative_delta += delta;
-            new_data.insert(time, cumulative_delta);
+            new_data.insert(time, (delta, cumulative_delta)); // Store both
         }
 
         self.data = new_data;
@@ -87,16 +90,25 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
     }
 
     fn on_insert_klines(&mut self, klines: &[Kline]) {
-        let mut last_cumulative_delta = self.data.values().last().copied().unwrap_or(0.0);
-
         for kline in klines {
+            // Calculate the delta for the incoming kline
             let delta = if kline.volume.0 == -1.0 { // bybit workaround
                 kline.volume.1
             } else {
                 kline.volume.0 - kline.volume.1
             };
-            last_cumulative_delta += delta;
-            self.data.insert(kline.time, last_cumulative_delta);
+
+            // Determine the baseline cumulative delta.
+            // This is the cumulative delta of the candle *before* the one we are inserting/updating.
+            let baseline_cumulative = self
+                .data
+                .range(..kline.time) // Get all entries with a key LESS than the current kline's time
+                .next_back()         // Get the last of those entries
+                .map_or(0.0, |(_, v)| v.1); // Get its cumulative value, or 0.0 if none exist
+
+            let new_cumulative = baseline_cumulative + delta;
+
+            self.data.insert(kline.time, (delta, new_cumulative));
         }
         self.clear_all_caches();
     }

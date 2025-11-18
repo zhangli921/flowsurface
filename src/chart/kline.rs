@@ -641,7 +641,7 @@ impl KlineChart {
                 self.indicators
                     .values_mut()
                     .filter_map(Option::as_mut)
-                    .for_each(|indi| indi.on_insert_klines(klines_raw));
+                    .for_each(|indi| indi.rebuild_from_source(&self.data_source));
 
                 if klines_raw.is_empty() {
                     self.request_handler
