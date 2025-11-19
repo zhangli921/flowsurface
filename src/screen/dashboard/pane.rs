@@ -238,7 +238,12 @@ impl State {
                     let streams = by_basis_default(
                         derived_plan.basis,
                         Timeframe::M15,
-                        |tf| vec![kline_stream(derived_plan.ticker_info, tf)],
+                        |tf| {
+                            vec![
+                                kline_stream(derived_plan.ticker_info, tf),
+                                depth_stream(&derived_plan),
+                            ]
+                        },
                         || {
                             let depth_aggr = derived_plan
                                 .ticker_info
@@ -344,7 +349,7 @@ impl State {
     ) {
         match &mut self.content {
             Content::Kline {
-                chart, indicators, ..
+                chart, indicators, kline_config, ..
             } => {
                 let Some(chart) = chart else {
                     panic!("chart wasn't initialized when inserting klines");
@@ -365,6 +370,7 @@ impl State {
                         indicators,
                         ticker_info,
                         chart.kind(),
+                        kline_config.clone(),
                     );
                 }
             }
@@ -745,6 +751,7 @@ impl State {
                 chart,
                 indicators,
                 kind: chart_kind,
+                kline_config,
                 ..
             } => {
                 if let Some(chart) = chart {
@@ -797,7 +804,7 @@ impl State {
                     let settings_modal = || {
                         kline_cfg_view(
                             chart.study_configurator(),
-                            data::chart::kline::Config {},
+                            kline_config.clone(),
                             chart_kind,
                             id,
                             chart.basis(),
@@ -1569,6 +1576,7 @@ pub enum Content {
         indicators: Vec<KlineIndicator>,
         layout: data::chart::ViewConfig,
         kind: data::chart::KlineChartKind,
+        kline_config: data::chart::kline::Config,
     },
     TimeAndSales(Option<TimeAndSales>),
     Ladder(Option<Ladder>),
@@ -1640,20 +1648,22 @@ impl Content {
         settings: &Settings,
         tick_size: f32,
     ) -> Self {
-        let (prev_indis, prev_layout, prev_kind_opt) = if let Content::Kline {
+        let (prev_indis, prev_layout, prev_kind_opt, prev_kline_config) = if let Content::Kline {
             chart,
             indicators,
             kind,
             layout,
+            kline_config,
         } = current_content
         {
             (
                 Some(indicators.clone()),
                 Some(chart.as_ref().map_or(layout.clone(), |c| c.chart_layout())),
                 Some(chart.as_ref().map_or(kind.clone(), |c| c.kind().clone())),
+                Some(kline_config.clone()),
             )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         let (default_tf, determined_chart_kind) = match content_kind {
@@ -1724,6 +1734,7 @@ impl Content {
             &enabled_indicators,
             ticker_info,
             &determined_chart_kind,
+            prev_kline_config.clone().unwrap_or_default(),
         );
 
         Content::Kline {
@@ -1731,6 +1742,7 @@ impl Content {
             indicators: enabled_indicators,
             layout,
             kind: determined_chart_kind,
+            kline_config: prev_kline_config.unwrap_or_default(),
         }
     }
 
@@ -1745,6 +1757,7 @@ impl Content {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
                 },
+                kline_config: data::chart::kline::Config::default(),
             },
             ContentKind::FootprintChart => Content::Kline {
                 chart: None,
@@ -1758,6 +1771,7 @@ impl Content {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
                 },
+                kline_config: data::chart::kline::Config::default(),
             },
             ContentKind::HeatmapChart => Content::Heatmap {
                 chart: None,
