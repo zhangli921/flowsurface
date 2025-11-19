@@ -209,16 +209,10 @@ impl State {
                         derived_plan.tick_size,
                     );
 
-                    let streams = by_basis_default(
+                    let streams = create_kline_chart_streams(
+                        &derived_plan,
                         derived_plan.basis,
                         Timeframe::M5,
-                        |tf| {
-                            vec![
-                                depth_stream(&derived_plan),
-                                kline_stream(derived_plan.ticker_info, tf),
-                            ]
-                        },
-                        || vec![depth_stream(&derived_plan)],
                     );
 
                     (content, streams)
@@ -235,26 +229,10 @@ impl State {
                         )
                     };
 
-                    let streams = by_basis_default(
+                    let streams = create_kline_chart_streams(
+                        &derived_plan,
                         derived_plan.basis,
                         Timeframe::M15,
-                        |tf| {
-                            vec![
-                                kline_stream(derived_plan.ticker_info, tf),
-                                depth_stream(&derived_plan),
-                            ]
-                        },
-                        || {
-                            let depth_aggr = derived_plan
-                                .ticker_info
-                                .exchange()
-                                .stream_ticksize(None, TickMultiplier(50));
-                            let temp = PaneSetup {
-                                depth_aggr,
-                                ..derived_plan
-                            };
-                            vec![depth_stream(&temp)]
-                        },
                     );
 
                     (content, streams)
@@ -2067,4 +2045,32 @@ fn by_basis_default<T>(
         Basis::Time(tf) => on_time(tf),
         Basis::Tick(_) => on_tick(),
     }
+}
+
+fn create_kline_chart_streams(
+    derived_plan: &PaneSetup,
+    basis: Option<Basis>,
+    default_tf: Timeframe,
+) -> Vec<StreamKind> {
+    let kline_stream = |ti: TickerInfo, tf: Timeframe| StreamKind::Kline {
+        ticker_info: ti,
+        timeframe: tf,
+    };
+    let depth_stream = |dp: &PaneSetup| StreamKind::DepthAndTrades {
+        ticker_info: dp.ticker_info,
+        depth_aggr: dp.depth_aggr,
+        push_freq: dp.push_freq,
+    };
+
+    by_basis_default(
+        basis,
+        default_tf,
+        |tf| {
+            vec![
+                kline_stream(derived_plan.ticker_info, tf),
+                depth_stream(derived_plan),
+            ]
+        },
+        || vec![depth_stream(derived_plan)],
+    )
 }
