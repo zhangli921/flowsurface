@@ -9,26 +9,40 @@ mod style;
 mod widget;
 mod window;
 
-use data::config::theme::default_theme;
-use data::{layout::WindowSpec, sidebar};
-use layout::{Layout, configuration};
-use modal::{LayoutManager, ThemeEditor, audio};
-use modal::{dashboard_modal, main_dialog_modal};
+use data::{
+    self,
+    arbiter_service::ArbiterService,
+    config::theme::default_theme,
+    io_service::{IoService, TimeRange},
+    kline::KLine,
+    layout::WindowSpec,
+    sidebar, ArbiterError, ExternalAdapter,
+};
+use layout::{configuration, Layout};
+use modal::{audio, dashboard_modal, main_dialog_modal, LayoutManager, ThemeEditor};
 use screen::dashboard::{self, Dashboard};
+use storage::MmapStore; // Now explicitly imported
 use widget::{
-    confirm_dialog_container,
-    toast::{self, Toast},
-    tooltip,
+    confirm_dialog_container, // Now explicitly imported
+    toast::{self, Manager as ToastManager, Toast}, // Now explicitly imported
+    tooltip,                  // Now explicitly imported
 };
 
 use iced::{
     Alignment, Element, Subscription, Task, keyboard, padding,
     widget::{
-        button, column, container, pane_grid, pick_list, row, rule, scrollable, text,
+        button, column, container, pane_grid, pick_list, row, rule, scrollable, text, // scrollable added
         tooltip::Position as TooltipPosition,
     },
 };
-use std::{borrow::Cow, collections::HashMap, vec};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    env,
+    path::PathBuf,
+    sync::Arc,
+    vec,
+};
 
 fn main() {
     logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
@@ -55,6 +69,7 @@ fn main() {
 struct Flowsurface {
     main_window: window::Window,
     sidebar: dashboard::Sidebar,
+    arbiter: Arc<ArbiterService>,
     layout_manager: LayoutManager,
     theme_editor: ThemeEditor,
     audio_stream: audio::AudioStream,
@@ -71,6 +86,8 @@ enum Message {
     Sidebar(dashboard::sidebar::Message),
     MarketWsEvent(exchange::Event),
     Dashboard(Option<uuid::Uuid>, dashboard::Message),
+    FetchKLines(String, TimeRange),
+    KLineDataFetched(Result<Vec<KLine>, Arc<ArbiterError>>),
     Tick(std::time::Instant),
     WindowEvent(window::Event),
     ExitRequested(HashMap<window::Id, WindowSpec>),
@@ -90,6 +107,37 @@ enum Message {
 
 impl Flowsurface {
     fn new() -> (Self, Task<Message>) {
+        // --- Start of Arbiter Service Initialization ---
+        let mmap_path = {
+            let mut path = env::current_dir().unwrap();
+            if path.ends_with("flowsurface") {
+                // Running from workspace root
+                path.push("test_data.mmap");
+            } else {
+                // Assuming we are in flowsurface/
+                path.pop();
+                path.push("test_data.mmap");
+            }
+            if !path.exists() {
+                // Fallback for release build structure
+                if let Ok(mut exe_path) = env::current_exe() {
+                    exe_path.pop(); // remove binary name
+                    exe_path.push("test_data.mmap");
+                    path = exe_path;
+                }
+            }
+            path
+        };
+
+        let store = MmapStore::open(&mmap_path)
+            .unwrap_or_else(|e| panic!("Failed to open MmapStore at {:?}: {}", mmap_path, e));
+
+        let arbiter = Arc::new(ArbiterService::new(
+            IoService::new(Arc::new(store)),
+            ExternalAdapter::new(),
+        ));
+        // --- End of Arbiter Service Initialization ---
+
         let saved_state = layout::load_saved_state();
 
         let (main_window_id, open_main_window) = {
@@ -107,6 +155,7 @@ impl Flowsurface {
 
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
+            arbiter,
             layout_manager: saved_state.layout_manager,
             theme_editor: ThemeEditor::new(saved_state.custom_theme),
             audio_stream: audio::AudioStream::new(saved_state.audio_cfg),
@@ -171,6 +220,28 @@ impl Flowsurface {
                         return dashboard
                             .update_latest_klines(&stream, &kline, main_window_id)
                             .map(move |msg| Message::Dashboard(None, msg));
+                    }
+                }
+            }
+            Message::FetchKLines(symbol, range) => {
+                let arbiter = self.arbiter.clone();
+                return Task::perform(
+                    async move {
+                        arbiter
+                            .arbitrate_kline_data(symbol, range)
+                            .await
+                            .map_err(Arc::new)
+                    },
+                    Message::KLineDataFetched,
+                );
+            }
+            Message::KLineDataFetched(result) => {
+                match result {
+                    Ok(klines) => {
+                        log::info!("Successfully fetched {} klines.", klines.len());
+                    }
+                    Err(e) => {
+                        log::error!("Failed to fetch klines: {}", e);
                     }
                 }
             }
@@ -638,11 +709,22 @@ impl Flowsurface {
     }
 
     fn load_layout(&mut self, layout: layout::Layout, main_window: window::Id) -> Task<Message> {
+        let arbiter_task = {
+            let now = chrono::Utc::now();
+            let start = now - chrono::Duration::hours(24);
+            let range = TimeRange {
+                start_ns: start.timestamp_nanos_opt().unwrap_or(0) as u64,
+                end_ns: now.timestamp_nanos_opt().unwrap_or(0) as u64,
+            };
+            Task::done(Message::FetchKLines("BTCUSDT".to_string(), range))
+        };
+
         self.layout_manager
             .set_active_layout(layout.clone())
             .expect("Failed to set active layout")
             .load_layout(main_window)
             .map(move |msg| Message::Dashboard(Some(layout.id), msg))
+            .chain(arbiter_task)
     }
 
     fn view_with_modal<'a>(

@@ -186,6 +186,14 @@ impl MmapStore {
     }
 }
 
+// SAFETY: The `MmapStore` is designed to be read-only. The underlying `Mmap` object
+// from `memmap2` is safe to access from multiple threads for read operations.
+// The raw pointer `_mmap_ptr` is stable and the data it points to (the Mmap object)
+// lives for the duration of the `MmapStore` instance. Therefore, it is safe
+// to mark MmapStore as both Send and Sync.
+unsafe impl Send for MmapStore {}
+unsafe impl Sync for MmapStore {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

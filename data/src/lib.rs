@@ -1,7 +1,12 @@
 pub mod aggr;
+pub mod arbiter_error;
+pub mod arbiter_service;
 pub mod audio;
 pub mod chart;
 pub mod config;
+pub mod external_adapter;
+pub mod io_service;
+pub mod kline;
 pub mod layout;
 pub mod loader; // Add this line
 pub mod log;
@@ -21,6 +26,11 @@ pub use config::theme::Theme;
 pub use config::timezone::UserTimezone;
 
 use ::log::{error, info, warn};
+pub use arbiter_error::ArbiterError;
+pub use arbiter_service::ArbiterService;
+pub use external_adapter::ExternalAdapter;
+pub use io_service::{IoService, TimeRange};
+pub use kline::KLine;
 pub use layout::{Dashboard, Layout, Pane};
 
 pub const SAVED_STATE_PATH: &str = "saved-state.json";
