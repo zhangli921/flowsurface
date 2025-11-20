@@ -222,11 +222,10 @@ impl ChaseTracker {
         max_interval: Duration,
     ) {
         let max_ms = max_interval.as_millis() as u64;
-        if let Some(prev) = self.last_update_ms
-            && max_ms > 0
-            && now_ms.saturating_sub(prev) > max_ms
-        {
-            self.reset();
+        if let Some(prev) = self.last_update_ms {
+            if max_ms > 0 && now_ms.saturating_sub(prev) > max_ms {
+                self.reset();
+            }
         }
 
         self.last_update_ms = Some(now_ms);

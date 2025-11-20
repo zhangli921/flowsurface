@@ -32,10 +32,10 @@ pub fn path() -> Result<PathBuf, Error> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error(transparent)]
+    #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error(transparent)]
+    #[error("Failed to set logger: {0:?}")]
     SetLog(#[from] log::SetLoggerError),
-    #[error(transparent)]
+    #[error("Failed to parse log level: {0:?}")]
     ParseLevel(#[from] log::ParseLevelError),
 }
