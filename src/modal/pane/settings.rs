@@ -460,7 +460,6 @@ pub fn comparison_cfg_view<'a>(
 
 pub fn kline_cfg_view<'a>(
     study_config: &'a study::Configurator<FootprintStudy>,
-    cfg: data::chart::kline::Config,
     kind: &'a KlineChartKind,
     pane: pane_grid::Pane,
     basis: data::chart::Basis,
@@ -523,7 +522,7 @@ pub fn kline_cfg_view<'a>(
                 column![text("Studies").size(14), study_cfg].spacing(8),
                 row![
                     space::horizontal(),
-                    sync_all_button(pane, VisualConfig::Kline(cfg))
+                    sync_all_button(pane, VisualConfig::Kline(data::chart::kline::Config::default()))
                 ],
                 ; spacing = 12, align_x = Alignment::Start
             ]
