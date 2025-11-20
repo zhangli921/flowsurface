@@ -86,8 +86,8 @@ impl KlineIndicatorImpl for VolumeIndicator {
 
     fn rebuild_from_source(&mut self, source: &PlotData<KlineDataPoint>) {
         match source {
-            PlotData::TimeBased(timeseries) => {
-                self.data = timeseries.volume_data();
+            PlotData::TimeBased(pyramid) => {
+                self.data = pyramid.volume_data();
             }
             PlotData::TickBased(tickseries) => {
                 self.data = tickseries.volume_data();
@@ -111,7 +111,7 @@ impl KlineIndicatorImpl for VolumeIndicator {
         source: &PlotData<KlineDataPoint>,
     ) {
         match source {
-            PlotData::TimeBased(_) => return,
+            PlotData::TimeBased(_) => {}
             PlotData::TickBased(tickseries) => {
                 let start_idx = old_dp_len.saturating_sub(1);
                 for (idx, dp) in tickseries.datapoints.iter().enumerate().skip(start_idx) {

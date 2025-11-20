@@ -327,7 +327,7 @@ impl State {
     ) {
         match &mut self.content {
             Content::Kline {
-                chart, indicators, kline_config, ..
+                chart, indicators, kline_config: _, ..
             } => {
                 let Some(chart) = chart else {
                     panic!("chart wasn't initialized when inserting klines");
@@ -348,7 +348,6 @@ impl State {
                         indicators,
                         ticker_info,
                         chart.kind(),
-                        kline_config.clone(),
                     );
                 }
             }
@@ -1712,7 +1711,6 @@ impl Content {
             &enabled_indicators,
             ticker_info,
             &determined_chart_kind,
-            prev_kline_config.clone().unwrap_or_default(),
         );
 
         Content::Kline {

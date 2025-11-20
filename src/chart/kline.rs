@@ -5,7 +5,7 @@ use super::{
 use crate::chart::indicator::kline::KlineIndicatorImpl;
 use crate::{modal::pane::settings::study, style};
 use data::aggr::ticks::TickAggr;
-use data::aggr::time::TimeSeries;
+use data::aggr::time::DataPyramid;
 use data::chart::Autoscale;
 use data::chart::kline::ClusterScaling;
 use data::chart::{
@@ -131,7 +131,7 @@ impl Chart for KlineChart {
 
     fn is_empty(&self) -> bool {
         match &self.data_source {
-            PlotData::TimeBased(timeseries) => timeseries.datapoints.is_empty(),
+            PlotData::TimeBased(pyramid) => pyramid.levels.first().map_or(true, |(_, level)| level.is_empty()),
             PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.is_empty(),
         }
     }
@@ -194,7 +194,7 @@ impl KlineChart {
             Basis::Time(interval) => {
                 let step = PriceStep::from_f32(tick_size);
 
-                let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, klines_raw)
+                let timeseries = DataPyramid::<KlineDataPoint>::new(interval, step, klines_raw)
                     .with_trades(&raw_trades);
 
                 let base_price_y = timeseries.base_price();
@@ -334,8 +334,8 @@ impl KlineChart {
 
     pub fn update_latest_kline(&mut self, kline: &Kline) {
         match self.data_source {
-            PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_klines(&[*kline]);
+            PlotData::TimeBased(ref mut pyramid) => {
+                pyramid.insert_klines(&[*kline]);
 
                 self.indicators
                     .values_mut()
@@ -360,14 +360,14 @@ impl KlineChart {
 
     fn missing_data_task(&mut self) -> Option<Action> {
         match &self.data_source {
-            PlotData::TimeBased(timeseries) => {
-                let timeframe_ms = timeseries.interval.to_milliseconds();
+            PlotData::TimeBased(pyramid) => {
+                let timeframe_ms = pyramid.base_interval.to_milliseconds();
 
                 let (visible_earliest, visible_latest) = self.visible_timerange()?;
-                let (kline_earliest, kline_latest) = timeseries.timerange();
+                let (kline_earliest, kline_latest) = pyramid.timerange();
                 let earliest = visible_earliest.saturating_sub(visible_latest - visible_earliest);
 
-                if timeseries.datapoints.is_empty() {
+                if pyramid.levels.first().map_or(true, |(_, level)| level.is_empty()) {
                     let range = FetchRange::Kline(earliest, visible_latest + timeframe_ms);
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
@@ -387,7 +387,7 @@ impl KlineChart {
                 if !self.fetching_trades.0
                     && exchange::fetcher::is_trade_fetch_enabled()
                     && let Some((fetch_from, fetch_to)) =
-                        timeseries.suggest_trade_fetch_range(visible_earliest, visible_latest)
+                        pyramid.suggest_trade_fetch_range(visible_earliest, visible_latest)
                 {
                     let range = FetchRange::Trades(fetch_from, fetch_to);
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
@@ -399,7 +399,7 @@ impl KlineChart {
                 // priority 3, Open Interest data
                 let ctx = indicator::kline::FetchCtx {
                     main_chart: &self.chart,
-                    timeframe: timeseries.interval,
+                    timeframe: pyramid.base_interval,
                     visible_earliest,
                     kline_latest,
                     prefetch_earliest: earliest,
@@ -414,7 +414,7 @@ impl KlineChart {
 
                 // priority 4, missing klines & integrity check
                 if let Some(missing_keys) =
-                    timeseries.check_kline_integrity(kline_earliest, kline_latest, timeframe_ms)
+                    pyramid.check_kline_integrity(kline_earliest, kline_latest, timeframe_ms)
                 {
                     let latest =
                         missing_keys.iter().max().unwrap_or(&visible_latest) + timeframe_ms;
@@ -528,8 +528,8 @@ impl KlineChart {
             PlotData::TickBased(ref mut tick_aggr) => {
                 tick_aggr.change_tick_size(new_tick_size, &self.raw_trades);
             }
-            PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.change_tick_size(new_tick_size, &self.raw_trades);
+            PlotData::TimeBased(ref mut pyramid) => {
+                pyramid.change_tick_size(new_tick_size, &self.raw_trades);
             }
         }
 
@@ -548,7 +548,7 @@ impl KlineChart {
         match new_basis {
             Basis::Time(interval) => {
                 let step = self.chart.tick_size;
-                let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, &[]);
+                let timeseries = DataPyramid::<KlineDataPoint>::new(interval, step, &[]);
                 self.data_source = PlotData::TimeBased(timeseries);
             }
             Basis::Tick(tick_count) => {
@@ -609,8 +609,8 @@ impl KlineChart {
 
                 self.invalidate(None);
             }
-            PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(trades_buffer);
+            PlotData::TimeBased(ref mut pyramid) => {
+                pyramid.insert_trades_existing_buckets(trades_buffer);
             }
         }
     }
@@ -620,8 +620,8 @@ impl KlineChart {
             PlotData::TickBased(ref mut tick_aggr) => {
                 tick_aggr.insert_trades(&raw_trades);
             }
-            PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(&raw_trades);
+            PlotData::TimeBased(ref mut pyramid) => {
+                pyramid.insert_trades_existing_buckets(&raw_trades);
             }
         }
 
@@ -634,9 +634,9 @@ impl KlineChart {
 
     pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
         match self.data_source {
-            PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_klines(klines_raw);
-                timeseries.insert_trades_existing_buckets(&self.raw_trades);
+            PlotData::TimeBased(ref mut pyramid) => {
+                pyramid.insert_klines(klines_raw);
+                pyramid.insert_trades_existing_buckets(&self.raw_trades);
 
                 self.indicators
                     .values_mut()
@@ -684,7 +684,7 @@ impl KlineChart {
         let rounded_lowest = lowest.round_to_side_step(true, step).add_steps(-1, step);
 
         match &self.data_source {
-            PlotData::TimeBased(timeseries) => timeseries.max_qty_ts_range(
+            PlotData::TimeBased(pyramid) => pyramid.max_qty_ts_range(
                 cluster_kind,
                 earliest,
                 latest,
@@ -1133,13 +1133,20 @@ fn render_data_source<F>(
                     draw_fn(frame, x_position, &tick_aggr.kline, &tick_aggr.footprint);
                 });
         }
-        PlotData::TimeBased(timeseries) => {
+        PlotData::TimeBased(pyramid) => {
             if latest < earliest {
                 return;
             }
 
-            timeseries
-                .datapoints
+            let interval_ms = pyramid.base_interval.to_milliseconds();
+            let visible_bars = if latest > earliest && interval_ms > 0 {
+                (latest - earliest) / interval_ms
+            } else {
+                0
+            };
+            let data_level = pyramid.select_level(visible_bars);
+
+            data_level
                 .range(earliest..=latest)
                 .for_each(|(timestamp, dp)| {
                     let x_position = interval_to_x(*timestamp);
@@ -1286,9 +1293,16 @@ fn draw_all_npocs(
                 .filter_map(|(index, dp)| dp.footprint.poc.as_ref().map(|poc| (index as u64, poc)))
                 .for_each(|(interval, poc)| draw_the_line(interval, poc));
         }
-        PlotData::TimeBased(timeseries) => {
-            timeseries
-                .datapoints
+        PlotData::TimeBased(pyramid) => {
+            let interval_ms = pyramid.base_interval.to_milliseconds();
+            let visible_bars = if visible_latest > visible_earliest && interval_ms > 0 {
+                (visible_latest - visible_earliest) / interval_ms
+            } else {
+                0
+            };
+            let data_level = pyramid.select_level(visible_bars);
+
+            data_level
                 .iter()
                 .rev()
                 .take(lookback)
@@ -1710,23 +1724,28 @@ fn draw_crosshair_tooltip(
     at_interval: u64,
 ) {
     let kline_opt = match data {
-        PlotData::TimeBased(timeseries) => timeseries
-            .datapoints
-            .iter()
-            .find(|(time, _)| **time == at_interval)
-            .map(|(_, dp)| &dp.kline)
-            .or_else(|| {
-                if timeseries.datapoints.is_empty() {
-                    None
-                } else {
-                    let (last_time, dp) = timeseries.datapoints.last_key_value()?;
-                    if at_interval > *last_time {
-                        Some(&dp.kline)
-                    } else {
-                        None
-                    }
-                }
-            }),
+        PlotData::TimeBased(pyramid) => {
+            if let Some((_, level_0)) = pyramid.levels.first() {
+                level_0
+                    .iter()
+                    .find(|(time, _)| **time == at_interval)
+                    .map(|(_, dp)| &dp.kline)
+                    .or_else(|| {
+                        if level_0.is_empty() {
+                            None
+                        } else {
+                            let (last_time, dp) = level_0.last_key_value()?;
+                            if at_interval > *last_time {
+                                Some(&dp.kline)
+                            } else {
+                                None
+                            }
+                        }
+                    })
+            } else {
+                None
+            }
+        },
         PlotData::TickBased(tick_aggr) => {
             let index = (at_interval / u64::from(tick_aggr.interval.0)) as usize;
             if index < tick_aggr.datapoints.len() {

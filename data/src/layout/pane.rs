@@ -55,6 +55,8 @@ pub enum Pane {
         indicators: Vec<KlineIndicator>,
         #[serde(deserialize_with = "ok_or_default", default)]
         link_group: Option<LinkGroup>,
+        #[serde(deserialize_with = "ok_or_default", default)]
+        kline_config: kline::Config,
     },
     ComparisonChart {
         stream_type: Vec<PersistStreamKind>,

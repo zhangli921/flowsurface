@@ -33,6 +33,7 @@ impl Default for Config {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct HeatmapDataPoint {
     pub grouped_trades: Box<[GroupedTrade]>,
     pub buy_sell: (f32, f32),
@@ -71,6 +72,45 @@ impl DataPoint for HeatmapDataPoint {
     fn clear_trades(&mut self) {
         self.grouped_trades = Box::new([]);
         self.buy_sell = (0.0, 0.0);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.buy_sell.0 += other.buy_sell.0;
+        self.buy_sell.1 += other.buy_sell.1;
+
+        let mut merged_trades = Vec::with_capacity(self.grouped_trades.len() + other.grouped_trades.len());
+        let mut self_iter = self.grouped_trades.iter().peekable();
+        let mut other_iter = other.grouped_trades.iter().peekable();
+
+        loop {
+            match (self_iter.peek(), other_iter.peek()) {
+                (Some(self_trade), Some(other_trade)) => {
+                    match self_trade.compare_with(other_trade.price, other_trade.is_sell) {
+                        std::cmp::Ordering::Less => {
+                            merged_trades.push(self_iter.next().unwrap().clone());
+                        }
+                        std::cmp::Ordering::Greater => {
+                            merged_trades.push(other_iter.next().unwrap().clone());
+                        }
+                        std::cmp::Ordering::Equal => {
+                            let mut merged = self_iter.next().unwrap().clone();
+                            merged.qty += other_iter.next().unwrap().qty;
+                            merged_trades.push(merged);
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    merged_trades.extend(self_iter.cloned());
+                    break;
+                }
+                (None, Some(_)) => {
+                    merged_trades.extend(other_iter.cloned());
+                    break;
+                }
+                (None, None) => break,
+            }
+        }
+        self.grouped_trades = merged_trades.into_boxed_slice();
     }
 
     fn last_trade_time(&self) -> Option<u64> {

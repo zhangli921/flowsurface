@@ -15,13 +15,15 @@ use data::chart::{
 };
 use data::util::{abbr_large_numbers, count_decimals};
 use data::{
-    aggr::time::{DataPoint, TimeSeries},
+    aggr::time::{DataPoint, DataPyramid},
     chart::Autoscale,
 };
+use std::collections::BTreeMap;
 use exchange::util::{Price, PriceStep};
 use exchange::{SIZE_IN_QUOTE_CURRENCY, TickerInfo, Trade, depth::Depth};
 
 use iced::widget::canvas::{self, Event, Geometry, Path};
+
 use iced::{
     Alignment, Color, Element, Point, Rectangle, Renderer, Size, Theme, Vector, mouse,
     theme::palette::Extended,
@@ -102,7 +104,7 @@ impl Chart for HeatmapChart {
     }
 
     fn is_empty(&self) -> bool {
-        self.trades.datapoints.is_empty()
+        self.trades.levels.first().map_or(true, |(_, level)| level.is_empty())
     }
 }
 
@@ -144,7 +146,7 @@ enum IndicatorData {
 
 pub struct HeatmapChart {
     chart: ViewState,
-    trades: TimeSeries<HeatmapDataPoint>,
+    trades: DataPyramid<HeatmapDataPoint>,
     indicators: EnumMap<HeatmapIndicator, Option<IndicatorData>>,
     pause_buffer: Vec<(u64, Box<[Trade]>, Depth)>,
     heatmap: HistoricalDepth,
@@ -193,7 +195,7 @@ impl HeatmapChart {
             indicators,
             pause_buffer: vec![],
             heatmap,
-            trades: TimeSeries::<HeatmapDataPoint>::new(basis, step),
+            trades: DataPyramid::<HeatmapDataPoint>::new(basis, step),
             visual_config: config.unwrap_or_default(),
             study_configurator: study::Configurator::new(),
             studies,
@@ -234,23 +236,24 @@ impl HeatmapChart {
         }
 
         self.process_datapoint(trades_buffer, depth_update_t, depth);
+        self.trades.build_pyramid();
     }
 
     fn cleanup_old_data(&mut self) {
-        if self.trades.datapoints.len() > CLEANUP_THRESHOLD {
+        if self.trades.levels[0].1.len() > CLEANUP_THRESHOLD {
             let keys_to_remove = self
                 .trades
-                .datapoints
+                .levels[0].1
                 .keys()
                 .take(CLEANUP_THRESHOLD / 10)
                 .copied()
                 .collect::<Vec<u64>>();
 
             for key in keys_to_remove {
-                self.trades.datapoints.remove(&key);
+                self.trades.levels[0].1.remove(&key);
             }
 
-            if let Some(oldest_time) = self.trades.datapoints.keys().next().copied() {
+            if let Some(oldest_time) = self.trades.levels[0].1.keys().next().copied() {
                 self.heatmap.cleanup_old_price_levels(oldest_time);
             }
         }
@@ -269,7 +272,7 @@ impl HeatmapChart {
         {
             let entry = self
                 .trades
-                .datapoints
+                .levels[0].1
                 .entry(rounded_depth_update)
                 .or_insert_with(|| HeatmapDataPoint {
                     grouped_trades: Box::new([]),
@@ -302,9 +305,8 @@ impl HeatmapChart {
     }
 
     pub fn set_basis(&mut self, basis: Basis) {
-        self.chart.basis = basis;
-
-        self.trades.datapoints.clear();
+        self.trades.levels.clear();
+        self.trades.levels.push((self.trades.base_interval, BTreeMap::new()));
         self.heatmap = HistoricalDepth::new(
             self.chart.ticker_info.min_qty.into(),
             self.chart.tick_size,
@@ -370,7 +372,8 @@ impl HeatmapChart {
         chart_state.tick_size = step;
         chart_state.decimals = count_decimals(new_tick_size);
 
-        self.trades.datapoints.clear();
+        self.trades.levels.clear();
+        self.trades.levels.push((self.trades.base_interval, BTreeMap::new()));
         self.heatmap = HistoricalDepth::new(self.chart.ticker_info.min_qty.into(), step, basis);
     }
 
@@ -609,8 +612,15 @@ impl canvas::Program<Message> for HeatmapChart {
                 }
             };
 
-            self.trades
-                .datapoints
+            let interval_ms = self.trades.base_interval.to_milliseconds();
+            let visible_bars = if latest > earliest && interval_ms > 0 {
+                (latest - earliest) / interval_ms
+            } else {
+                0
+            };
+            let data_level = self.trades.select_level(visible_bars);
+
+            data_level
                 .range(earliest..=latest)
                 .for_each(|(time, dp)| {
                     let x_position = chart.interval_to_x(*time);
@@ -925,7 +935,7 @@ fn draw_volume_profile(
     kind: &ProfileKind,
     palette: &Extended,
     chart: &ViewState,
-    timeseries: &TimeSeries<HeatmapDataPoint>,
+    timeseries: &DataPyramid<HeatmapDataPoint>,
     area_width: f32,
 ) {
     let (highest, lowest) = chart.price_range(region);
@@ -968,7 +978,7 @@ fn draw_volume_profile(
     let mut profile = vec![(0.0f32, 0.0f32); num_ticks];
     let mut max_aggr_volume = 0.0f32;
 
-    timeseries.datapoints.range(time_range).for_each(|(_, dp)| {
+    timeseries.levels[0].1.range(time_range).for_each(|(_, dp)| {
         dp.grouped_trades
             .iter()
             .filter(|trade| trade.price >= lowest && trade.price <= highest)

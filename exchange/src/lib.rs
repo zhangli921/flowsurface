@@ -158,6 +158,28 @@ impl Timeframe {
             }
         }
     }
+
+    pub fn from_milliseconds(ms: u64) -> Result<Self, InvalidTimeframe> {
+        match ms {
+            100 => Ok(Timeframe::MS100),
+            200 => Ok(Timeframe::MS200),
+            300 => Ok(Timeframe::MS300),
+            500 => Ok(Timeframe::MS500),
+            1_000 => Ok(Timeframe::MS1000),
+            60_000 => Ok(Timeframe::M1),
+            180_000 => Ok(Timeframe::M3), // 3 * 60_000
+            300_000 => Ok(Timeframe::M5), // 5 * 60_000
+            900_000 => Ok(Timeframe::M15), // 15 * 60_000
+            1_800_000 => Ok(Timeframe::M30), // 30 * 60_000
+            3_600_000 => Ok(Timeframe::H1), // 60 * 60_000
+            7_200_000 => Ok(Timeframe::H2), // 120 * 60_000
+            14_400_000 => Ok(Timeframe::H4), // 240 * 60_000
+            21_600_000 => Ok(Timeframe::H6), // 360 * 60_000
+            43_200_000 => Ok(Timeframe::H12), // 720 * 60_000
+            86_400_000 => Ok(Timeframe::D1), // 1440 * 60_000
+            _ => Err(InvalidTimeframe(ms)),
+        }
+    }
 }
 
 impl From<Timeframe> for f32 {

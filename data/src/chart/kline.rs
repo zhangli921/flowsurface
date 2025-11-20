@@ -65,6 +65,15 @@ impl DataPoint for KlineDataPoint {
         self.clear_trades();
     }
 
+    fn merge(&mut self, other: &Self) {
+        self.kline.high = self.kline.high.max(other.kline.high);
+        self.kline.low = self.kline.low.min(other.kline.low);
+        self.kline.close = other.kline.close;
+        self.kline.volume.0 += other.kline.volume.0;
+        self.kline.volume.1 += other.kline.volume.1;
+        self.footprint.merge(&other.footprint);
+    }
+
     fn last_trade_time(&self) -> Option<u64> {
         self.last_trade_time()
     }
@@ -129,6 +138,15 @@ impl GroupedTrades {
 
     pub fn delta_qty(&self) -> f32 {
         self.buy_qty - self.sell_qty
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.buy_qty += other.buy_qty;
+        self.sell_qty += other.sell_qty;
+        self.buy_count += other.buy_count;
+        self.sell_count += other.sell_count;
+        self.first_time = self.first_time.min(other.first_time);
+        self.last_time = self.last_time.max(other.last_time);
     }
 }
 
@@ -227,6 +245,15 @@ impl KlineTrades {
     pub fn clear(&mut self) {
         self.trades.clear();
         self.poc = None;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for (price, other_group) in &other.trades {
+            self.trades
+                .entry(*price)
+                .and_modify(|self_group| self_group.merge(other_group))
+                .or_insert_with(|| other_group.clone());
+        }
     }
 }
 

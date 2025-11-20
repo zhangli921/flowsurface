@@ -9,19 +9,19 @@ use serde::{Deserialize, Serialize};
 use super::aggr::{
     self,
     ticks::TickAggr,
-    time::{DataPoint, TimeSeries},
+    time::{DataPoint, DataPyramid},
 };
 pub use kline::KlineChartKind;
 
-pub enum PlotData<D: DataPoint> {
-    TimeBased(TimeSeries<D>),
+pub enum PlotData<D: DataPoint + Clone> {
+    TimeBased(DataPyramid<D>),
     TickBased(TickAggr),
 }
 
-impl<D: DataPoint> PlotData<D> {
+impl<D: DataPoint + Clone> PlotData<D> {
     pub fn latest_y_midpoint(&self, calculate_target_y: impl Fn(exchange::Kline) -> f32) -> f32 {
         match self {
-            PlotData::TimeBased(timeseries) => timeseries
+            PlotData::TimeBased(pyramid) => pyramid
                 .latest_kline()
                 .map_or(0.0, |kline| calculate_target_y(*kline)),
             PlotData::TickBased(tick_aggr) => tick_aggr
@@ -36,8 +36,8 @@ impl<D: DataPoint> PlotData<D> {
         end_interval: u64,
     ) -> Option<(f32, f32)> {
         match self {
-            PlotData::TimeBased(timeseries) => {
-                timeseries.min_max_price_in_range(start_interval, end_interval)
+            PlotData::TimeBased(pyramid) => {
+                pyramid.min_max_price_in_range(start_interval, end_interval)
             }
             PlotData::TickBased(tick_aggr) => {
                 tick_aggr.min_max_price_in_range(start_interval as usize, end_interval as usize)

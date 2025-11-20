@@ -68,7 +68,7 @@ impl KlineIndicatorImpl for CumulativeDeltaIndicator {
 
     fn rebuild_from_source(&mut self, source: &PlotData<KlineDataPoint>) {
         let volume_data = match source {
-            PlotData::TimeBased(timeseries) => timeseries.volume_data(),
+            PlotData::TimeBased(pyramid) => pyramid.volume_data(),
             PlotData::TickBased(tickseries) => tickseries.volume_data(),
         };
 
