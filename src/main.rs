@@ -18,6 +18,7 @@ use data::{
     layout::WindowSpec,
     sidebar, ArbiterError, ExternalAdapter,
 };
+use data::compute::service::VpComputeService;
 use layout::{configuration, Layout};
 use modal::{audio, dashboard_modal, main_dialog_modal, LayoutManager, ThemeEditor};
 use screen::dashboard::{self, Dashboard};
@@ -79,6 +80,7 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: data::Theme,
     notifications: Vec<Toast>,
+    vp_service: Option<Arc<VpComputeService>>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,7 @@ enum Message {
     KLineDataFetched(Result<Vec<KLine>, Arc<ArbiterError>>),
     ComputeVp(data::compute::vp::ComputeParams),
     VpComputed(Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>),
+    VpServiceInitialized(Result<Arc<VpComputeService>, String>),
     Tick(std::time::Instant),
     WindowEvent(window::Event),
     ExitRequested(HashMap<window::Id, WindowSpec>),
@@ -155,6 +158,15 @@ impl Flowsurface {
 
         let (sidebar, launch_sidebar) = dashboard::Sidebar::new(&saved_state);
 
+        let init_vp_service = Task::perform(
+            async move {
+                VpComputeService::new()
+                    .await
+                    .map(Arc::new)
+            },
+            Message::VpServiceInitialized,
+        );
+
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
             arbiter,
@@ -168,6 +180,7 @@ impl Flowsurface {
             preferred_currency: saved_state.preferred_currency,
             theme: saved_state.theme,
             notifications: vec![],
+            vp_service: None,
         };
 
         let last_active_layout = state.layout_manager.active_layout();
@@ -178,7 +191,8 @@ impl Flowsurface {
             open_main_window
                 .discard()
                 .chain(load_layout)
-                .chain(launch_sidebar.map(Message::Sidebar)),
+                .chain(launch_sidebar.map(Message::Sidebar))
+                .chain(init_vp_service),
         )
     }
 
@@ -244,6 +258,40 @@ impl Flowsurface {
                     }
                     Err(e) => {
                         log::error!("Failed to fetch klines: {}", e);
+                    }
+                }
+            }
+            Message::VpServiceInitialized(result) => {
+                match result {
+                    Ok(service) => {
+                        log::info!("VpComputeService initialized successfully.");
+                        self.vp_service = Some(service);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to initialize VpComputeService: {}", e);
+                        self.notifications.push(Toast::error(format!(
+                            "GPU Compute Init Failed: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+            Message::ComputeVp(params) => {
+                if let Some(service) = &self.vp_service {
+                    let service = service.clone();
+                    // TODO: Construct TickDataBuffer from Mmap/IoService
+                    log::info!("ComputeVp request received. Params: {:?}", params.num_ticks);
+                } else {
+                    log::warn!("ComputeVp requested but VpComputeService is not ready.");
+                }
+            }
+            Message::VpComputed(result) => {
+                match result {
+                    Ok(profile) => {
+                        log::info!("Volume Profile computed: POC at {}", profile.point_of_control);
+                    }
+                    Err(e) => {
+                        log::error!("Volume Profile computation failed: {}", e);
                     }
                 }
             }

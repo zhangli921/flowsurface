@@ -4,10 +4,11 @@ use bytemuck::{self, Pod, Zeroable};
 use crate::arbiter_error::ArbiterError;
 use iced::wgpu::{self as iced_wgpu, util::DeviceExt, BindingType, BufferBindingType, MapMode};
 use tokio::sync::oneshot;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct ComputeParams {
     pub num_ticks: u32,
     pub price_resolution: u32,
@@ -27,7 +28,7 @@ pub struct SparseBar {
     pub volume: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VolumeProfile {
     pub bars: Vec<SparseBar>,
     pub point_of_control: u32,
@@ -35,19 +36,26 @@ pub struct VolumeProfile {
     pub value_area_end: u32,
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ComputeError {
     #[error("Failed to map GPU buffer")]
     MapError,
     #[error("Channel closed unexpectedly")]
     ChannelClosed,
     #[error("Arbiter error: {0}")]
-    ArbiterError(#[from] ArbiterError),
+    ArbiterError(Arc<ArbiterError>),
     #[error("Compute error: {0}")]
     Other(String),
 }
 
+impl From<ArbiterError> for ComputeError {
+    fn from(e: ArbiterError) -> Self {
+        ComputeError::ArbiterError(Arc::new(e))
+    }
+}
+
 /// Manages WGPU resources for the Volume Profile compute shader.
+#[derive(Debug)]
 pub struct VpComputePipeline {
     pub compute_pipeline: iced_wgpu::ComputePipeline,
     pub bind_group_layout: iced_wgpu::BindGroupLayout,
