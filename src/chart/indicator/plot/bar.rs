@@ -129,7 +129,7 @@ where
         scale: &YScale,
     ) {
         let palette = theme.extended_palette();
-        let bar_width = ctx.cell_width * self.bar_width_factor;
+        let bar_width = ctx.state.cell_width * self.bar_width_factor;
 
         let baseline_value = match self.baseline {
             Baseline::Zero => 0.0,
@@ -139,7 +139,7 @@ where
         let y_base = scale.to_y(baseline_value);
 
         datapoints.for_each_in(range, |x, y| {
-            let center_x = ctx.interval_to_x(x);
+            let center_x = ctx.state.interval_to_x(x);
             let left = center_x - (bar_width / 2.0);
 
             let total = (self.value)(y);

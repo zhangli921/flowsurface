@@ -99,7 +99,7 @@ where
         scale: &YScale,
     ) {
         let palette = theme.extended_palette();
-        let bar_width = ctx.cell_width * self.bar_width_factor;
+        let bar_width = ctx.state.cell_width * self.bar_width_factor;
 
         let mut prev_cumulative = 0.0;
 
@@ -111,7 +111,7 @@ where
         }
 
         datapoints.for_each_in(range, |x, y| {
-            let center_x = ctx.interval_to_x(x);
+            let center_x = ctx.state.interval_to_x(x);
             let left = center_x - (bar_width / 2.0);
 
             let (delta, cumulative) = (self.value)(y);

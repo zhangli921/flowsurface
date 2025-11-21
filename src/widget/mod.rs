@@ -1,3 +1,11 @@
+pub mod chart;
+pub mod color_picker;
+pub mod column_drag;
+pub mod decorate;
+pub mod multi_split;
+pub mod toast;
+pub mod vp_renderer;
+
 use super::Element;
 use crate::style::{self, Icon, icon_text, modal_container};
 use iced::{
@@ -7,13 +15,6 @@ use iced::{
     Theme, border, padding,
     widget::{button, column, container, row, scrollable, slider, space, text, tooltip::Position},
 };
-
-pub mod chart;
-pub mod color_picker;
-pub mod column_drag;
-pub mod decorate;
-pub mod multi_split;
-pub mod toast;
 
 pub fn tooltip<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
@@ -245,17 +246,6 @@ where
 }
 
 #[macro_export]
-/// Creates a column with horizontal rules between each item.
-///
-/// # Examples
-/// ```
-/// split_column![
-///     text("Item 1"),
-///     text("Item 2"),
-///     text("Item 3"),
-/// ] ; spacing = 8, align_x = Alignment::Start
-/// ```
-///
 macro_rules! split_column {
     () => {
         column![]

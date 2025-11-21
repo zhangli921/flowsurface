@@ -3,6 +3,7 @@ pub mod arbiter_error;
 pub mod arbiter_service;
 pub mod audio;
 pub mod chart;
+pub mod compute;
 pub mod config;
 pub mod external_adapter;
 pub mod io_service;

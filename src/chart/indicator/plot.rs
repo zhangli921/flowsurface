@@ -1,4 +1,5 @@
-use crate::chart::{Basis, Interaction, Message, ViewState};
+use crate::chart::{Basis, Message, ViewState};
+use crate::chart::renderer::Interaction;
 use crate::style::{self, dashed_line};
 use data::util::{guesstimate_ticks, round_to_tick};
 
@@ -224,7 +225,7 @@ where
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let ctx = &self.ctx;
-        if ctx.bounds.width == 0.0 {
+        if ctx.state.bounds.width == 0.0 {
             return vec![];
         }
 
@@ -232,20 +233,20 @@ where
             let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
 
             frame.translate(center);
-            frame.scale(ctx.scaling);
+            frame.scale(ctx.state.scaling);
             frame.translate(Vector::new(
-                ctx.translation.x,
-                (-bounds.height / ctx.scaling) / 2.0,
+                ctx.state.translation.x,
+                (-bounds.height / ctx.state.scaling) / 2.0,
             ));
 
-            let width = frame.width() / ctx.scaling;
+            let width = frame.width() / ctx.state.scaling;
             let region = Rectangle {
-                x: -ctx.translation.x - width / 2.0,
+                x: -ctx.state.translation.x - width / 2.0,
                 y: 0.0,
                 width,
-                height: frame.height() / ctx.scaling,
+                height: frame.height() / ctx.state.scaling,
             };
-            let (earliest, latest) = ctx.interval_range(&region);
+            let (earliest, latest) = ctx.state.interval_range(&region);
             if latest < earliest {
                 return;
             }
@@ -253,7 +254,7 @@ where
             let scale = YScale {
                 min: self.min_for_labels,
                 max: self.max_for_labels,
-                px_height: frame.height() / ctx.scaling,
+                px_height: frame.height() / ctx.state.scaling,
             };
 
             self.plot
@@ -262,20 +263,20 @@ where
 
         let crosshair = self.crosshair_cache.draw(renderer, bounds.size(), |frame| {
             let dashed = dashed_line(theme);
-            if let Some(cursor_position) = cursor.position_in(ctx.bounds) {
+            if let Some(cursor_position) = cursor.position_in(ctx.state.bounds) {
                 // vertical snap by basis
-                let width = frame.width() / ctx.scaling;
+                let width = frame.width() / ctx.state.scaling;
                 let region = Rectangle {
-                    x: -ctx.translation.x - width / 2.0,
+                    x: -ctx.state.translation.x - width / 2.0,
                     y: 0.0,
                     width,
-                    height: frame.height() / ctx.scaling,
+                    height: frame.height() / ctx.state.scaling,
                 };
-                let earliest = ctx.x_to_interval(region.x) as f64;
-                let latest = ctx.x_to_interval(region.x + region.width) as f64;
+                let earliest = ctx.state.x_to_interval(region.x) as f64;
+                let latest = ctx.state.x_to_interval(region.x + region.width) as f64;
 
                 let crosshair_ratio = f64::from(cursor_position.x / bounds.width);
-                let (rounded_x, snap_ratio) = match ctx.basis {
+                let (rounded_x, snap_ratio) = match ctx.state.basis {
                     Basis::Time(tf) => {
                         let step = tf.to_milliseconds() as f64;
                         let rx = ((earliest + crosshair_ratio * (latest - earliest)) / step).round()
@@ -291,10 +292,10 @@ where
                     }
                     Basis::Tick(_) => {
                         let world_x = region.x + (cursor_position.x / bounds.width) * region.width;
-                        let snapped_world_x = (world_x / ctx.cell_width).round() * ctx.cell_width;
+                        let snapped_world_x = (world_x / ctx.state.cell_width).round() * ctx.state.cell_width;
 
                         let sr = (snapped_world_x - region.x) / region.width;
-                        let rx = ctx.x_to_interval(snapped_world_x);
+                        let rx = ctx.state.x_to_interval(snapped_world_x);
                         (rx, sr)
                     }
                 };

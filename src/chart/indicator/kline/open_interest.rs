@@ -1,5 +1,5 @@
 use crate::chart::{
-    Basis, Caches, Message, ViewState,
+    Basis, Message, ViewState,
     indicator::{
         indicator_row,
         kline::{FetchCtx, KlineIndicatorImpl},
@@ -16,14 +16,12 @@ use iced::widget::{center, row, text};
 use std::{collections::BTreeMap, ops::RangeInclusive};
 
 pub struct OpenInterestIndicator {
-    cache: Caches,
     pub data: BTreeMap<u64, f32>,
 }
 
 impl OpenInterestIndicator {
     pub fn new() -> Self {
         Self {
-            cache: Caches::default(),
             data: BTreeMap::new(),
         }
     }
@@ -33,9 +31,9 @@ impl OpenInterestIndicator {
         main_chart: &'a ViewState,
         visible_range: RangeInclusive<u64>,
     ) -> iced::Element<'a, Message> {
-        match main_chart.basis {
+        match main_chart.state.basis {
             Basis::Time(timeframe) => {
-                let exchange = main_chart.ticker_info.exchange();
+                let exchange = main_chart.state.ticker_info.exchange();
                 if !Self::is_supported_exchange(exchange) {
                     return center(text(format!(
                         "WIP: Open Interest is not available for {exchange}"
@@ -81,7 +79,7 @@ impl OpenInterestIndicator {
             .padding(0.08)
             .with_tooltip(tooltip);
 
-        indicator_row(main_chart, &self.cache, plot, &self.data, visible_range)
+        indicator_row(main_chart, plot, &self.data, visible_range)
     }
 
     // helper to compute (earliest, latest) present OI keys
@@ -107,11 +105,11 @@ impl OpenInterestIndicator {
 
 impl KlineIndicatorImpl for OpenInterestIndicator {
     fn clear_all_caches(&mut self) {
-        self.cache.clear_all();
+        // self.cache.clear_all();
     }
 
     fn clear_crosshair_caches(&mut self) {
-        self.cache.clear_crosshair();
+        // self.cache.clear_crosshair();
     }
 
     fn element<'a>(
@@ -123,7 +121,7 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
     }
 
     fn fetch_range(&mut self, ctx: &FetchCtx) -> Option<FetchRange> {
-        let exchange = ctx.main_chart.ticker_info.exchange();
+        let exchange = ctx.main_chart.state.ticker_info.exchange();
         let is_supported =
             Self::is_supported_exchange(exchange) && Self::is_supported_timeframe(ctx.timeframe);
 

@@ -1,5 +1,7 @@
 //! Defines the canonical K-line data structure for the application.
 
+use exchange::Kline as ExchangeKline;
+
 /// Represents a single OHLCV (Open, High, Low, Close, Volume) data point,
 /// commonly known as a "candlestick".
 ///
@@ -23,4 +25,20 @@ pub struct KLine {
     pub volume: f64,
     /// The total number of trades that occurred during the period.
     pub num_trades: u32,
+}
+
+impl From<ExchangeKline> for KLine {
+    fn from(kline: ExchangeKline) -> Self {
+        Self {
+            // Convert ms to ns
+            open_time_ns: kline.time * 1_000_000,
+            open: kline.open.to_f32() as f64,
+            high: kline.high.to_f32() as f64,
+            low: kline.low.to_f32() as f64,
+            close: kline.close.to_f32() as f64,
+            volume: (kline.volume.0 + kline.volume.1) as f64,
+            // exchange::Kline doesn't have num_trades, so default to 0
+            num_trades: 0,
+        }
+    }
 }

@@ -125,7 +125,7 @@ where
             color,
         );
 
-        let expected_interval_ms = if let Basis::Time(tf) = ctx.basis {
+        let expected_interval_ms = if let Basis::Time(tf) = ctx.state.basis {
             tf.to_milliseconds()
         } else {
             0
@@ -134,7 +134,7 @@ where
         // Polyline
         let mut prev: Option<(u64, f32, f32)> = None;
         datapoints.for_each_in(range.clone(), |x_timestamp, y| {
-            let sx = ctx.interval_to_x(x_timestamp) - (ctx.cell_width / 2.0);
+            let sx = ctx.state.interval_to_x(x_timestamp) - (ctx.state.cell_width / 2.0);
             let vy = (self.value)(y);
             let sy = scale.to_y(vy);
             if let Some((prev_timestamp, px, py)) = prev {
@@ -155,9 +155,9 @@ where
         });
 
         if self.show_points {
-            let radius = (ctx.cell_width * self.point_radius_factor).min(5.0);
+            let radius = (ctx.state.cell_width * self.point_radius_factor).min(5.0);
             datapoints.for_each_in(range, |x, y| {
-                let sx = ctx.interval_to_x(x) - (ctx.cell_width / 2.0);
+                let sx = ctx.state.interval_to_x(x) - (ctx.state.cell_width / 2.0);
                 let sy = scale.to_y((self.value)(y));
                 frame.fill(&Path::circle(iced::Point::new(sx, sy), radius), color);
             });

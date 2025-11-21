@@ -1,7 +1,7 @@
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 use std::fmt;
-use std::io::Cursor;
+
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

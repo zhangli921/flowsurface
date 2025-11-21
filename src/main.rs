@@ -88,6 +88,8 @@ enum Message {
     Dashboard(Option<uuid::Uuid>, dashboard::Message),
     FetchKLines(String, TimeRange),
     KLineDataFetched(Result<Vec<KLine>, Arc<ArbiterError>>),
+    ComputeVp(data::compute::vp::ComputeParams),
+    VpComputed(Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>),
     Tick(std::time::Instant),
     WindowEvent(window::Event),
     ExitRequested(HashMap<window::Id, WindowSpec>),

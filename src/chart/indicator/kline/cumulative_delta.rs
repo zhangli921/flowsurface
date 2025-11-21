@@ -1,5 +1,5 @@
 use crate::chart::{
-    Caches, Message, ViewState,
+    Message, ViewState,
     indicator::{
         indicator_row,
         kline::KlineIndicatorImpl,
@@ -18,7 +18,6 @@ use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
 pub struct CumulativeDeltaIndicator {
-    cache: Caches,
     // Store (delta, cumulative_delta)
     data: BTreeMap<u64, (f32, f32)>,
 }
@@ -26,7 +25,6 @@ pub struct CumulativeDeltaIndicator {
 impl CumulativeDeltaIndicator {
     pub fn new() -> Self {
         Self {
-            cache: Caches::default(),
             data: BTreeMap::new(),
         }
     }
@@ -45,17 +43,17 @@ impl CumulativeDeltaIndicator {
         let plot = WaterfallPlot::new(|v: &(f32, f32)| *v)
             .with_tooltip(tooltip);
 
-        indicator_row(main_chart, &self.cache, plot, &self.data, visible_range)
+        indicator_row(main_chart, plot, &self.data, visible_range)
     }
 }
 
 impl KlineIndicatorImpl for CumulativeDeltaIndicator {
     fn clear_all_caches(&mut self) {
-        self.cache.clear_all();
+        // self.cache.clear_all();
     }
 
     fn clear_crosshair_caches(&mut self) {
-        self.cache.clear_crosshair();
+        // self.cache.clear_crosshair();
     }
 
     fn element<'a>(
