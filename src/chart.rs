@@ -321,6 +321,7 @@ pub struct ChartState {
     pub decimals: usize,
     pub ticker_info: TickerInfo,
     pub layout: ViewConfig,
+    pub volume_profile: Option<data::compute::vp::VolumeProfile>,
 }
 
 impl ChartState {
@@ -445,6 +446,7 @@ impl ViewState {
                 decimals,
                 ticker_info,
                 layout,
+                volume_profile: None,
             },
             // cache: Caches::default(),
         }

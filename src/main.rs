@@ -12,13 +12,13 @@ mod window;
 use data::{
     self,
     arbiter_service::ArbiterService,
+    compute::service::VpComputeService,
     config::theme::default_theme,
     io_service::{IoService, TimeRange},
     kline::KLine,
     layout::WindowSpec,
     sidebar, ArbiterError, ExternalAdapter,
 };
-use data::compute::service::VpComputeService;
 use layout::{configuration, Layout};
 use modal::{audio, dashboard_modal, main_dialog_modal, LayoutManager, ThemeEditor};
 use screen::dashboard::{self, Dashboard};
@@ -71,6 +71,7 @@ struct Flowsurface {
     main_window: window::Window,
     sidebar: dashboard::Sidebar,
     arbiter: Arc<ArbiterService>,
+    vp_service: Option<Arc<VpComputeService>>,
     layout_manager: LayoutManager,
     theme_editor: ThemeEditor,
     audio_stream: audio::AudioStream,
@@ -80,7 +81,6 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: data::Theme,
     notifications: Vec<Toast>,
-    vp_service: Option<Arc<VpComputeService>>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +90,7 @@ enum Message {
     Dashboard(Option<uuid::Uuid>, dashboard::Message),
     FetchKLines(String, TimeRange),
     KLineDataFetched(Result<Vec<KLine>, Arc<ArbiterError>>),
-    ComputeVp(data::compute::vp::ComputeParams),
+    ComputeVp(String, TimeRange), // symbol, time range
     VpComputed(Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>),
     VpServiceInitialized(Result<Arc<VpComputeService>, String>),
     Tick(std::time::Instant),
@@ -158,6 +158,7 @@ impl Flowsurface {
 
         let (sidebar, launch_sidebar) = dashboard::Sidebar::new(&saved_state);
 
+        // Initialize VpComputeService asynchronously
         let init_vp_service = Task::perform(
             async move {
                 VpComputeService::new()
@@ -170,6 +171,7 @@ impl Flowsurface {
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
             arbiter,
+            vp_service: None, // Will be initialized asynchronously
             layout_manager: saved_state.layout_manager,
             theme_editor: ThemeEditor::new(saved_state.custom_theme),
             audio_stream: audio::AudioStream::new(saved_state.audio_cfg),
@@ -180,7 +182,6 @@ impl Flowsurface {
             preferred_currency: saved_state.preferred_currency,
             theme: saved_state.theme,
             notifications: vec![],
-            vp_service: None,
         };
 
         let last_active_layout = state.layout_manager.active_layout();
@@ -255,6 +256,7 @@ impl Flowsurface {
                 match result {
                     Ok(klines) => {
                         log::info!("Successfully fetched {} klines.", klines.len());
+                        // TODO: Store klines in ChartState for rendering
                     }
                     Err(e) => {
                         log::error!("Failed to fetch klines: {}", e);
@@ -276,11 +278,53 @@ impl Flowsurface {
                     }
                 }
             }
-            Message::ComputeVp(params) => {
+            Message::ComputeVp(_symbol, range) => {
                 if let Some(service) = &self.vp_service {
                     let service = service.clone();
-                    // TODO: Construct TickDataBuffer from Mmap/IoService
-                    log::info!("ComputeVp request received. Params: {:?}", params.num_ticks);
+                    let io_service = self.arbiter.io_service().clone();
+                    
+                    return Task::future(async move {
+                        // Fetch ticks from IoService in a blocking task
+                        let ticks = match tokio::task::spawn_blocking(move || {
+                            io_service.fetch_ticks_blocking(range)
+                        }).await {
+                            Ok(result) => match result {
+                                Ok(ticks) => ticks,
+                                Err(e) => {
+                                    let compute_err: data::compute::vp::ComputeError = e.into();
+                                    return Message::VpComputed(Err(compute_err));
+                                },
+                            },
+                            Err(e) => return Message::VpComputed(Err(
+                                data::compute::vp::ComputeError::Other(format!("Spawn blocking failed: {}", e))
+                            )),
+                        };
+                        
+                        // Calculate compute parameters
+                        let num_ticks = ticks.prices.len() as u32;
+                        if num_ticks == 0 {
+                            return Message::VpComputed(Err(
+                                data::compute::vp::ComputeError::Other("No ticks found".to_string())
+                            ));
+                        }
+                        
+                        let min_price = *ticks.prices.iter().min().unwrap_or(&0) as u32;
+                        let max_price = *ticks.prices.iter().max().unwrap_or(&0) as u32;
+                        let price_range = max_price.saturating_sub(min_price);
+                        let price_resolution = 1; // 1 cent resolution
+                        let histogram_buckets = (price_range / price_resolution).max(1) as u64;
+                        
+                        let params = data::compute::vp::ComputeParams {
+                            num_ticks,
+                            price_resolution,
+                            min_price,
+                            volume_scaling_factor: 1,
+                        };
+                        
+                        // Run compute on GPU
+                        let result = service.compute_vp(&ticks, &params, histogram_buckets).await;
+                        Message::VpComputed(result)
+                    });
                 } else {
                     log::warn!("ComputeVp requested but VpComputeService is not ready.");
                 }
@@ -288,10 +332,15 @@ impl Flowsurface {
             Message::VpComputed(result) => {
                 match result {
                     Ok(profile) => {
-                        log::info!("Volume Profile computed: POC at {}", profile.point_of_control);
+                        log::info!("Volume Profile computed: POC at {}, {} bars", profile.point_of_control, profile.bars.len());
+                        // TODO: Store profile in ChartState for rendering
                     }
                     Err(e) => {
                         log::error!("Volume Profile computation failed: {}", e);
+                        self.notifications.push(Toast::error(format!(
+                            "VP Compute Failed: {}",
+                            e
+                        )));
                     }
                 }
             }

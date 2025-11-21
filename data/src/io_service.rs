@@ -5,7 +5,7 @@ use std::sync::Arc;
 use storage::MmapStore;
 use arrow::array; // Required for downcasting Arrow arrays
 
-use crate::{kline::KLine, arbiter_error::ArbiterError};
+use crate::{kline::KLine, arbiter_error::ArbiterError, compute::vp::TickDataBuffer};
 
 /// Defines a time range with nanosecond precision.
 #[derive(Debug, Clone, Copy)]
@@ -175,5 +175,73 @@ impl IoService {
         klines.retain(|k| k.open_time_ns >= range.start_ns && k.open_time_ns < range.end_ns);
 
         Ok(klines)
+    }
+
+    /// Fetches raw tick data for a given time range from the MmapStore and converts it to TickDataBuffer.
+    ///
+    /// This is a synchronous, CPU-intensive, and potentially blocking operation.
+    /// It **must** be called within `tokio::task::spawn_blocking`.
+    ///
+    /// # Arguments
+    ///
+    /// * `range` - The time range for which to fetch tick data.
+    pub fn fetch_ticks_blocking(&self, range: TimeRange) -> Result<TickDataBuffer, ArbiterError> {
+        let index = self.store.index();
+
+        // Find the first data block that *could* contain data for our time range.
+        let start_idx = index.partition_point(|entry| entry.key_hash() < range.start_ns);
+
+        let mut prices: Vec<u64> = Vec::new();
+        let mut volumes: Vec<f32> = Vec::new();
+
+        // Iterate through index entries that overlap with the requested time range.
+        for entry in &index[start_idx..] {
+            // If the block's start time is already after our range ends, we can stop.
+            if entry.key_hash() >= range.end_ns {
+                break;
+            }
+
+            // Load and deserialize payload
+            let payload = self.store.get_payload(entry);
+            let payload_bytes = bytes::Bytes::from(payload.to_vec());
+            
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(payload_bytes)?
+                .with_batch_size(8192)
+                .build()?;
+
+            for batch_result in reader {
+                let batch = batch_result?;
+                
+                let timestamps = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<array::TimestampNanosecondArray>()
+                    .ok_or(ArbiterError::InvalidInput("Timestamp column has wrong type"))?;
+                let price_array = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<array::Float64Array>()
+                    .ok_or(ArbiterError::InvalidInput("Price column has wrong type"))?;
+                let volume_array = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<array::Float64Array>()
+                    .ok_or(ArbiterError::InvalidInput("Volume column has wrong type"))?;
+
+                for i in 0..batch.num_rows() {
+                    let ts = timestamps.value(i) as u64;
+                    // Filter ticks to be within the requested range
+                    if ts >= range.start_ns && ts < range.end_ns {
+                        // Convert price from f64 to u64 (fixed-point representation)
+                        // Assuming price is in dollars with 2 decimal places, multiply by 100
+                        let price_fixed = (price_array.value(i) * 100.0) as u64;
+                        prices.push(price_fixed);
+                        volumes.push(volume_array.value(i) as f32);
+                    }
+                }
+            }
+        }
+
+        Ok(TickDataBuffer { prices, volumes })
     }
 }

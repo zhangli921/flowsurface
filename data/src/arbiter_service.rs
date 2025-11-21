@@ -31,6 +31,11 @@ impl ArbiterService {
         }
     }
 
+    /// Returns a reference to the IoService for direct access to raw data.
+    pub fn io_service(&self) -> &IoService {
+        &self.io_service
+    }
+
     /// Fetches K-line data for a given symbol and time range from all available
     /// sources concurrently and merges the results.
     ///

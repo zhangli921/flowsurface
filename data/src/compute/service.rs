@@ -1,9 +1,9 @@
+//! Service for managing a headless WGPU context dedicated to compute tasks.
+
 use crate::compute::vp::{ComputeError, ComputeParams, TickDataBuffer, VolumeProfile, VpComputePipeline};
 use iced::wgpu::{self, Instance, RequestAdapterOptions, PowerPreference};
 use std::sync::Arc;
 
-/// A service that manages the WGPU context and pipeline for Volume Profile computation.
-/// It runs in a headless environment, independent of the UI rendering context.
 #[derive(Debug)]
 pub struct VpComputeService {
     device: Arc<wgpu::Device>,
@@ -12,7 +12,6 @@ pub struct VpComputeService {
 }
 
 impl VpComputeService {
-    /// Initializes a new VpComputeService with its own WGPU context.
     pub async fn new() -> Result<Self, String> {
         let instance = Instance::new(&wgpu::InstanceDescriptor::default());
 
@@ -32,7 +31,7 @@ impl VpComputeService {
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::default(),
                     ..Default::default()
-                }
+                },
             )
             .await
             .map_err(|e: wgpu::RequestDeviceError| format!("Failed to create WGPU device: {}", e))?;
@@ -48,7 +47,6 @@ impl VpComputeService {
         })
     }
 
-    /// Runs the Volume Profile aggregation task.
     pub async fn compute_vp(
         &self,
         ticks: &TickDataBuffer,

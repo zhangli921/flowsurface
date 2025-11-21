@@ -1605,6 +1605,7 @@ dependencies = [
  "serde_json",
  "storage",
  "thiserror 2.0.17",
+ "tokio",
  "uuid",
 ]
 
