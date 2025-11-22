@@ -189,13 +189,24 @@ impl IoService {
         let index = self.store.index();
 
         // Find the first data block that *could* contain data for our time range.
+        // partition_point returns the index where entry.key_hash() >= range.start_ns
         let start_idx = index.partition_point(|entry| entry.key_hash() < range.start_ns);
+        
+        // IMPORTANT: We must check the previous chunk as well, because:
+        // 1. The query range start might fall within the duration of the previous chunk
+        // 2. key_hash is the chunk's START time, but the chunk contains data that extends beyond that
+        // 3. If start_idx == index.len(), all chunks start before range.start_ns, but the last chunk might contain our data
+        let scan_start_idx = if start_idx == 0 {
+            0
+        } else {
+            start_idx.saturating_sub(1)
+        };
 
-        let mut prices: Vec<u64> = Vec::new();
+        let mut prices: Vec<u32> = Vec::new();
         let mut volumes: Vec<f32> = Vec::new();
 
         // Iterate through index entries that overlap with the requested time range.
-        for entry in &index[start_idx..] {
+        for entry in &index[scan_start_idx..] {
             // If the block's start time is already after our range ends, we can stop.
             if entry.key_hash() >= range.end_ns {
                 break;
@@ -232,9 +243,10 @@ impl IoService {
                     let ts = timestamps.value(i) as u64;
                     // Filter ticks to be within the requested range
                     if ts >= range.start_ns && ts < range.end_ns {
-                        // Convert price from f64 to u64 (fixed-point representation)
+                        // Convert price from f64 to u32 (fixed-point representation)
                         // Assuming price is in dollars with 2 decimal places, multiply by 100
-                        let price_fixed = (price_array.value(i) * 100.0) as u64;
+                        // u32 max (~4.2 billion) represents prices up to ~42 million
+                        let price_fixed = (price_array.value(i) * 100.0) as u32;
                         prices.push(price_fixed);
                         volumes.push(volume_array.value(i) as f32);
                     }

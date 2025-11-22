@@ -52,6 +52,7 @@ pub enum Message {
         data: FetchedData,
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
+    ComputeVp(String, data::io_service::TimeRange),
 }
 
 pub struct Dashboard {
@@ -373,6 +374,9 @@ impl Dashboard {
                             pane::Effect::FocusWidget(id) => {
                                 return (iced::widget::operation::focus(id), None);
                             }
+                            pane::Effect::RequestVpComputation(symbol, range) => {
+                                return (Task::future(async move { Message::ComputeVp(symbol, range) }), None);
+                            }
                         };
                         return (task, None);
                     }
@@ -404,6 +408,10 @@ impl Dashboard {
                     Task::none(),
                     Some(Event::ResolveStreams { pane_id, streams }),
                 );
+            }
+            Message::ComputeVp(_symbol, _range) => {
+                // This message is handled in main.rs, just pass through
+                return (Task::none(), None);
             }
             Message::Notification(toast) => {
                 return (Task::none(), Some(Event::Notification(toast)));
@@ -848,7 +856,11 @@ impl Dashboard {
                         ticker_info,
                     } = stream_type
                     {
-                        pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &data);
+                        if let Some(pane::Effect::RequestVpComputation(symbol, range)) = 
+                            pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &data) 
+                        {
+                            return Task::future(async move { Message::ComputeVp(symbol, range) });
+                        }
                     }
                 }
             }
@@ -1020,6 +1032,9 @@ impl Dashboard {
                             reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
                         ));
                     }
+                    chart::Action::RequestVpComputation(symbol, time_range) => {
+                        tasks.push(Task::done(Message::ComputeVp(symbol, time_range)));
+                    }
                 },
                 Some(pane::Action::Panel(_action)) => {}
                 Some(pane::Action::ResolveStreams(streams)) => {
@@ -1041,6 +1056,43 @@ impl Dashboard {
             });
 
         Task::batch(tasks)
+    }
+
+    pub fn find_pane_by_symbol(&mut self, symbol: &str) -> Option<&mut pane::State> {
+        log::info!("find_pane_by_symbol: searching for '{}'", symbol);
+        
+        // Search in main window panes
+        let mut pane_count = 0;
+        for (_pane_id, pane_state) in self.panes.iter_mut() {
+            pane_count += 1;
+            if let pane::Content::Kline { chart: Some(chart), .. } = &pane_state.content {
+                let chart_symbol = chart.ticker_info().ticker.to_string();
+                log::info!("  Checking pane {}: chart symbol = '{}'", pane_count, chart_symbol);
+                if chart_symbol == symbol {
+                    log::info!("  MATCH FOUND!");
+                    return Some(pane_state);
+                }
+            } else {
+                log::info!("  Pane {} is not Kline or has no chart", pane_count);
+            }
+        }
+        
+        log::info!("  Checked {} main window panes, no match", pane_count);
+        
+        // Search in popout windows
+        for (_window_id, (panes, _spec)) in self.popout.iter_mut() {
+            for (_pane_id, pane_state) in panes.iter_mut() {
+                if let pane::Content::Kline { chart: Some(chart), .. } = &pane_state.content {
+                    let chart_symbol = chart.ticker_info().ticker.to_string();
+                    if chart_symbol == symbol {
+                        return Some(pane_state);
+                    }
+                }
+            }
+        }
+        
+        log::warn!("find_pane_by_symbol: No match found for '{}'", symbol);
+        None
     }
 
     pub fn resolve_streams(

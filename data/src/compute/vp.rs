@@ -2,13 +2,12 @@
 
 use bytemuck::{self, Pod, Zeroable};
 use crate::arbiter_error::ArbiterError;
-use iced::wgpu::{self as iced_wgpu, util::DeviceExt, BindingType, BufferBindingType, MapMode};
+use wgpu::{self, util::DeviceExt, BindingType, BufferBindingType, MapMode};
 use tokio::sync::oneshot;
-use std::sync::Arc;
 use thiserror::Error;
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct ComputeParams {
     pub num_ticks: u32,
     pub price_resolution: u32,
@@ -18,7 +17,7 @@ pub struct ComputeParams {
 
 // TickDataBuffer to match the shader's input structure
 pub struct TickDataBuffer {
-    pub prices: Vec<u64>,
+    pub prices: Vec<u32>,  // Fixed-point price * 100, using u32 instead of u64 for WGSL compatibility
     pub volumes: Vec<f32>,
 }
 
@@ -43,39 +42,39 @@ pub enum ComputeError {
     #[error("Channel closed unexpectedly")]
     ChannelClosed,
     #[error("Arbiter error: {0}")]
-    ArbiterError(Arc<ArbiterError>),
+    ArbiterError(String),
     #[error("Compute error: {0}")]
     Other(String),
 }
 
 impl From<ArbiterError> for ComputeError {
-    fn from(e: ArbiterError) -> Self {
-        ComputeError::ArbiterError(Arc::new(e))
+    fn from(err: ArbiterError) -> Self {
+        ComputeError::ArbiterError(err.to_string())
     }
 }
 
 /// Manages WGPU resources for the Volume Profile compute shader.
 #[derive(Debug)]
 pub struct VpComputePipeline {
-    pub compute_pipeline: iced_wgpu::ComputePipeline,
-    pub bind_group_layout: iced_wgpu::BindGroupLayout,
+    pub compute_pipeline: wgpu::ComputePipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl VpComputePipeline {
-    pub fn new(device: &iced_wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device) -> Self {
         let shader_source = include_str!("vp_compute.wgsl");
-        let shader_module = device.create_shader_module(iced_wgpu::ShaderModuleDescriptor {
+        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("VP Compute Shader"),
-            source: iced_wgpu::ShaderSource::Wgsl(shader_source.into()),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
         let bind_group_layout =
-            device.create_bind_group_layout(&iced_wgpu::BindGroupLayoutDescriptor {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("VP Bind Group Layout"),
                 entries: &[
-                    iced_wgpu::BindGroupLayoutEntry {
+                    wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: iced_wgpu::ShaderStages::COMPUTE,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: BindingType::Buffer {
                             ty: BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
@@ -83,9 +82,9 @@ impl VpComputePipeline {
                         },
                         count: None,
                     },
-                    iced_wgpu::BindGroupLayoutEntry {
+                    wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: iced_wgpu::ShaderStages::COMPUTE,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: BindingType::Buffer {
                             ty: BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
@@ -93,9 +92,9 @@ impl VpComputePipeline {
                         },
                         count: None,
                     },
-                    iced_wgpu::BindGroupLayoutEntry {
+                    wgpu::BindGroupLayoutEntry {
                         binding: 2,
-                        visibility: iced_wgpu::ShaderStages::COMPUTE,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: BindingType::Buffer {
                             ty: BufferBindingType::Storage { read_only: false },
                             has_dynamic_offset: false,
@@ -103,9 +102,9 @@ impl VpComputePipeline {
                         },
                         count: None,
                     },
-                    iced_wgpu::BindGroupLayoutEntry {
+                    wgpu::BindGroupLayoutEntry {
                         binding: 3,
-                        visibility: iced_wgpu::ShaderStages::COMPUTE,
+                        visibility: wgpu::ShaderStages::COMPUTE,
                         ty: BindingType::Buffer {
                             ty: BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -116,19 +115,17 @@ impl VpComputePipeline {
                 ],
             });
 
-        let pipeline_layout = device.create_pipeline_layout(&iced_wgpu::PipelineLayoutDescriptor {
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("VP Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
-        let compute_pipeline = device.create_compute_pipeline(&iced_wgpu::ComputePipelineDescriptor {
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("VP Compute Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+            entry_point: "main",
         });
 
         Self {
@@ -139,58 +136,58 @@ impl VpComputePipeline {
 
     pub async fn run_aggregation(
         &self,
-        device: &iced_wgpu::Device,
-        queue: &iced_wgpu::Queue,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         ticks: &TickDataBuffer,
         params: &ComputeParams,
         histogram_buckets: u64,
     ) -> Result<VolumeProfile, ComputeError> {
         let histogram_buffer_size = histogram_buckets * std::mem::size_of::<u32>() as u64;
         
-        let price_buffer = device.create_buffer_init(&iced_wgpu::util::BufferInitDescriptor {
+        let price_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("VP Price Buffer"),
             contents: bytemuck::cast_slice(&ticks.prices),
-            usage: iced_wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let volume_buffer = device.create_buffer_init(&iced_wgpu::util::BufferInitDescriptor {
+        let volume_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("VP Volume Buffer"),
             contents: bytemuck::cast_slice(&ticks.volumes),
-            usage: iced_wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let uniform_buffer = device.create_buffer_init(&iced_wgpu::util::BufferInitDescriptor {
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("VP Uniform Buffer"),
             contents: bytemuck::bytes_of(params),
-            usage: iced_wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM,
         });
         
-        let histogram_buffer = device.create_buffer(&iced_wgpu::BufferDescriptor {
+        let histogram_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("VP Histogram Buffer"),
             size: histogram_buffer_size,
-            usage: iced_wgpu::BufferUsages::STORAGE | iced_wgpu::BufferUsages::COPY_SRC | iced_wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let staging_buffer = device.create_buffer(&iced_wgpu::BufferDescriptor { 
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor { 
             label: Some("VP Staging Buffer"),
             size: histogram_buffer_size,
-            usage: iced_wgpu::BufferUsages::MAP_READ | iced_wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let bind_group = device.create_bind_group(&iced_wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("VP Bind Group"),
             layout: &self.bind_group_layout,
             entries: &[
-                iced_wgpu::BindGroupEntry { binding: 0, resource: price_buffer.as_entire_binding() },
-                iced_wgpu::BindGroupEntry { binding: 1, resource: volume_buffer.as_entire_binding() },
-                iced_wgpu::BindGroupEntry { binding: 2, resource: histogram_buffer.as_entire_binding() },
-                iced_wgpu::BindGroupEntry { binding: 3, resource: uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: price_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: volume_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: histogram_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: uniform_buffer.as_entire_binding() },
             ],
         });
 
-        let mut encoder = device.create_command_encoder(&iced_wgpu::CommandEncoderDescriptor {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("VP Command Encoder"),
         });
 
@@ -198,7 +195,7 @@ impl VpComputePipeline {
         encoder.clear_buffer(&histogram_buffer, 0, None);
 
         {
-            let mut compute_pass = encoder.begin_compute_pass(&iced_wgpu::ComputePassDescriptor {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("VP Compute Pass"),
                 timestamp_writes: None,
             });
@@ -241,6 +238,9 @@ impl VpComputePipeline {
                 Err(_e) => Err(ComputeError::MapError),
             });
         });
+
+        // IMPORTANT: Poll the device to ensure the map_async callback is executed
+        device.poll(wgpu::Maintain::Wait);
 
         let compute_result = receiver.await.map_err(|_| ComputeError::ChannelClosed)??;
         Ok(compute_result)

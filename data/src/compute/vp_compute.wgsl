@@ -1,9 +1,9 @@
 // GPGPU compute shader for calculating Session Volume Profile (S-VP)
 
 // Input buffers containing tick data (prices and volumes)
-// Prices are stored as u64 to avoid floating point precision issues.
+// Prices are stored as u32 (fixed-point) to be compatible with standard WGSL.
 // They represent the price multiplied by a scaling factor (e.g., 100 for 2 decimal places).
-@group(0) @binding(0) var<storage, read> prices: array<u64>;
+@group(0) @binding(0) var<storage, read> prices: array<u32>;
 @group(0) @binding(1) var<storage, read> volumes: array<f32>;
 
 // Output buffer for the volume histogram. The index represents the price bucket.
@@ -23,8 +23,8 @@ struct ComputeParams {
 @group(0) @binding(3) var<uniform> compute_params: ComputeParams;
 
 
-[[stage(compute), workgroup_size(64, 1, 1)]]
-fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
+@compute @workgroup_size(64, 1, 1)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let tick_index = global_id.x;
 
     // Boundary check
@@ -33,16 +33,19 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     }
 
     // 1. Read price and volume
-    let price_raw = u32(prices[tick_index]);
+    let price_raw = prices[tick_index];
     let volume_f32 = volumes[tick_index];
 
     // 2. Price Binning
     // Map the raw price to an index in our histogram array.
+    // Note: price_raw and min_price are both u32. Ensure (price_raw - min_price) doesn't underflow logic
+    // (though in Rust side we should ensure min_price <= all prices).
+    if (price_raw < compute_params.min_price) {
+        return;
+    }
     let price_index = (price_raw - compute_params.min_price) / compute_params.price_resolution;
 
     // Boundary check for histogram array to prevent out-of-bounds access
-    // This check is important as price_index could be negative if price_raw < compute_params.min_price
-    // but WGSL u32 prevents that. It could also be very large if price_raw is large.
     if (price_index >= arrayLength(&histogram)) {
         return;
     }
@@ -52,4 +55,3 @@ fn main([[builtin(global_invocation_id)]] global_id: vec3<u32>) {
     let volume_u32 = u32(volume_f32 * f32(compute_params.volume_scaling_factor));
     atomicAdd(&histogram[price_index], volume_u32);
 }
-

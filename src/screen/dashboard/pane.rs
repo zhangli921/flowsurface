@@ -44,6 +44,7 @@ pub enum Effect {
     RequestFetch(FetchRequests),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
+    RequestVpComputation(String, data::io_service::TimeRange),
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -341,7 +342,8 @@ impl State {
         timeframe: Timeframe,
         ticker_info: TickerInfo,
         klines: &[Kline],
-    ) {
+    ) -> Option<Effect> {
+        log::info!("Pane: insert_hist_klines called. Klines count: {}", klines.len());
         match &mut self.content {
             Content::Kline {
                 chart, indicators, ..
@@ -352,6 +354,15 @@ impl State {
 
                 if let Some(id) = req_id {
                     chart.insert_hist_klines(id, klines);
+                    log::info!("Pane: Calling check_vp_update_needed after insert_hist_klines");
+                    if let Some(action) = chart.check_vp_update_needed() {
+                        if let chart::Action::RequestVpComputation(symbol, range) = action {
+                            log::info!("Pane: insert_hist_klines requesting VP for {}", symbol);
+                            return Some(Effect::RequestVpComputation(symbol, range));
+                        }
+                    } else {
+                        log::warn!("Pane: check_vp_update_needed returned None");
+                    }
                 } else {
                     let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
                     let layout = chart.chart_layout();
@@ -366,27 +377,22 @@ impl State {
                         ticker_info,
                         chart.kind(),
                     );
-                }
-            }
-            Content::Comparison(chart) => {
-                let Some(chart) = chart else {
-                    panic!("Comparison chart wasn't initialized when inserting klines");
-                };
-
-                if let Some(id) = req_id {
-                    chart.insert_history(id, ticker_info, klines);
-                } else {
-                    *chart = ComparisonChart::new(
-                        Basis::Time(timeframe),
-                        &[ticker_info],
-                        Some(chart.serializable_config()),
-                    );
+                    log::info!("Pane: New KlineChart created. Checking VP...");
+                    if let Some(action) = chart.check_vp_update_needed() {
+                        if let chart::Action::RequestVpComputation(symbol, range) = action {
+                            log::info!("Pane: New chart requesting VP for {}", symbol);
+                            return Some(Effect::RequestVpComputation(symbol, range));
+                        }
+                    } else {
+                        log::warn!("Pane: New chart check_vp_update_needed returned None");
+                    }
                 }
             }
             _ => {
-                log::error!("pane content not candlestick or footprint");
+                log::error!("insert_hist_klines called on non-kline pane");
             }
         }
+        None
     }
 
     fn has_stream(&self) -> bool {
@@ -935,6 +941,13 @@ impl State {
                 }
                 Content::Kline { chart: Some(c), .. } => {
                     super::chart::update(c, &msg);
+                    if let Some(action) = c.check_vp_update_needed() {
+                        log::info!("Pane: check_vp_update_needed returned action");
+                        if let chart::Action::RequestVpComputation(symbol, range) = action {
+                            log::info!("Pane: Requesting VP computation for {} in range {}-{}", symbol, range.start_ns, range.end_ns);
+                            return Some(Effect::RequestVpComputation(symbol, range));
+                        }
+                    }
                 }
                 _ => {}
             },

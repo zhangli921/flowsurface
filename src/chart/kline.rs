@@ -28,6 +28,7 @@ use enum_map::EnumMap;
 use std::time::Instant;
 
 use crate::chart::renderer;
+use iced::widget::canvas::Cache;
 
 impl Chart for KlineChart {
     type IndicatorKind = KlineIndicator;
@@ -49,7 +50,21 @@ impl Chart for KlineChart {
                 tick_aggr.datapoints.iter().map(|dp| dp.kline).map(Into::into).collect()
             },
         };
-        let svp_data = self.vp_data.as_ref().map(|vp| vp.data.clone()).unwrap_or_else(Vec::new);
+        
+        // log::info!("chart_data: volume_profile is_some = {}", self.chart.state.volume_profile.is_some());
+        let svp_data = self.chart.state.volume_profile.as_ref().map(|vp| {
+            // log::info!("chart_data: VP has {} bars", vp.bars.len());
+            vp.bars.clone()
+        }).unwrap_or_else(|| {
+            // log::info!("chart_data: No VP data, returning empty vec");
+            Vec::new()
+        });
+        
+        if !svp_data.is_empty() {
+            // log::info!("chart_data: Providing {} SVP bars to renderer", svp_data.len());
+        } else {
+            // log::info!("chart_data: svp_data is empty");
+        }
 
         renderer::ChartData {
             kline_data,
@@ -155,6 +170,14 @@ impl Chart for KlineChart {
             PlotData::TickBased(tick_aggr) => tick_aggr.datapoints.is_empty(),
         }
     }
+
+    fn xaxis_cache(&self) -> &Cache {
+        &self.xaxis_cache
+    }
+
+    fn yaxis_cache(&self) -> &Cache {
+        &self.yaxis_cache
+    }
 }
 
 impl PlotConstants for KlineChart {
@@ -198,6 +221,8 @@ pub struct KlineChart {
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
     vp_data: Option<SessionVolumeProfile>,
+    xaxis_cache: Cache,
+    yaxis_cache: Cache,
 }
 
 impl KlineChart {
@@ -219,7 +244,13 @@ impl KlineChart {
                     .with_trades(&raw_trades);
 
                 let base_price_y = timeseries.base_price();
-                let latest_x = timeseries.latest_timestamp().unwrap_or(0);
+                // Fallback to current time if no kline data, so VP can find data in test_data.mmap
+                let latest_x = timeseries.latest_timestamp().unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64
+                });
                 
                 let cell_width = match kind {
                     KlineChartKind::Footprint { .. } => 80.0,
@@ -274,6 +305,8 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     vp_data: None,
+                    xaxis_cache: Cache::default(),
+                    yaxis_cache: Cache::default(),
                 }
             }
             Basis::Tick(interval) => {
@@ -333,6 +366,8 @@ impl KlineChart {
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
                     vp_data: None,
+                    xaxis_cache: Cache::default(),
+                    yaxis_cache: Cache::default(),
                 }
             }
         }
@@ -362,6 +397,10 @@ impl KlineChart {
 
     pub fn kind(&self) -> &KlineChartKind {
         &self.kind
+    }
+
+    pub fn ticker_info(&self) -> &TickerInfo {
+        &self.chart.state.ticker_info
     }
 
     fn missing_data_task(&mut self) -> Option<Action> {
@@ -587,6 +626,7 @@ impl KlineChart {
                     self.request_handler.mark_completed(req_id);
                 }
                 self.invalidate(None);
+                self.chart.state.vp_needs_update = true;
             }
             PlotData::TickBased(_) => {}
         }
@@ -662,7 +702,7 @@ impl KlineChart {
                         .data_source
                         .visible_price_range(start_interval, end_interval)
                     {
-                        let padding = (highest - lowest) * 0.05;
+                        let padding = (highest - lowest) * 0.10;
                         let price_span = (highest - lowest) + (2.0 * padding);
 
                         if price_span > 0.0 && chart.bounds.height > f32::EPSILON {
@@ -713,5 +753,32 @@ impl KlineChart {
                 Some(prev_indi_count),
             );
         }
+    }
+    
+    /// Check if VP computation is needed and return the request if so
+    pub fn check_vp_update_needed(&mut self) -> Option<Action> {
+        if self.chart.state.vp_needs_update {
+            self.chart.state.vp_needs_update = false; // Reset flag
+            let symbol = self.chart.state.ticker_info.ticker.to_string();
+            log::info!("Checking VP update for {}. visible_time_range_ns() call...", symbol);
+            if let Some(time_range) = self.chart.state.visible_time_range_ns() {
+                log::info!("VP Update Needed: {} range {}-{}", symbol, time_range.start_ns, time_range.end_ns);
+                Some(Action::RequestVpComputation(symbol, time_range))
+            } else {
+                log::warn!("VP Update Skipped: visible_time_range_ns returned None (maybe Basis::Tick?)");
+                None
+            }
+        } else {
+            // log::info!("VP Update Not Needed: vp_needs_update is false");
+            None
+        }
+    }
+    
+    /// Update the stored volume profile data
+    pub fn set_volume_profile(&mut self, vp: data::compute::vp::VolumeProfile) {
+        log::info!("set_volume_profile called with {} bars", vp.bars.len());
+        self.chart.state.volume_profile = Some(vp);
+        self.chart.state.vp_needs_update = false;
+        log::info!("Volume Profile updated in KlineChart, vp_needs_update = false");
     }
 }

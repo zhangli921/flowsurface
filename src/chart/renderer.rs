@@ -3,7 +3,8 @@ use iced::advanced::renderer;
 use iced::mouse::{self, Cursor};
 use iced::{event, Rectangle, Vector, Point};
 use iced::widget::shader;
-use iced::wgpu;
+use iced::wgpu::{self, util::DeviceExt};
+use bytemuck;
 
 
 use crate::chart::{ViewState, Message};
@@ -47,12 +48,66 @@ where
 
     fn update(
         &self,
-        _state: &mut Self::State,
-        _event: &event::Event,
-        _bounds: Rectangle,
-        _cursor: Cursor,
+        state: &mut Self::State,
+        event: &event::Event,
+        bounds: Rectangle,
+        cursor: Cursor,
     ) -> Option<iced::widget::Action<M>> {
-        // TODO: Implement event handling logic here, adapting from the old `canvas_interaction` function.
+        // Check if bounds changed
+        if bounds != self.data.view_state.state.bounds {
+             return Some(iced::widget::Action::publish(
+                 crate::chart::Message::BoundsChanged(bounds).into(),
+             ));
+        }
+
+        match event {
+            event::Event::Mouse(mouse_event) => match mouse_event {
+                mouse::Event::ButtonPressed(mouse::Button::Left) => {
+                    if let Some(position) = cursor.position() {
+                        if bounds.contains(position) {
+                            *state = Interaction::Panning {
+                                translation: self.data.view_state.state.translation,
+                                start: position,
+                            };
+                        }
+                    }
+                }
+                mouse::Event::ButtonReleased(mouse::Button::Left) => {
+                    if matches!(*state, Interaction::Panning { .. }) {
+                        *state = Interaction::None;
+                    }
+                }
+                mouse::Event::CursorMoved { position } => {
+                    if let Interaction::Panning { translation, start } = *state {
+                        let delta = *position - start;
+                        let new_translation = translation + Vector::new(delta.x, delta.y);
+                        return Some(iced::widget::Action::publish(
+                            crate::chart::Message::Translated(new_translation).into(),
+                        ));
+                    }
+                    // Emit CrosshairMoved
+                    // return Some(iced::widget::Action::publish(
+                    //     crate::chart::Message::CrosshairMoved.into(),
+                    // ));
+                }
+                mouse::Event::WheelScrolled { delta } => {
+                    if let Some(cursor_position) = cursor.position_in(bounds) {
+                        let delta_y = match delta {
+                            mouse::ScrollDelta::Lines { y, .. } => *y,
+                            mouse::ScrollDelta::Pixels { y, .. } => *y,
+                        };
+                        
+                        if delta_y != 0.0 {
+                             return Some(iced::widget::Action::publish(
+                                crate::chart::Message::XScaling(delta_y, cursor_position.x, true).into(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
         None
     }
 
@@ -80,38 +135,107 @@ pub struct ChartRenderer {
     pub view_state: ViewState,
 }
 
-// This is the placeholder for our custom WGPU renderer state
-pub struct ChartWgpuRenderer;
+use crate::chart::svp_renderer::{SvpRenderer, SvpUniforms};
+use crate::chart::kline_renderer::KlineRenderer;
+
+// The WGPU renderer state that holds all rendering resources
+pub struct ChartWgpuRenderer {
+    kline_renderer: KlineRenderer,
+    svp_renderer: Option<SvpRenderer>,
+}
 
 impl shader::Primitive for ChartRenderer {
     type Renderer = ChartWgpuRenderer;
 
     fn initialize(
         &self,
-        _device: &wgpu::Device,
+        device: &wgpu::Device,
         _queue: &wgpu::Queue,
-        _format: wgpu::TextureFormat,
+        format: wgpu::TextureFormat,
     ) -> Self::Renderer {
-        ChartWgpuRenderer
+        log::info!("Initializing ChartWgpuRenderer");
+        
+        // Initialize renderers
+        let kline_renderer = KlineRenderer::new(device, format);
+        let svp_renderer = SvpRenderer::new(device, format);
+        
+        ChartWgpuRenderer {
+            kline_renderer,
+            svp_renderer: Some(svp_renderer),
+        }
     }
 
     fn prepare(
         &self,
-        _renderer: &mut Self::Renderer,
-        _device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        _bounds: &Rectangle,
+        renderer: &mut Self::Renderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bounds: &Rectangle,
         _viewport: &shader::Viewport,
     ) {
-        // Prepare data for rendering
+        // Prepare K-line data
+        renderer.kline_renderer.prepare(device, queue, &self.kline_data, &self.view_state, bounds);
+
+        // Prepare SVP data for rendering
+        if !self.svp_data.is_empty() {
+            if let Some(svp_renderer) = &mut renderer.svp_renderer {
+                // Create uniforms from view_state
+                let uniforms = create_svp_uniforms(&self.view_state, bounds);
+                
+                // Delegate preparation to SvpRenderer
+                svp_renderer.prepare(device, queue, &self.svp_data, &self.view_state, uniforms);
+            }
+        }
     }
     
     fn draw(
         &self,
-        _renderer: &Self::Renderer,
-        _render_pass: &mut wgpu::RenderPass<'_>,
+        renderer: &Self::Renderer,
+        render_pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        // Draw the primitive
-        false
+        // Draw K-lines (bottom layer)
+        renderer.kline_renderer.draw(render_pass);
+        
+        // Draw SVP (top layer)
+        if let Some(svp_renderer) = &renderer.svp_renderer {
+            svp_renderer.draw(render_pass);
+        }
+        
+        // Return true to indicate we handled the rendering
+        true
+    }
+}
+
+/// Helper function to create SVP uniforms from view state
+fn create_svp_uniforms(view_state: &ViewState, bounds: &Rectangle) -> SvpUniforms {
+    let state = &view_state.state;
+    
+    // Create orthographic projection matrix for 2D rendering
+    // Map chart space to clip space [-1, 1]
+    let visible_region = state.visible_region(bounds.size());
+    
+    // Simple orthographic projection
+    let left = visible_region.x;
+    let right = visible_region.x + visible_region.width;
+    let bottom = visible_region.y + visible_region.height;
+    let top = visible_region.y;
+    
+    let projection = [
+        [2.0 / (right - left), 0.0, 0.0, 0.0],
+        [0.0, 2.0 / (top - bottom), 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [-(right + left) / (right - left), -(top + bottom) / (top - bottom), 0.0, 1.0],
+    ];
+    
+    SvpUniforms {
+        projection: bytemuck::cast(projection),
+        chart_min_price: state.y_to_price(visible_region.y + visible_region.height).to_f32_lossy(),
+        chart_max_price: state.y_to_price(visible_region.y).to_f32_lossy(),
+        chart_min_x: left,
+        chart_max_x: right,
+        svp_x_offset: right - (visible_region.width * 0.15), // 15% from right edge
+        svp_max_width: visible_region.width * 0.12, // 12% of chart width
+        price_tick_size: state.cell_height,
+        _padding: 0.0,
     }
 }

@@ -91,7 +91,7 @@ enum Message {
     FetchKLines(String, TimeRange),
     KLineDataFetched(Result<Vec<KLine>, Arc<ArbiterError>>),
     ComputeVp(String, TimeRange), // symbol, time range
-    VpComputed(Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>),
+    VpComputed(String, Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>), // (symbol, result)
     VpServiceInitialized(Result<Arc<VpComputeService>, String>),
     Tick(std::time::Instant),
     WindowEvent(window::Event),
@@ -278,10 +278,11 @@ impl Flowsurface {
                     }
                 }
             }
-            Message::ComputeVp(_symbol, range) => {
+            Message::ComputeVp(symbol, range) => {
                 if let Some(service) = &self.vp_service {
                     let service = service.clone();
                     let io_service = self.arbiter.io_service().clone();
+                    let symbol_clone = symbol.clone();
                     
                     return Task::future(async move {
                         // Fetch ticks from IoService in a blocking task
@@ -292,18 +293,19 @@ impl Flowsurface {
                                 Ok(ticks) => ticks,
                                 Err(e) => {
                                     let compute_err: data::compute::vp::ComputeError = e.into();
-                                    return Message::VpComputed(Err(compute_err));
+                                    return Message::VpComputed(symbol_clone.clone(), Err(compute_err));
                                 },
                             },
-                            Err(e) => return Message::VpComputed(Err(
+                            Err(e) => return Message::VpComputed(symbol_clone.clone(), Err(
                                 data::compute::vp::ComputeError::Other(format!("Spawn blocking failed: {}", e))
                             )),
                         };
                         
                         // Calculate compute parameters
                         let num_ticks = ticks.prices.len() as u32;
+                        log::info!("Received {} ticks for VP computation", num_ticks);
                         if num_ticks == 0 {
-                            return Message::VpComputed(Err(
+                            return Message::VpComputed(symbol_clone.clone(), Err(
                                 data::compute::vp::ComputeError::Other("No ticks found".to_string())
                             ));
                         }
@@ -318,28 +320,44 @@ impl Flowsurface {
                             num_ticks,
                             price_resolution,
                             min_price,
-                            volume_scaling_factor: 1,
+                            volume_scaling_factor: 10000, // Scale by 10000 to preserve 4 decimal places
                         };
                         
                         // Run compute on GPU
                         let result = service.compute_vp(&ticks, &params, histogram_buckets).await;
-                        Message::VpComputed(result)
+                        Message::VpComputed(symbol_clone, result)
                     });
                 } else {
                     log::warn!("ComputeVp requested but VpComputeService is not ready.");
                 }
             }
-            Message::VpComputed(result) => {
+            Message::VpComputed(symbol, result) => {
                 match result {
                     Ok(profile) => {
-                        log::info!("Volume Profile computed: POC at {}, {} bars", profile.point_of_control, profile.bars.len());
-                        // TODO: Store profile in ChartState for rendering
+                        log::info!("Volume Profile computed for {}: POC at {}, {} bars", symbol, profile.point_of_control, profile.bars.len());
+                        
+                        // Find the chart for this symbol and update its VP data
+                        let dashboard = self.active_dashboard_mut();
+                        log::info!("Searching for chart with symbol: {}", symbol);
+                        
+                        if let Some(pane) = dashboard.find_pane_by_symbol(&symbol) {
+                            log::info!("Found pane for symbol {}", symbol);
+                            if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
+                                log::info!("Found Kline chart, calling set_volume_profile");
+                                chart.set_volume_profile(profile);
+                                log::info!("VP data stored in chart for {}", symbol);
+                            } else {
+                                log::warn!("Pane content is not Kline or chart is None");
+                            }
+                        } else {
+                            log::warn!("No chart found for symbol {} to store VP data", symbol);
+                        }
                     }
                     Err(e) => {
-                        log::error!("Volume Profile computation failed: {}", e);
+                        log::error!("Volume Profile computation failed for {}: {}", symbol, e);
                         self.notifications.push(Toast::error(format!(
-                            "VP Compute Failed: {}",
-                            e
+                            "VP Compute Failed for {}: {}",
+                            symbol, e
                         )));
                     }
                 }
@@ -460,6 +478,11 @@ impl Flowsurface {
                 self.theme = theme.clone();
             }
             Message::Dashboard(id, message) => {
+                // Handle ComputeVp specially - forward to main app's ComputeVp handler
+                if let dashboard::Message::ComputeVp(symbol, range) = &message {
+                    return self.update(Message::ComputeVp(symbol.clone(), *range));
+                }
+                
                 let main_window = self.main_window;
                 let layout_id = id.unwrap_or(self.layout_manager.active_layout().id);
 
@@ -808,22 +831,11 @@ impl Flowsurface {
     }
 
     fn load_layout(&mut self, layout: layout::Layout, main_window: window::Id) -> Task<Message> {
-        let arbiter_task = {
-            let now = chrono::Utc::now();
-            let start = now - chrono::Duration::hours(24);
-            let range = TimeRange {
-                start_ns: start.timestamp_nanos_opt().unwrap_or(0) as u64,
-                end_ns: now.timestamp_nanos_opt().unwrap_or(0) as u64,
-            };
-            Task::done(Message::FetchKLines("BTCUSDT".to_string(), range))
-        };
-
         self.layout_manager
             .set_active_layout(layout.clone())
             .expect("Failed to set active layout")
             .load_layout(main_window)
             .map(move |msg| Message::Dashboard(Some(layout.id), msg))
-            .chain(arbiter_task)
     }
 
     fn view_with_modal<'a>(

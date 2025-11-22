@@ -31,7 +31,6 @@ impl ArbiterService {
         }
     }
 
-    /// Returns a reference to the IoService for direct access to raw data.
     pub fn io_service(&self) -> &IoService {
         &self.io_service
     }

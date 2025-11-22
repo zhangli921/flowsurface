@@ -2,6 +2,7 @@ use super::{
     Chart, Message, PlotConstants, ViewState,
 };
 use crate::chart::renderer;
+use iced::widget::canvas::Cache;
 use crate::modal::pane::settings::study::{self, Study};
 use data::chart::{
     Basis, ViewConfig,
@@ -109,6 +110,14 @@ impl Chart for HeatmapChart {
     fn is_empty(&self) -> bool {
         self.trades.datapoints.is_empty()
     }
+
+    fn xaxis_cache(&self) -> &Cache {
+        &self.xaxis_cache
+    }
+
+    fn yaxis_cache(&self) -> &Cache {
+        &self.yaxis_cache
+    }
 }
 
 impl PlotConstants for HeatmapChart {
@@ -157,6 +166,8 @@ pub struct HeatmapChart {
     study_configurator: study::Configurator<HeatmapStudy>,
     last_tick: Instant,
     pub studies: Vec<HeatmapStudy>,
+    xaxis_cache: Cache,
+    yaxis_cache: Cache,
 }
 
 impl HeatmapChart {
@@ -203,6 +214,8 @@ impl HeatmapChart {
             study_configurator: study::Configurator::new(),
             studies,
             last_tick: Instant::now(),
+            xaxis_cache: Cache::default(),
+            yaxis_cache: Cache::default(),
         }
     }
 

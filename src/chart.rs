@@ -6,6 +6,7 @@ mod scale;
 pub mod renderer;
 pub mod svp_renderer;
 pub mod kline_renderer;
+pub mod axes;
 
 use crate::style;
 use crate::widget::multi_split::{MultiSplit};
@@ -17,9 +18,11 @@ use exchange::util::{Price, PriceStep};
 
 use iced::{
     padding, Alignment, Element, Length, Point, Rectangle, Size, Theme, Vector,
-    widget::{button, center, column, container, mouse_area, row, rule, text, shader},
+    widget::{button, center, column, container, mouse_area, row, rule, text, shader, canvas},
 };
+use iced::widget::canvas::Cache;
 use crate::chart::renderer::UnifiedChartProgram;
+use crate::chart::axes::{XAxis, YAxis};
 
 const ZOOM_SENSITIVITY: f32 = 30.0;
 
@@ -57,11 +60,15 @@ pub trait Chart: PlotConstants {
     fn autoscaled_coords(&self) -> Vector;
     fn supports_fit_autoscaling(&self) -> bool;
     fn is_empty(&self) -> bool;
+    
+    fn xaxis_cache(&self) -> &Cache;
+    fn yaxis_cache(&self) -> &Cache;
 }
 
 pub enum Action {
     ErrorOccurred(data::InternalError),
     RequestFetch(exchange::fetcher::FetchRequests),
+    RequestVpComputation(String, data::io_service::TimeRange),
 }
 
 pub fn update<T: Chart>(chart: &mut T, message: &Message) {
@@ -95,12 +102,14 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
                 state.translation = *translation;
                 state.layout.autoscale = None;
             }
+            state.vp_needs_update = true;
         }
         Message::Scaled(scaling, translation) => {
             let state = chart.mut_state();
             state.scaling = *scaling;
             state.translation = *translation;
             state.layout.autoscale = None;
+            state.vp_needs_update = true;
         }
         Message::AutoscaleToggled => {
             let supports_fit_autoscaling = chart.supports_fit_autoscaling();
@@ -180,6 +189,7 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
                     state.layout.autoscale = None;
                 }
             }
+            state.vp_needs_update = true;
         }
         Message::YScaling(delta, cursor_to_center_y, is_wheel_scroll) => {
             let min_cell_height = T::min_cell_height(chart);
@@ -224,6 +234,10 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
         }
         Message::CrosshairMoved => return chart.invalidate_crosshair(),
     }
+    // Invalidate caches when state changes
+    chart.xaxis_cache().clear();
+    chart.yaxis_cache().clear();
+    
     chart.invalidate_all();
 }
 
@@ -233,8 +247,11 @@ pub fn view<'a, T: Chart>(chart: &'a T, indicators: &'a [T::IndicatorKind], _tim
     }
     let state = chart.state();
 
-    // TODO: Re-implement axis labels with a WGPU-compatible method
-    let axis_labels_x = container(text("X-Axis")).width(Length::Fill).height(Length::Fill);
+    // Axis rendering using Canvas
+    let axis_labels_x = Element::from(canvas(XAxis::new(state, chart.xaxis_cache()))
+        .width(Length::Fill)
+        .height(Length::Fill))
+        .map(|_| Message::CrosshairMoved);
 
     let buttons = {
         let (autoscale_btn_placeholder, autoscale_btn_tooltip) = match state.layout.autoscale {
@@ -255,8 +272,10 @@ pub fn view<'a, T: Chart>(chart: &'a T, indicators: &'a [T::IndicatorKind], _tim
     };
     let y_labels_width = state.y_labels_width();
     let content = {
-        // TODO: Re-implement axis labels with a WGPU-compatible method
-        let axis_labels_y = container(text("Y-Axis")).width(Length::Fill).height(Length::Fill);
+        let axis_labels_y = Element::from(canvas(YAxis::new(state, chart.yaxis_cache()))
+            .width(Length::Fill)
+            .height(Length::Fill))
+            .map(|_| Message::CrosshairMoved);
 
         let main_chart_shader = shader::Shader::new(UnifiedChartProgram {
             data: chart.chart_data(),
@@ -322,6 +341,7 @@ pub struct ChartState {
     pub ticker_info: TickerInfo,
     pub layout: ViewConfig,
     pub volume_profile: Option<data::compute::vp::VolumeProfile>,
+    pub vp_needs_update: bool,
 }
 
 impl ChartState {
@@ -351,6 +371,20 @@ impl ChartState {
                     self.x_to_interval(region.x + region.width).saturating_add(interval / 2),
                 )
             }
+        }
+    }
+
+    pub fn visible_time_range_ns(&self) -> Option<data::io_service::TimeRange> {
+        match self.basis {
+            Basis::Time(_) => {
+                let region = self.visible_region(self.bounds.size());
+                let (start, end) = self.interval_range(&region);
+                Some(data::io_service::TimeRange {
+                    start_ns: start * 1_000_000,
+                    end_ns: end * 1_000_000,
+                })
+            }
+            _ => None,
         }
     }
     pub fn price_range(&self, region: &Rectangle) -> (Price, Price) {
@@ -447,6 +481,7 @@ impl ViewState {
                 ticker_info,
                 layout,
                 volume_profile: None,
+                vp_needs_update: true,
             },
             // cache: Caches::default(),
         }

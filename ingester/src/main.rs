@@ -14,6 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::mem;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC_NUMBER: &[u8; 8] = b"ZEROCPY!";
 const DATA_VERSION: u16 = 1;
@@ -40,7 +41,21 @@ fn write_as_bytes<T>(writer: &mut impl Write, data: &T) -> std::io::Result<()> {
 fn generate_dummy_trades(count: usize) -> Vec<Trade> {
     let mut rng = thread_rng();
     let mut trades = Vec::with_capacity(count);
-    let start_time = 1732056000_000_000_000; // A timestamp in late 2025 (nanoseconds)
+    
+    // Use current time + 48 hours as the end point, and go back 72 hours (total 3 days of data)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_nanos() as u64;
+    
+    let future_buffer = 48 * 60 * 60 * 1_000_000_000; // 48 hours in ns
+    let history_duration = 72 * 60 * 60 * 1_000_000_000; // 72 hours in ns
+    
+    let end_time = now + future_buffer;
+    let start_time = end_time - history_duration;
+    
+    println!("Generating trades from {} to {} ns (covering now: {})", start_time, end_time, now);
+    
     let mut current_price = 70000.0;
     let time_increment_ns = 100_000_000; // 100 milliseconds apart, 10 ticks per second
 
@@ -108,7 +123,9 @@ fn record_batch_to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, parquet
 
 fn main() {
     println!("Generating dummy trade data...");
-    let trades = generate_dummy_trades(24 * 60 * 60 * 10); // Approx 24 hours of 100ms interval trades
+    // Generate 72 hours of data at 100ms intervals (10 ticks/second)
+    // 72 hours * 3600 seconds/hour * 10 ticks/second = 2,592,000 ticks
+    let trades = generate_dummy_trades(72 * 60 * 60 * 10);
 
     println!("Processing trades into time-indexed blocks...");
     let mut all_index_entries: Vec<IndexEntry> = Vec::new();
