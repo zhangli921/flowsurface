@@ -6,16 +6,19 @@ use arrow::record_batch::RecordBatch;
 use exchange::{util::Price, Trade};
 use futures_util::StreamExt;
 use parquet::arrow::arrow_writer::ArrowWriter;
-use reqwest::Client; // Async Client
+use reqwest::Client;
 use serde::Deserialize;
 use storage::{FileHeader, IndexEntry};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio::sync::mpsc;
+use log::{info, error, warn};
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
 
 const MAGIC_NUMBER: &[u8; 8] = b"ZEROCPY!";
 const DATA_VERSION: u16 = 1;
@@ -34,6 +37,186 @@ struct AggTrade {
     #[serde(rename = "m")]
     is_buyer_maker: bool,
 }
+
+// Command enum for controlling the Ingestion Service
+#[derive(Debug, Clone)]
+pub enum IngestCommand {
+    Subscribe(String), // Symbol
+    Unsubscribe(String),
+    Shutdown,
+}
+
+pub struct IngestionService {
+    command_rx: mpsc::Receiver<IngestCommand>,
+    active_symbol: Option<String>,
+    abort_handle: Option<tokio::task::JoinHandle<()>>,
+    data_dir: PathBuf,
+}
+
+impl IngestionService {
+    pub fn new(command_rx: mpsc::Receiver<IngestCommand>, data_dir: PathBuf) -> Self {
+        Self {
+            command_rx,
+            active_symbol: None,
+            abort_handle: None,
+            data_dir,
+        }
+    }
+
+    pub async fn run(mut self) {
+        info!("IngestionService started.");
+        while let Some(cmd) = self.command_rx.recv().await {
+            match cmd {
+                IngestCommand::Subscribe(symbol) => {
+                    info!("IngestCommand::Subscribe: {}", symbol);
+                    self.switch_symbol(&symbol).await;
+                }
+                IngestCommand::Unsubscribe(symbol) => {
+                     if self.active_symbol.as_deref() == Some(&symbol) {
+                         info!("IngestCommand::Unsubscribe: {}", symbol);
+                         self.stop_current_task();
+                     }
+                }
+                IngestCommand::Shutdown => {
+                    info!("IngestionService shutting down.");
+                    self.stop_current_task();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn stop_current_task(&mut self) {
+        if let Some(handle) = self.abort_handle.take() {
+            handle.abort(); // Cancel the running task
+        }
+        self.active_symbol = None;
+    }
+
+    async fn switch_symbol(&mut self, symbol: &str) {
+        if self.active_symbol.as_deref() == Some(symbol) {
+            return; // Already active
+        }
+        
+        self.stop_current_task();
+        
+        let symbol_clone = symbol.to_string();
+        let data_dir = self.data_dir.clone();
+        
+        // Spawn a new task for this symbol
+        let handle = tokio::spawn(async move {
+            run_ingest_task(symbol_clone, data_dir).await;
+        });
+        
+        self.abort_handle = Some(handle);
+        self.active_symbol = Some(symbol.to_string());
+    }
+}
+
+async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
+    info!("Starting ingestion task for {}", symbol);
+    
+    let filename = format!("{}.mmap", symbol);
+    let mmap_path = data_dir.join(filename);
+    let mmap_path_str = mmap_path.to_str().unwrap();
+    
+    // Construct WS URL dynamically
+    let ws_url = format!("wss://stream.binance.com:9443/ws/{}@aggTrade", symbol.to_lowercase());
+
+    // 1. Initialize Mmap Writer
+    let (mut writer, last_timestamp) = MmapWriter::open_or_create(mmap_path_str);
+    
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    // Default 2h history
+    let default_duration_hours = 2;
+    
+    let start_ms = if let Some(last_ts) = last_timestamp {
+        info!("[{}] Resuming download from: {}", symbol, last_ts);
+        last_ts + 1 // Start from next ms to avoid duplication logic (or let append_chunk handle it)
+    } else {
+        now_ms - (default_duration_hours * 60 * 60 * 1000)
+    };
+
+    if start_ms < now_ms {
+        let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+        let history_trades = fetch_binance_trades(&client, &symbol, start_ms, now_ms).await;
+
+        let chunk_interval_ns: u64 = 60 * 1_000_000_000; // 1 minute
+        if !history_trades.is_empty() {
+            info!("[{}] Appending {} history trades...", symbol, history_trades.len());
+            let mut current_chunk_start = history_trades[0].time - (history_trades[0].time % chunk_interval_ns);
+            let mut chunk_trades = Vec::new();
+
+            for trade in history_trades {
+                if trade.time >= current_chunk_start + chunk_interval_ns {
+                    writer.append_chunk(&chunk_trades, current_chunk_start);
+                    chunk_trades.clear();
+                    while trade.time >= current_chunk_start + chunk_interval_ns {
+                        current_chunk_start += chunk_interval_ns;
+                    }
+                }
+                chunk_trades.push(trade);
+            }
+            if !chunk_trades.is_empty() {
+                writer.append_chunk(&chunk_trades, current_chunk_start);
+            }
+        }
+    }
+
+    // 4. Live Streaming
+    info!("[{}] Connecting to WebSocket: {}...", symbol, ws_url);
+    let connect_res = connect_async(&ws_url).await;
+    
+    if let Err(e) = connect_res {
+        error!("[{}] Failed to connect WS: {}", symbol, e);
+        return;
+    }
+    
+    let (ws_stream, _) = connect_res.unwrap();
+    info!("[{}] Connected! Streaming...", symbol);
+
+    let (_, mut read) = ws_stream.split();
+    let mut live_buffer: Vec<Trade> = Vec::new();
+    let mut last_flush_time = SystemTime::now();
+    let flush_interval = Duration::from_secs(1);
+
+    while let Some(message) = read.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                if let Ok(trade) = serde_json::from_str::<AggTrade>(&text) {
+                    let price_f = trade.price.parse::<f32>().unwrap_or(0.0);
+                    let qty_f = trade.qty.parse::<f32>().unwrap_or(0.0);
+                    
+                    live_buffer.push(Trade {
+                        time: trade.time * 1_000_000,
+                        is_sell: trade.is_buyer_maker,
+                        price: Price::from_f32(price_f),
+                        qty: qty_f,
+                    });
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Err(e) => {
+                error!("[{}] WS Error: {}", symbol, e);
+                break; // Exit loop to restart? For now just exit task.
+            },
+            _ => {}
+        }
+
+        if last_flush_time.elapsed().unwrap() >= flush_interval {
+            if !live_buffer.is_empty() {
+                // Use first trade timestamp for chunk key - simple appending
+                let chunk_time = live_buffer[0].time;
+                writer.append_chunk(&live_buffer, chunk_time);
+                live_buffer.clear();
+            }
+            last_flush_time = SystemTime::now();
+        }
+    }
+    warn!("[{}] Ingestion task ended.", symbol);
+}
+
+// --- Helpers from original main.rs ---
 
 fn write_as_bytes<T>(writer: &mut impl Write, data: &T) -> std::io::Result<()> {
     let bytes = unsafe {
@@ -86,12 +269,11 @@ fn record_batch_to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, parquet
     Ok(buffer)
 }
 
-// Async version of fetch_binance_trades
 async fn fetch_binance_trades(client: &Client, symbol: &str, start_time_ms: u64, end_time_ms: u64) -> Vec<Trade> {
     let mut trades = Vec::new();
     let mut current_start = start_time_ms;
 
-    println!("Fetching trades for {} from {} to {}...", symbol, start_time_ms, end_time_ms);
+    info!("Fetching trades for {} from {} to {}...", symbol, start_time_ms, end_time_ms);
 
     while current_start < end_time_ms {
         let url = format!(
@@ -127,24 +309,18 @@ async fn fetch_binance_trades(client: &Client, symbol: &str, start_time_ms: u64,
                                     qty: qty_f,
                                 });
                             }
-                            
-                            if trades.len() % 50_000 == 0 {
-                                print!("\rFetched {} trades... ", trades.len());
-                                // Flush stdout not straightforward in async, skipping or using println occasionally
-                            }
                         }
-                        Err(e) => { eprintln!("JSON Error: {}", e); tokio::time::sleep(Duration::from_secs(1)).await; }
+                        Err(e) => { error!("JSON Error: {}", e); tokio::time::sleep(Duration::from_secs(1)).await; }
                     }
                 } else {
-                    if resp.status().as_u16() == 429 { tokio::time::sleep(Duration::from_secs(60)).await; }
-                    else { tokio::time::sleep(Duration::from_secs(1)).await; }
+                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
-            Err(e) => { eprintln!("Conn Error: {}", e); tokio::time::sleep(Duration::from_secs(1)).await; }
+            Err(e) => { error!("Conn Error: {}", e); tokio::time::sleep(Duration::from_secs(1)).await; }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // tokio::time::sleep(Duration::from_millis(10)).await; // Rate limit niceness
     }
-    println!("\nFinished fetching. Total trades: {}", trades.len());
+    info!("Finished fetching {}. Total trades: {}", symbol, trades.len());
     trades
 }
 
@@ -161,6 +337,11 @@ impl MmapWriter {
         let index_size = INDEX_CAPACITY * mem::size_of::<IndexEntry>();
         let expected_payload_start = header_size + index_size;
 
+        // Ensure directory exists
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -173,7 +354,7 @@ impl MmapWriter {
 
         let mut writer = if file_len >= header_size as u64 {
             // Try to read existing file
-            println!("Found existing Mmap file, checking validity...");
+            info!("Found existing Mmap file {}, checking validity...", path);
             let mut header_buf = vec![0u8; header_size];
             file.read_exact(&mut header_buf).unwrap();
             
@@ -203,7 +384,7 @@ impl MmapWriter {
                         0
                     };
                     
-                    println!("Resuming from existing file. Entries: {}, Last Time: {:?}", index_count, last_timestamp);
+                    info!("Resuming from existing file. Entries: {}, Last Time: {:?}", index_count, last_timestamp);
 
                     Self {
                         file,
@@ -212,15 +393,15 @@ impl MmapWriter {
                         current_payload_offset,
                     }
                 } else {
-                    println!("Failed to read indices, re-creating file.");
+                    warn!("Failed to read indices, re-creating file.");
                     Self::create_new(file, expected_payload_start)
                 }
             } else {
-                println!("Invalid magic/version, re-creating file.");
+                warn!("Invalid magic/version, re-creating file.");
                 Self::create_new(file, expected_payload_start)
             }
         } else {
-            println!("Creating new Mmap file...");
+            info!("Creating new Mmap file {}...", path);
             Self::create_new(file, expected_payload_start)
         };
         
@@ -263,7 +444,7 @@ impl MmapWriter {
         if trades.is_empty() { return; }
         
         if self.index_entries.len() >= INDEX_CAPACITY {
-            eprintln!("Index capacity reached! Cannot append more chunks.");
+            error!("Index capacity reached! Cannot append more chunks.");
             return;
         }
 
@@ -277,16 +458,15 @@ impl MmapWriter {
         let existing_idx = self.index_entries.iter().position(|e| e.key_hash == chunk_start_ns);
 
         if let Some(idx) = existing_idx {
-            let old_len = self.index_entries[idx].length;
-            println!("Replacing duplicate chunk for time {}. Old len: {}, New len: {}", chunk_start_ns, old_len, payload.len());
-            
-            self.index_entries[idx] = IndexEntry {
+            // Replace
+             self.index_entries[idx] = IndexEntry {
                 key_hash: chunk_start_ns,
                 start_offset: self.current_payload_offset,
                 length: payload.len() as u32,
                 reserved: 0,
             };
         } else {
+            // New
             let index_entry = IndexEntry {
                 key_hash: chunk_start_ns,
                 start_offset: self.current_payload_offset,
@@ -304,93 +484,7 @@ impl MmapWriter {
         self.write_header();
         
         self.file.sync_all().unwrap();
-        println!("Appended chunk: {} trades. Total Indices: {}", trades.len(), self.index_entries.len());
+        info!("Appended chunk: {} trades.", trades.len());
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let symbol = "BTCUSDT";
-    let ws_url = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
-    let mmap_path = "test_data.mmap";
-
-    let (mut writer, last_timestamp) = MmapWriter::open_or_create(mmap_path);
-    
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-    let default_duration_hours = 24;
-    
-    let start_ms = if let Some(last_ts) = last_timestamp {
-        println!("Resuming download from: {}", last_ts);
-        last_ts
-    } else {
-        now_ms - (default_duration_hours * 60 * 60 * 1000)
-    };
-
-    if start_ms < now_ms {
-        let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-        // DIRECT AWAIT, NO THREAD SPAWNING
-        let history_trades = fetch_binance_trades(&client, symbol, start_ms, now_ms).await;
-
-        let chunk_interval_ns: u64 = 60 * 1_000_000_000; // 1 minute
-        if !history_trades.is_empty() {
-            println!("Appending history to Mmap...");
-            let mut current_chunk_start = history_trades[0].time - (history_trades[0].time % chunk_interval_ns);
-            let mut chunk_trades = Vec::new();
-
-            for trade in history_trades {
-                if trade.time >= current_chunk_start + chunk_interval_ns {
-                    writer.append_chunk(&chunk_trades, current_chunk_start);
-                    chunk_trades.clear();
-                    while trade.time >= current_chunk_start + chunk_interval_ns {
-                        current_chunk_start += chunk_interval_ns;
-                    }
-                }
-                chunk_trades.push(trade);
-            }
-            if !chunk_trades.is_empty() {
-                writer.append_chunk(&chunk_trades, current_chunk_start);
-            }
-        }
-    } else {
-        println!("Data is up to date.");
-    }
-
-    println!("Connecting to WebSocket: {}...", ws_url);
-    let (ws_stream, _) = connect_async(ws_url).await.expect("Failed to connect");
-    println!("Connected! Listening for live trades...");
-
-    let (_, mut read) = ws_stream.split();
-    let mut live_buffer: Vec<Trade> = Vec::new();
-    let mut last_flush_time = SystemTime::now();
-    let flush_interval = Duration::from_secs(1);
-
-    while let Some(message) = read.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                if let Ok(trade) = serde_json::from_str::<AggTrade>(&text) {
-                    let price_f = trade.price.parse::<f32>().unwrap_or(0.0);
-                    let qty_f = trade.qty.parse::<f32>().unwrap_or(0.0);
-                    
-                    live_buffer.push(Trade {
-                        time: trade.time * 1_000_000,
-                        is_sell: trade.is_buyer_maker,
-                        price: Price::from_f32(price_f),
-                        qty: qty_f,
-                    });
-                }
-            }
-            Ok(Message::Close(_)) => break,
-            Err(e) => eprintln!("WS Error: {}", e),
-            _ => {}
-        }
-
-        if last_flush_time.elapsed().unwrap() >= flush_interval {
-            if !live_buffer.is_empty() {
-                let chunk_time = live_buffer[0].time;
-                writer.append_chunk(&live_buffer, chunk_time);
-                live_buffer.clear();
-            }
-            last_flush_time = SystemTime::now();
-        }
-    }
-}

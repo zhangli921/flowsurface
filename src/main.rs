@@ -12,6 +12,7 @@ mod window;
 use data::{
     self,
     arbiter_service::ArbiterService,
+    ingester::{IngestionService, IngestCommand},
     compute::service::VpComputeService,
     config::theme::default_theme,
     io_service::{IoService, TimeRange},
@@ -81,6 +82,7 @@ struct Flowsurface {
     timezone: data::UserTimezone,
     theme: data::Theme,
     notifications: Vec<Toast>,
+    ingest_tx: tokio::sync::mpsc::Sender<IngestCommand>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,25 +114,18 @@ enum Message {
 
 impl Flowsurface {
     fn new() -> (Self, Task<Message>) {
+        // --- Start Ingestion Service ---
+        let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(100);
+        let data_dir = data::data_path(Some("market_data")); 
+        let ingestion_service = IngestionService::new(ingest_rx, data_dir);
+        tokio::spawn(ingestion_service.run());
+        // -------------------------------
+
         // --- Start of Arbiter Service Initialization ---
         let mmap_path = {
-            let mut path = env::current_dir().unwrap();
-            if path.ends_with("flowsurface") {
-                // Running from workspace root
-                path.push("test_data.mmap");
-            } else {
-                // Assuming we are in flowsurface/
-                path.pop();
-                path.push("test_data.mmap");
-            }
-            if !path.exists() {
-                // Fallback for release build structure
-                if let Ok(mut exe_path) = env::current_exe() {
-                    exe_path.pop(); // remove binary name
-                    exe_path.push("test_data.mmap");
-                    path = exe_path;
-                }
-            }
+            let mut path = data::data_path(Some("market_data"));
+            std::fs::create_dir_all(&path).ok();
+            path.push("BTCUSDT.mmap"); // Default to BTCUSDT
             path
         };
 
@@ -182,6 +177,7 @@ impl Flowsurface {
             preferred_currency: saved_state.preferred_currency,
             theme: saved_state.theme,
             notifications: vec![],
+            ingest_tx,
         };
 
         let last_active_layout = state.layout_manager.active_layout();
@@ -503,6 +499,17 @@ impl Flowsurface {
                             Task::none()
                         }
                         Some(dashboard::Event::ResolveStreams { pane_id, streams }) => {
+                            // Notify Ingestion Service
+                            if let Some(stream) = streams.first() {
+                                let symbol = match stream {
+                                    exchange::adapter::PersistStreamKind::Kline(pk) => pk.ticker.to_string(),
+                                    exchange::adapter::PersistStreamKind::DepthAndTrades(pd) => pd.ticker.to_string(),
+                                };
+                                if !symbol.is_empty() {
+                                    let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol));
+                                }
+                            }
+
                             let tickers_info = self.sidebar.tickers_info();
 
                             let resolved_streams =

@@ -9,6 +9,15 @@ exchange = { path = "../exchange" }
 arrow = "57.0.0"
 parquet = { version = "57.0.0", features = ["arrow"] }
 rand = "0.8.5"
+reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"] }
+tokio = { version = "1.48", features = ["full", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+url = "2.5"
+anyhow = "1.0"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 
 [[bin]]
 name = "ingester"

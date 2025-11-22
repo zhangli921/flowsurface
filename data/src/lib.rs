@@ -6,10 +6,11 @@ pub mod chart;
 pub mod compute;
 pub mod config;
 pub mod external_adapter;
+pub mod ingester; // Added
 pub mod io_service;
 pub mod kline;
 pub mod layout;
-pub mod loader; // Add this line
+pub mod loader;
 pub mod log;
 pub mod panel;
 pub mod tickers_table;

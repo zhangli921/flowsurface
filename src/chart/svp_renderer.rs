@@ -199,26 +199,14 @@ impl SvpRenderer {
             let min_price_level = svp_data.iter().map(|b| b.price_level).min().unwrap_or(0);
             
             // Convert base price level (scaled *100) to Price units (*10^8).
-            let raw_base_units = (min_price_level as i64) * 1_000_000;
-            self.base_price_units = raw_base_units;
-
-            // HACK: Shift VP to match view price if data is too old (mmap vs live mismatch)
-            let view_price_units = state.base_price_y.units;
-            let mut shift_units = 0;
-            
-            if (view_price_units - self.base_price_units).abs() > 10_000 * 100_000_000 {
-                 shift_units = view_price_units - self.base_price_units;
-                 self.base_price_units += shift_units; // Shift the base to the new location
-                 log::warn!("SVP HACK: Shifting data base by {} units to match view price", shift_units);
-            }
+            // Factor: 1,000,000.
+            self.base_price_units = (min_price_level as i64) * 1_000_000;
             
             let instances: Vec<SvpInstance> = svp_data.iter().map(|bar| {
                 let bar_price_units = (bar.price_level as i64) * 1_000_000;
-                // Apply shift to bar as well, so relative offset (bar - base) remains small
-                let effective_bar_units = bar_price_units + shift_units;
-                let price_offset_units = effective_bar_units - self.base_price_units;
+                let price_offset_units = bar_price_units - self.base_price_units;
                 
-                // Convert to f32 offset (now safe as it's relative to local base)
+                // Convert to f32 offset
                 let price_offset = price_offset_units as f32;
                 
                 SvpInstance {
