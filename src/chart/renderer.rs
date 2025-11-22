@@ -81,7 +81,8 @@ where
                 mouse::Event::CursorMoved { position } => {
                     if let Interaction::Panning { translation, start } = *state {
                         let delta = *position - start;
-                        let new_translation = translation + Vector::new(delta.x, delta.y);
+                        // Lock Y axis panning - only allow X panning via chart drag
+                        let new_translation = translation + Vector::new(delta.x, 0.0);
                         return Some(iced::widget::Action::publish(
                             crate::chart::Message::Translated(new_translation).into(),
                         ));
@@ -191,13 +192,13 @@ impl shader::Primitive for ChartRenderer {
         renderer: &Self::Renderer,
         render_pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        // Draw K-lines (bottom layer)
-        renderer.kline_renderer.draw(render_pass);
-        
-        // Draw SVP (top layer)
+        // Draw SVP (background layer)
         if let Some(svp_renderer) = &renderer.svp_renderer {
             svp_renderer.draw(render_pass);
         }
+
+        // Draw K-lines (foreground layer)
+        renderer.kline_renderer.draw(render_pass);
         
         // Return true to indicate we handled the rendering
         true

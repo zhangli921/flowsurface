@@ -191,29 +191,40 @@ impl SvpRenderer {
         let data_changed = self.last_data_id != Some(current_id) || self.last_data_len != svp_data.len();
 
         if data_changed {
+            let state = &view_state.state; // Access view state for hack
+
             self.cached_max_volume = svp_data.iter().map(|b| b.volume).max().unwrap_or(1) as f32;
             
             // Find base price (min price level in profile)
             let min_price_level = svp_data.iter().map(|b| b.price_level).min().unwrap_or(0);
             
             // Convert base price level (scaled *100) to Price units (*10^8).
-            // Factor: 1,000,000.
-            // Check overflow: price_level (u32) * 1_000_000 fit in i64? Yes.
-            // Max u32 ~4e9. 4e15 fits in i64 (9e18).
-            self.base_price_units = (min_price_level as i64) * 1_000_000;
+            let raw_base_units = (min_price_level as i64) * 1_000_000;
+            self.base_price_units = raw_base_units;
+
+            // HACK: Shift VP to match view price if data is too old (mmap vs live mismatch)
+            let view_price_units = state.base_price_y.units;
+            let mut shift_units = 0;
+            
+            if (view_price_units - self.base_price_units).abs() > 10_000 * 100_000_000 {
+                 shift_units = view_price_units - self.base_price_units;
+                 self.base_price_units += shift_units; // Shift the base to the new location
+                 log::warn!("SVP HACK: Shifting data base by {} units to match view price", shift_units);
+            }
             
             let instances: Vec<SvpInstance> = svp_data.iter().map(|bar| {
                 let bar_price_units = (bar.price_level as i64) * 1_000_000;
-                let price_offset_units = bar_price_units - self.base_price_units;
+                // Apply shift to bar as well, so relative offset (bar - base) remains small
+                let effective_bar_units = bar_price_units + shift_units;
+                let price_offset_units = effective_bar_units - self.base_price_units;
                 
-                // Convert to f32 offset
-                // NOTE: This assumes the price range of the VP fits within f32 precision relative to base.
+                // Convert to f32 offset (now safe as it's relative to local base)
                 let price_offset = price_offset_units as f32;
                 
                 SvpInstance {
                     price: price_offset, 
                     volume: bar.volume as f32,
-                    color: [0.0, 0.0, 1.0, 0.2], // Blue, semi-transparent
+                    color: [0.0, 0.0, 1.0, 0.5], // Blue, semi-transparent
                 }
             }).collect();
 
@@ -235,6 +246,7 @@ impl SvpRenderer {
             
             self.last_data_id = Some(current_id);
             self.last_data_len = svp_data.len();
+            log::info!("SVP Buffer Updated: {} instances. BaseUnits: {}", self.instance_count, self.base_price_units);
         }
 
         if self.instance_count > 0 {
@@ -261,12 +273,11 @@ impl SvpRenderer {
             let transform_w = (y_chart_offset + state.translation.y) * state.scaling + state.bounds.height / 2.0;
 
             // X Parameters
-            let visible_region = state.visible_region(state.bounds.size());
-            let svp_max_width = visible_region.width * 0.25;
-            let svp_right_edge = visible_region.x + visible_region.width;
+            // Use screen width for max width calculation to keep it proportional to screen
+            let svp_max_width = state.bounds.width * 0.25;
             
-            // Right alignment logic
-            let svp_x_start = svp_right_edge;
+            // Right alignment logic: Pin to right edge of SCREEN
+            let svp_x_start = state.bounds.width;
             let volume_scale = -(svp_max_width / self.cached_max_volume.max(1.0));
 
             let uniforms = SvpUniforms {
