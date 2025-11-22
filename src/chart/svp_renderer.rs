@@ -1,33 +1,29 @@
-//! Renderer for Session Volume Profile (S-VP) using instanced drawing.
+//! Renderer for Session Volume Profile (S-VP) using instanced drawing with GPU-side geometry generation.
 
 use iced::wgpu::{self, util::DeviceExt};
 use bytemuck::{Pod, Zeroable};
 use data::compute::vp::SparseBar;
 use crate::chart::ViewState;
-use exchange::util::Price;
+use std::sync::Arc;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct SvpInstance {
-    pub position: [f32; 2],
-    pub size: [f32; 2],
+    pub price: f32,
+    pub volume: f32,
     pub color: [f32; 4],
 }
-
-const _: () = assert!(std::mem::size_of::<SvpInstance>() == 32);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct SvpUniforms {
-    pub projection: [f32; 16],
-    pub chart_min_price: f32,
-    pub chart_max_price: f32,
-    pub chart_min_x: f32,
-    pub chart_max_x: f32,
-    pub svp_x_offset: f32,
-    pub svp_max_width: f32,
-    pub price_tick_size: f32,
-    pub _padding: f32,
+    // x: unused, y: unused, z: price_scale, w: price_offset
+    pub transform: [f32; 4],
+    pub screen_size: [f32; 2],
+    // x: svp_x_start, y: volume_scale
+    pub svp_params: [f32; 2],
+    pub bar_height: f32,
+    pub _padding: [f32; 7],
 }
 
 pub struct SvpRenderer {
@@ -36,11 +32,19 @@ pub struct SvpRenderer {
     pub index_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     
-    // Resources updated per frame
+    // Persistent Resources
     pub instance_buffer: Option<wgpu::Buffer>,
+    pub instance_capacity: usize,
     pub instance_count: u32,
+    
     pub uniform_buffer: Option<wgpu::Buffer>,
     pub bind_group: Option<wgpu::BindGroup>,
+    
+    // Data Versioning
+    last_data_id: Option<usize>,
+    last_data_len: usize,
+    cached_max_volume: f32,
+    base_price_units: i64,
 }
 
 impl SvpRenderer {
@@ -87,7 +91,7 @@ impl SvpRenderer {
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x2,
                                 offset: 0,
-                                shader_location: 3, // VertexInput position is @location(3)
+                                shader_location: 3, // VertexInput position
                             },
                         ],
                     },
@@ -95,22 +99,22 @@ impl SvpRenderer {
                         array_stride: std::mem::size_of::<SvpInstance>() as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &[
-                            // position: vec2<f32> @ 0
+                            // price: f32 @ 0
                             wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x2,
+                                format: wgpu::VertexFormat::Float32,
                                 offset: 0,
                                 shader_location: 0,
                             },
-                            // size: vec2<f32> @ 1
+                            // volume: f32 @ 4
                             wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x2,
-                                offset: 8,
+                                format: wgpu::VertexFormat::Float32,
+                                offset: 4,
                                 shader_location: 1,
                             },
-                            // color: vec4<f32> @ 2
+                            // color: vec4<f32> @ 8
                             wgpu::VertexAttribute {
                                 format: wgpu::VertexFormat::Float32x4,
-                                offset: 16,
+                                offset: 8,
                                 shader_location: 2,
                             },
                         ],
@@ -159,82 +163,142 @@ impl SvpRenderer {
             index_buffer,
             bind_group_layout,
             instance_buffer: None,
+            instance_capacity: 0,
             instance_count: 0,
             uniform_buffer: None,
             bind_group: None,
+            last_data_id: None,
+            last_data_len: 0,
+            cached_max_volume: 1.0,
+            base_price_units: 0,
         }
     }
 
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
-        _queue: &wgpu::Queue,
-        svp_data: &[SparseBar],
+        queue: &wgpu::Queue,
+        svp_data: &Arc<Vec<SparseBar>>,
         view_state: &ViewState,
-        uniforms: SvpUniforms,
+        _old_uniforms: (), // Ignored, we calculate new ones
     ) {
         if svp_data.is_empty() {
             self.instance_count = 0;
             return;
         }
 
-        let max_volume = svp_data.iter().map(|b| b.volume).max().unwrap_or(1) as f32;
-        
-        let visible_region = view_state.state.visible_region(view_state.state.bounds.size());
-        let svp_max_width = visible_region.width * 0.25; // Increase width to 25%
-        let svp_right_edge = visible_region.x + visible_region.width;
-        
-        // Calculate height of one price unit in pixels
-        let cell_height = view_state.state.cell_height;
+        let current_id = svp_data.as_ptr() as usize;
+        let data_changed = self.last_data_id != Some(current_id) || self.last_data_len != svp_data.len();
 
-        let instances: Vec<SvpInstance> = svp_data.iter().map(|bar| {
-            // Convert from compute scaling (x100) to Price scaling (x10^8)
-            // Factor = 10^8 / 10^2 = 1_000_000
-            let price = Price { units: bar.price_level as i64 * 1_000_000 };
-            let y = view_state.state.price_to_y(price);
+        if data_changed {
+            self.cached_max_volume = svp_data.iter().map(|b| b.volume).max().unwrap_or(1) as f32;
             
-            let width = (bar.volume as f32 / max_volume) * svp_max_width;
-            let x = svp_right_edge - width; // Align to right
+            // Find base price (min price level in profile)
+            let min_price_level = svp_data.iter().map(|b| b.price_level).min().unwrap_or(0);
             
-            SvpInstance {
-                position: [x, y],
-                size: [width, cell_height], 
-                color: [0.0, 0.0, 1.0, 0.5], // Blue, semi-transparent
+            // Convert base price level (scaled *100) to Price units (*10^8).
+            // Factor: 1,000,000.
+            // Check overflow: price_level (u32) * 1_000_000 fit in i64? Yes.
+            // Max u32 ~4e9. 4e15 fits in i64 (9e18).
+            self.base_price_units = (min_price_level as i64) * 1_000_000;
+            
+            let instances: Vec<SvpInstance> = svp_data.iter().map(|bar| {
+                let bar_price_units = (bar.price_level as i64) * 1_000_000;
+                let price_offset_units = bar_price_units - self.base_price_units;
+                
+                // Convert to f32 offset
+                // NOTE: This assumes the price range of the VP fits within f32 precision relative to base.
+                let price_offset = price_offset_units as f32;
+                
+                SvpInstance {
+                    price: price_offset, 
+                    volume: bar.volume as f32,
+                    color: [0.0, 0.0, 1.0, 0.2], // Blue, semi-transparent
+                }
+            }).collect();
+
+            self.instance_count = instances.len() as u32;
+
+            if self.instance_buffer.is_none() || self.instance_capacity < instances.len() {
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("SVP Instance Buffer"),
+                    contents: bytemuck::cast_slice(&instances),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                });
+                self.instance_buffer = Some(buffer);
+                self.instance_capacity = instances.len();
+            } else {
+                if let Some(buffer) = &self.instance_buffer {
+                    queue.write_buffer(buffer, 0, bytemuck::cast_slice(&instances));
+                }
             }
-        }).collect();
+            
+            self.last_data_id = Some(current_id);
+            self.last_data_len = svp_data.len();
+        }
 
-        self.instance_count = instances.len() as u32;
-        
         if self.instance_count > 0 {
-             // Instance Buffer
-             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("SVP Instance Buffer"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
-            self.instance_buffer = Some(buffer);
+            let state = &view_state.state;
             
-            // Uniform Buffer
-            let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("SVP Uniform Buffer"),
-                contents: bytemuck::cast_slice(&[uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
+            // Calculate Uniforms
+            // Y Transform (Price -> Screen Y)
+            // Using the same logic as KlineRenderer but adapted for SvpInstance format.
+            // SvpInstance.price = (price_units - base_price_units) as f32
+            // y_screen = price_offset * Z + W
             
-            // Bind Group
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("SVP Bind Group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+            let tick_units_f = state.tick_size.units as f32;
+            let units_per_pixel_factor = state.cell_height / tick_units_f.max(1.0);
             
-            self.uniform_buffer = Some(uniform_buffer);
-            self.bind_group = Some(bind_group);
+            // Z: Scale factor for instance price offset
+            // y_chart = -offset * (1/tick * cell) ... (inherited from Kline derivation)
+            let transform_z = -units_per_pixel_factor * state.scaling;
+            
+            // W: Offset constant
+            // Needs to map base_price_units to screen Y
+            let base_diff_units = (state.base_price_y.units - self.base_price_units) as f32;
+            let y_chart_offset = base_diff_units * units_per_pixel_factor;
+            
+            let transform_w = (y_chart_offset + state.translation.y) * state.scaling + state.bounds.height / 2.0;
+
+            // X Parameters
+            let visible_region = state.visible_region(state.bounds.size());
+            let svp_max_width = visible_region.width * 0.25;
+            let svp_right_edge = visible_region.x + visible_region.width;
+            
+            // Right alignment logic
+            let svp_x_start = svp_right_edge;
+            let volume_scale = -(svp_max_width / self.cached_max_volume.max(1.0));
+
+            let uniforms = SvpUniforms {
+                transform: [0.0, 0.0, transform_z, transform_w],
+                screen_size: [state.bounds.width, state.bounds.height],
+                svp_params: [svp_x_start, volume_scale],
+                bar_height: state.cell_height * state.scaling,
+                _padding: [0.0; 7],
+            };
+
+            if self.uniform_buffer.is_none() {
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("SVP Uniform Buffer"),
+                    contents: bytemuck::cast_slice(&[uniforms]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+                self.uniform_buffer = Some(buffer);
+                
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("SVP Bind Group"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniform_buffer.as_ref().unwrap().as_entire_binding(),
+                        },
+                    ],
+                });
+                self.bind_group = Some(bind_group);
+            } else {
+                queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&[uniforms]));
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 use iced::advanced::layout::{Layout};
 use iced::advanced::renderer;
 use iced::mouse::{self, Cursor};
+use std::sync::Arc;
 use iced::{event, Rectangle, Vector, Point};
 use iced::widget::shader;
 use iced::wgpu::{self, util::DeviceExt};
@@ -34,8 +35,8 @@ pub struct UnifiedChartProgram {
 
 #[derive(Debug, Clone)]
 pub struct ChartData {
-    pub kline_data: Vec<data::kline::KLine>,
-    pub svp_data: Vec<SparseBar>,
+    pub kline_data: Arc<Vec<data::kline::KLine>>,
+    pub svp_data: Arc<Vec<SparseBar>>,
     pub view_state: ViewState,
 }
 
@@ -130,12 +131,12 @@ where
 #[derive(Debug, Clone)]
 pub struct ChartRenderer {
     pub bounds: Rectangle,
-    pub kline_data: Vec<data::kline::KLine>,
-    pub svp_data: Vec<SparseBar>,
+    pub kline_data: Arc<Vec<data::kline::KLine>>,
+    pub svp_data: Arc<Vec<SparseBar>>,
     pub view_state: ViewState,
 }
 
-use crate::chart::svp_renderer::{SvpRenderer, SvpUniforms};
+use crate::chart::svp_renderer::SvpRenderer;
 use crate::chart::kline_renderer::KlineRenderer;
 
 // The WGPU renderer state that holds all rendering resources
@@ -179,11 +180,8 @@ impl shader::Primitive for ChartRenderer {
         // Prepare SVP data for rendering
         if !self.svp_data.is_empty() {
             if let Some(svp_renderer) = &mut renderer.svp_renderer {
-                // Create uniforms from view_state
-                let uniforms = create_svp_uniforms(&self.view_state, bounds);
-                
                 // Delegate preparation to SvpRenderer
-                svp_renderer.prepare(device, queue, &self.svp_data, &self.view_state, uniforms);
+                svp_renderer.prepare(device, queue, &self.svp_data, &self.view_state, ());
             }
         }
     }
@@ -203,39 +201,5 @@ impl shader::Primitive for ChartRenderer {
         
         // Return true to indicate we handled the rendering
         true
-    }
-}
-
-/// Helper function to create SVP uniforms from view state
-fn create_svp_uniforms(view_state: &ViewState, bounds: &Rectangle) -> SvpUniforms {
-    let state = &view_state.state;
-    
-    // Create orthographic projection matrix for 2D rendering
-    // Map chart space to clip space [-1, 1]
-    let visible_region = state.visible_region(bounds.size());
-    
-    // Simple orthographic projection
-    let left = visible_region.x;
-    let right = visible_region.x + visible_region.width;
-    let bottom = visible_region.y + visible_region.height;
-    let top = visible_region.y;
-    
-    let projection = [
-        [2.0 / (right - left), 0.0, 0.0, 0.0],
-        [0.0, 2.0 / (top - bottom), 0.0, 0.0],
-        [0.0, 0.0, -1.0, 0.0],
-        [-(right + left) / (right - left), -(top + bottom) / (top - bottom), 0.0, 1.0],
-    ];
-    
-    SvpUniforms {
-        projection: bytemuck::cast(projection),
-        chart_min_price: state.y_to_price(visible_region.y + visible_region.height).to_f32_lossy(),
-        chart_max_price: state.y_to_price(visible_region.y).to_f32_lossy(),
-        chart_min_x: left,
-        chart_max_x: right,
-        svp_x_offset: right - (visible_region.width * 0.15), // 15% from right edge
-        svp_max_width: visible_region.width * 0.12, // 12% of chart width
-        price_tick_size: state.cell_height,
-        _padding: 0.0,
     }
 }

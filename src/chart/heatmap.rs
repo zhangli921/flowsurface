@@ -2,6 +2,7 @@ use super::{
     Chart, Message, PlotConstants, ViewState,
 };
 use crate::chart::renderer;
+use std::sync::Arc;
 use iced::widget::canvas::Cache;
 use crate::modal::pane::settings::study::{self, Study};
 use data::chart::{
@@ -59,8 +60,8 @@ impl Chart for HeatmapChart {
         // TODO: This is a placeholder. Heatmap data needs to be properly
         // converted into a format the new renderer can use.
         renderer::ChartData {
-            kline_data: vec![],
-            svp_data: vec![],
+            kline_data: Arc::new(vec![]),
+            svp_data: Arc::new(vec![]),
             view_state: self.chart.clone(),
         }
     }

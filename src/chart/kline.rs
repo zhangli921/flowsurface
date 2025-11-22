@@ -22,6 +22,7 @@ use exchange::{
 };
 
 use iced::task::Handle;
+use std::sync::Arc;
 use iced::{Element, Vector};
 
 use enum_map::EnumMap;
@@ -42,30 +43,14 @@ impl Chart for KlineChart {
     }
 
     fn chart_data(&self) -> renderer::ChartData {
-        let kline_data: Vec<data::kline::KLine> = match &self.data_source {
-            PlotData::TimeBased(timeseries) => {
-                timeseries.datapoints.values().map(|dp| dp.kline).map(Into::into).collect()
-            },
-            PlotData::TickBased(tick_aggr) => {
-                tick_aggr.datapoints.iter().map(|dp| dp.kline).map(Into::into).collect()
-            },
-        };
+        let kline_data = self.render_cache_kline.clone();
         
-        // log::info!("chart_data: volume_profile is_some = {}", self.chart.state.volume_profile.is_some());
         let svp_data = self.chart.state.volume_profile.as_ref().map(|vp| {
-            // log::info!("chart_data: VP has {} bars", vp.bars.len());
             vp.bars.clone()
         }).unwrap_or_else(|| {
-            // log::info!("chart_data: No VP data, returning empty vec");
-            Vec::new()
+            Arc::new(Vec::new())
         });
         
-        if !svp_data.is_empty() {
-            // log::info!("chart_data: Providing {} SVP bars to renderer", svp_data.len());
-        } else {
-            // log::info!("chart_data: svp_data is empty");
-        }
-
         renderer::ChartData {
             kline_data,
             svp_data,
@@ -220,9 +205,11 @@ pub struct KlineChart {
     request_handler: RequestHandler,
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
+    last_vp_request: Instant,
     vp_data: Option<SessionVolumeProfile>,
     xaxis_cache: Cache,
     yaxis_cache: Cache,
+    render_cache_kline: Arc<Vec<data::kline::KLine>>,
 }
 
 impl KlineChart {
@@ -286,6 +273,11 @@ impl KlineChart {
                 chart.state.translation.x = x_translation;
 
                 let data_source = PlotData::TimeBased(timeseries);
+                
+                let render_cache_kline = Arc::new(match &data_source {
+                    PlotData::TimeBased(ts) => ts.datapoints.values().map(|dp| dp.kline).map(Into::into).collect(),
+                    _ => Vec::new(),
+                });
 
                 let mut indicators = EnumMap::default();
                 for &i in enabled_indicators {
@@ -304,9 +296,11 @@ impl KlineChart {
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    last_vp_request: Instant::now(),
                     vp_data: None,
                     xaxis_cache: Cache::default(),
                     yaxis_cache: Cache::default(),
+                    render_cache_kline,
                 }
             }
             Basis::Tick(interval) => {
@@ -347,6 +341,11 @@ impl KlineChart {
                 chart.state.translation.x = x_translation;
 
                 let data_source = PlotData::TickBased(TickAggr::new(interval, step, &raw_trades));
+                
+                let render_cache_kline = Arc::new(match &data_source {
+                    PlotData::TickBased(aggr) => aggr.datapoints.iter().map(|dp| dp.kline).map(Into::into).collect(),
+                    _ => Vec::new(),
+                });
 
                 let mut indicators = EnumMap::default();
                 for &i in enabled_indicators {
@@ -365,9 +364,11 @@ impl KlineChart {
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    last_vp_request: Instant::now(),
                     vp_data: None,
                     xaxis_cache: Cache::default(),
                     yaxis_cache: Cache::default(),
+                    render_cache_kline,
                 }
             }
         }
@@ -377,6 +378,12 @@ impl KlineChart {
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_klines(&[*kline]);
+                
+                // Rebuild cache on new kline
+                // Optimization: We could append to existing Vec if Arc is not shared yet, 
+                // but since we use BTreeMap as source, full rebuild is safer for order.
+                // For high freq, we might want to optimize this further.
+                self.rebuild_render_cache();
 
                 self.indicators
                     .values_mut()
@@ -507,6 +514,8 @@ impl KlineChart {
                 timeseries.change_tick_size(new_tick_size, &self.raw_trades);
             }
         }
+        
+        self.rebuild_render_cache();
 
         self.indicators
             .values_mut()
@@ -533,6 +542,8 @@ impl KlineChart {
                 self.data_source = PlotData::TickBased(tick_aggr);
             }
         }
+        
+        self.rebuild_render_cache();
 
         self.indicators
             .values_mut()
@@ -575,6 +586,8 @@ impl KlineChart {
                 // } else {
                 //     self.mut_state().last_price = None;
                 // }
+                
+                self.rebuild_render_cache();
 
                 self.indicators
                     .values_mut()
@@ -587,6 +600,7 @@ impl KlineChart {
             }
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_trades_existing_buckets(trades_buffer);
+                self.rebuild_render_cache();
             }
         }
     }
@@ -600,6 +614,8 @@ impl KlineChart {
                 timeseries.insert_trades_existing_buckets(&raw_trades);
             }
         }
+        
+        self.rebuild_render_cache();
 
         self.raw_trades.extend(raw_trades);
 
@@ -613,6 +629,8 @@ impl KlineChart {
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_klines(klines_raw);
                 timeseries.insert_trades_existing_buckets(&self.raw_trades);
+                
+                self.rebuild_render_cache();
 
                 self.indicators
                     .values_mut()
@@ -757,28 +775,47 @@ impl KlineChart {
     
     /// Check if VP computation is needed and return the request if so
     pub fn check_vp_update_needed(&mut self) -> Option<Action> {
-        if self.chart.state.vp_needs_update {
-            self.chart.state.vp_needs_update = false; // Reset flag
-            let symbol = self.chart.state.ticker_info.ticker.to_string();
-            log::info!("Checking VP update for {}. visible_time_range_ns() call...", symbol);
-            if let Some(time_range) = self.chart.state.visible_time_range_ns() {
-                log::info!("VP Update Needed: {} range {}-{}", symbol, time_range.start_ns, time_range.end_ns);
-                Some(Action::RequestVpComputation(symbol, time_range))
-            } else {
-                log::warn!("VP Update Skipped: visible_time_range_ns returned None (maybe Basis::Tick?)");
-                None
-            }
+        if !self.chart.state.vp_needs_update {
+            return None;
+        }
+        
+        // Debounce VP requests to prevent stuttering (limit to ~3 requests per second)
+        if self.last_vp_request.elapsed().as_millis() < 300 {
+            return None;
+        }
+
+        self.chart.state.vp_needs_update = false; // Reset flag
+        self.last_vp_request = Instant::now();
+
+        let symbol = self.chart.state.ticker_info.ticker.to_string();
+        // log::info!("Checking VP update for {}. visible_time_range_ns() call...", symbol);
+        
+        if let Some(time_range) = self.chart.state.visible_time_range_ns() {
+            // log::info!("VP Update Needed: {} range {}-{}", symbol, time_range.start_ns, time_range.end_ns);
+            Some(Action::RequestVpComputation(symbol, time_range))
         } else {
-            // log::info!("VP Update Not Needed: vp_needs_update is false");
+            // log::warn!("VP Update Skipped: visible_time_range_ns returned None (maybe Basis::Tick?)");
             None
         }
     }
     
     /// Update the stored volume profile data
     pub fn set_volume_profile(&mut self, vp: data::compute::vp::VolumeProfile) {
-        log::info!("set_volume_profile called with {} bars", vp.bars.len());
+        // log::info!("set_volume_profile called with {} bars", vp.bars.len());
         self.chart.state.volume_profile = Some(vp);
         self.chart.state.vp_needs_update = false;
-        log::info!("Volume Profile updated in KlineChart, vp_needs_update = false");
+        // log::info!("Volume Profile updated in KlineChart, vp_needs_update = false");
+    }
+
+    fn rebuild_render_cache(&mut self) {
+        let kline_data: Vec<data::kline::KLine> = match &self.data_source {
+            PlotData::TimeBased(timeseries) => {
+                timeseries.datapoints.values().map(|dp| dp.kline).map(Into::into).collect()
+            },
+            PlotData::TickBased(tick_aggr) => {
+                tick_aggr.datapoints.iter().map(|dp| dp.kline).map(Into::into).collect()
+            },
+        };
+        self.render_cache_kline = Arc::new(kline_data);
     }
 }

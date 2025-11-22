@@ -1,5 +1,6 @@
 //! GPGPU compute pipeline for calculating Session Volume Profile (S-VP).
 
+use std::sync::Arc;
 use bytemuck::{self, Pod, Zeroable};
 use crate::arbiter_error::ArbiterError;
 use wgpu::{self, util::DeviceExt, BindingType, BufferBindingType, MapMode};
@@ -29,7 +30,7 @@ pub struct SparseBar {
 
 #[derive(Debug, Clone)]
 pub struct VolumeProfile {
-    pub bars: Vec<SparseBar>,
+    pub bars: Arc<Vec<SparseBar>>,
     pub point_of_control: u32,
     pub value_area_start: u32,
     pub value_area_end: u32,
@@ -250,7 +251,7 @@ impl VpComputePipeline {
 fn process_histogram(dense_histogram: Vec<u32>, min_price: u32, price_resolution: u32) -> VolumeProfile {
     if dense_histogram.is_empty() {
         return VolumeProfile {
-            bars: Vec::new(),
+            bars: Arc::new(Vec::new()),
             point_of_control: 0,
             value_area_start: 0,
             value_area_end: 0,
@@ -283,7 +284,7 @@ fn process_histogram(dense_histogram: Vec<u32>, min_price: u32, price_resolution
 
     if bars.is_empty() {
         return VolumeProfile {
-            bars,
+            bars: Arc::new(bars),
             point_of_control: 0,
             value_area_start: 0,
             value_area_end: 0,
@@ -320,7 +321,7 @@ fn process_histogram(dense_histogram: Vec<u32>, min_price: u32, price_resolution
     }
 
     VolumeProfile {
-        bars,
+        bars: Arc::new(bars),
         point_of_control: point_of_control_price,
         value_area_start,
         value_area_end,

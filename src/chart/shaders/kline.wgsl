@@ -1,18 +1,22 @@
 struct Uniforms {
-    projection: mat4x4<f32>,
+    // x: time_scale, y: time_offset, z: price_scale, w: price_offset
+    transform: vec4<f32>,
+    // x: screen_width, y: screen_height
+    screen_size: vec2<f32>,
+    candle_width: f32,
+    _padding: f32,
 }
 
 @group(0) @binding(0)
 var<uniform> uniforms: Uniforms;
 
 struct InstanceInput {
-    @location(0) x: f32,
-    @location(1) y_open: f32,
-    @location(2) y_high: f32,
-    @location(3) y_low: f32,
-    @location(4) y_close: f32,
-    @location(5) width: f32,
-    @location(6) color: vec4<f32>,
+    @location(0) time_offset: f32,
+    @location(1) open: f32,
+    @location(2) high: f32,
+    @location(3) low: f32,
+    @location(4) close: f32,
+    @location(5) color: vec4<f32>,
 }
 
 struct VertexOutput {
@@ -26,65 +30,61 @@ fn vs_main(
     instance: InstanceInput,
 ) -> VertexOutput {
     var out: VertexOutput;
+
+    // 1. Physics -> Screen Coordinates
+    // X = (time_offset * scale_x) + offset_x
+    let center_x = (instance.time_offset * uniforms.transform.x) + uniforms.transform.y;
     
-    // In screen coordinates (Y down):
-    // High price -> Low Y (Top)
-    // Low price -> High Y (Bottom)
-    
-    // Body Y range
-    var y_top_body = min(instance.y_open, instance.y_close);
-    var y_bottom_body = max(instance.y_open, instance.y_close);
-    
-    // Minimum thickness for body
+    // Y = (price * scale_y) + offset_y
+    // Prices are f32. High price should be lower Y (top of screen).
+    let y_open = (instance.open * uniforms.transform.z) + uniforms.transform.w;
+    let y_close = (instance.close * uniforms.transform.z) + uniforms.transform.w;
+    let y_high = (instance.high * uniforms.transform.z) + uniforms.transform.w;
+    let y_low = (instance.low * uniforms.transform.z) + uniforms.transform.w;
+
+    // 2. Body Bounds
+    var y_top_body = min(y_open, y_close);
+    var y_bottom_body = max(y_open, y_close);
+
+    // Minimum thickness 1px
     if (y_bottom_body - y_top_body < 1.0) {
         y_bottom_body = y_top_body + 1.0;
     }
-    
-    // Wick Y range (y_high is top/min Y, y_low is bottom/max Y)
-    var y_top_wick = instance.y_high;
-    var y_bottom_wick = instance.y_low;
-    
-    let half_width = instance.width / 2.0;
-    let half_wick = 0.5; // 1px width wick
-    
+
+    // 3. Wick Bounds
+    let y_top_wick = min(y_high, y_low);
+    let y_bottom_wick = max(y_high, y_low);
+
+    let half_width = uniforms.candle_width / 2.0;
+    let half_wick = 0.5; 
+
     var x_offset: f32;
     var y_pos: f32;
-    
-    // Indices 0-3: Body
-    // Indices 4-7: Wick
-    
+
     if (in_vertex_index < 4u) {
         // Body Quad
-        // 0: TL (-w, top)
-        // 1: TR (+w, top)
-        // 2: BR (+w, bottom)
-        // 3: BL (-w, bottom)
-        
         let is_right = (in_vertex_index == 1u || in_vertex_index == 2u);
         let is_bottom = (in_vertex_index == 2u || in_vertex_index == 3u);
-        
         x_offset = select(-half_width, half_width, is_right);
         y_pos = select(y_top_body, y_bottom_body, is_bottom);
     } else {
         // Wick Quad
-        // 4: TL (-w_wick, top_wick)
-        // 5: TR (+w_wick, top_wick)
-        // 6: BR (+w_wick, bottom_wick)
-        // 7: BL (-w_wick, bottom_wick)
-        
         let is_right = (in_vertex_index == 5u || in_vertex_index == 6u);
         let is_bottom = (in_vertex_index == 6u || in_vertex_index == 7u);
-        
         x_offset = select(-half_wick, half_wick, is_right);
         y_pos = select(y_top_wick, y_bottom_wick, is_bottom);
     }
-    
-    let final_x = instance.x + x_offset;
+
+    let final_x = center_x + x_offset;
     let final_y = y_pos;
-    
-    out.clip_position = uniforms.projection * vec4<f32>(final_x, final_y, 0.0, 1.0);
+
+    // 4. Clip Space
+    let clip_x = (final_x / uniforms.screen_size.x) * 2.0 - 1.0;
+    let clip_y = -((final_y / uniforms.screen_size.y) * 2.0 - 1.0); 
+
+    out.clip_position = vec4<f32>(clip_x, clip_y, 0.0, 1.0);
     out.color = instance.color;
-    
+
     return out;
 }
 
@@ -92,4 +92,3 @@ fn vs_main(
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return in.color;
 }
-
