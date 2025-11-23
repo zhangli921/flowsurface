@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::fs::{self, File as TokioFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use arrow::array::{ArrayRef, Float64Array, TimestampNanosecondArray, UInt32Array};
+use arrow::array::{ArrayRef, Float64Array, TimestampMicrosecondArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -75,8 +75,8 @@ impl ExternalAdapter {
         let url = format!(
             "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&endTime={}&limit=1000",
             symbol,
-            range.start_ns / 1_000_000, // Binance uses milliseconds
-            range.end_ns / 1_000_000
+            range.start_us / 1_000, // Binance uses milliseconds
+            range.end_us / 1_000
         );
 
         let binance_klines: Vec<BinanceKLine> = self.client.get(&url).send().await?.json().await?;
@@ -108,14 +108,14 @@ async fn get_cache_path(symbol: &str, range: TimeRange) -> Result<PathBuf, Arbit
     if !cache_dir.exists() {
         fs::create_dir_all(&cache_dir).await?;
     }
-    let file_name = format!("{}_{}_{}.parquet", symbol, range.start_ns, range.end_ns);
+    let file_name = format!("{}_{}_{}.parquet", symbol, range.start_us, range.end_us);
     Ok(cache_dir.join(file_name))
 }
 
 /// Converts a slice of `KLine` objects into an Arrow `RecordBatch`.
 fn klines_to_record_batch(klines: &[KLine]) -> Result<RecordBatch, ArbiterError> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("open_time_ns", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("open_time_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         Field::new("open", DataType::Float64, false),
         Field::new("high", DataType::Float64, false),
         Field::new("low", DataType::Float64, false),
@@ -124,7 +124,7 @@ fn klines_to_record_batch(klines: &[KLine]) -> Result<RecordBatch, ArbiterError>
         Field::new("num_trades", DataType::UInt32, false),
     ]));
 
-    let mut open_time_ns_builder = TimestampNanosecondArray::builder(klines.len());
+    let mut open_time_us_builder = TimestampMicrosecondArray::builder(klines.len());
     let mut open_builder = Float64Array::builder(klines.len());
     let mut high_builder = Float64Array::builder(klines.len());
     let mut low_builder = Float64Array::builder(klines.len());
@@ -133,7 +133,7 @@ fn klines_to_record_batch(klines: &[KLine]) -> Result<RecordBatch, ArbiterError>
     let mut num_trades_builder = UInt32Array::builder(klines.len());
 
     for kline in klines {
-        open_time_ns_builder.append_value(kline.open_time_ns as i64);
+        open_time_us_builder.append_value(kline.open_time_us as i64);
         open_builder.append_value(kline.open);
         high_builder.append_value(kline.high);
         low_builder.append_value(kline.low);
@@ -143,7 +143,7 @@ fn klines_to_record_batch(klines: &[KLine]) -> Result<RecordBatch, ArbiterError>
     }
 
     let columns: Vec<ArrayRef> = vec![
-        Arc::new(open_time_ns_builder.finish()),
+        Arc::new(open_time_us_builder.finish()),
         Arc::new(open_builder.finish()),
         Arc::new(high_builder.finish()),
         Arc::new(low_builder.finish()),
@@ -157,12 +157,12 @@ fn klines_to_record_batch(klines: &[KLine]) -> Result<RecordBatch, ArbiterError>
 
 /// Converts an Arrow `RecordBatch` into a `Vec<KLine>`.
 fn record_batch_to_klines(batch: &RecordBatch) -> Result<Vec<KLine>, ArbiterError> {
-    let open_time_ns_array = batch
-        .column_by_name("open_time_ns")
-        .ok_or(ArbiterError::InvalidInput("Missing 'open_time_ns' column"))?
+    let open_time_us_array = batch
+        .column_by_name("open_time_us")
+        .ok_or(ArbiterError::InvalidInput("Missing 'open_time_us' column"))?
         .as_any()
-        .downcast_ref::<TimestampNanosecondArray>()
-        .ok_or(ArbiterError::InvalidInput("Invalid 'open_time_ns' column type"))?;
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .ok_or(ArbiterError::InvalidInput("Invalid 'open_time_us' column type"))?;
     let open_array = batch
         .column_by_name("open")
         .ok_or(ArbiterError::InvalidInput("Missing 'open' column"))?
@@ -203,7 +203,7 @@ fn record_batch_to_klines(batch: &RecordBatch) -> Result<Vec<KLine>, ArbiterErro
     let mut klines = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         klines.push(KLine {
-            open_time_ns: open_time_ns_array.value(i) as u64,
+            open_time_us: open_time_us_array.value(i) as u64,
             open: open_array.value(i),
             high: high_array.value(i),
             low: low_array.value(i),
@@ -272,7 +272,7 @@ mod binance_kline_format {
             where
                 A: SeqAccess<'de>,
             {
-                let open_time_ns: u64 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let open_time_ms: u64 = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(0, &self))?;
                 let open_str: &str = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(1, &self))?;
                 let high_str: &str = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(2, &self))?;
                 let low_str: &str = seq.next_element()?.ok_or_else(|| de::Error::invalid_length(3, &self))?;
@@ -289,7 +289,7 @@ mod binance_kline_format {
                 while seq.next_element::<serde_json::Value>()?.is_some() {}
 
                 Ok(KLine {
-                    open_time_ns: open_time_ns * 1_000_000, // Convert ms to ns
+                    open_time_us: open_time_ms * 1_000, // Convert ms to us
                     open: open_str.parse().map_err(de::Error::custom)?,
                     high: high_str.parse().map_err(de::Error::custom)?,
                     low: low_str.parse().map_err(de::Error::custom)?,

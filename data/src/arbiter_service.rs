@@ -82,12 +82,12 @@ fn merge_and_resolve(
     _range: TimeRange,
 ) -> Vec<KLine> {
     // 1. Define the "Live Window" as the last 12 hours from the current time.
-    let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
-    let live_window_start_ns = now_ns.saturating_sub(Duration::hours(12).num_nanoseconds().unwrap_or(0) as u64);
+    let now_us = Utc::now().timestamp_micros() as u64;
+    let live_window_start_us = now_us.saturating_sub((Duration::hours(12).num_microseconds().unwrap_or(0) as u64));
 
     // 2. Filter historical data, removing any data that falls within the live window.
     // Live data is considered the source of truth for the recent past.
-    historical_data.retain(|k| k.open_time_ns < live_window_start_ns);
+    historical_data.retain(|k| k.open_time_us < live_window_start_us);
 
     // 3. Combine the authoritative live data with the filtered historical data.
     let mut combined = live_data;
@@ -95,10 +95,10 @@ fn merge_and_resolve(
 
     // 4. Sort the combined data by timestamp to ensure chronological order.
     // This is crucial as the two sources are fetched concurrently.
-    combined.sort_by_key(|k| k.open_time_ns);
+    combined.sort_by_key(|k| k.open_time_us);
 
     // 5. Remove any consecutive duplicates that might arise at the merge boundary.
-    combined.dedup_by_key(|k| k.open_time_ns);
+    combined.dedup_by_key(|k| k.open_time_us);
 
     combined
 }

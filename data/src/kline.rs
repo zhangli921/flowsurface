@@ -10,9 +10,11 @@ use exchange::Kline as ExchangeKline;
 /// high-performance aggregation tasks.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KLine {
-    /// The start time of the K-line period, as a Unix timestamp in nanoseconds.
+    /// The start time of the K-line period, as a Unix timestamp in microseconds.
     /// This serves as the primary key.
-    pub open_time_ns: u64,
+    /// Microsecond precision is sufficient for financial data and allows representing
+    /// timestamps up to year 584,542 (far beyond any practical need).
+    pub open_time_us: u64,
     /// The opening price for the period.
     pub open: f64,
     /// The highest price reached during the period.
@@ -30,8 +32,8 @@ pub struct KLine {
 impl From<ExchangeKline> for KLine {
     fn from(kline: ExchangeKline) -> Self {
         Self {
-            // Convert ms to ns
-            open_time_ns: kline.time * 1_000_000,
+            // Convert ms to us (microseconds)
+            open_time_us: kline.time * 1_000,
             open: kline.open.to_f32() as f64,
             high: kline.high.to_f32() as f64,
             low: kline.low.to_f32() as f64,

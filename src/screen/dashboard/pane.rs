@@ -944,7 +944,7 @@ impl State {
                     if let Some(action) = c.check_vp_update_needed() {
                         log::info!("Pane: check_vp_update_needed returned action");
                         if let chart::Action::RequestVpComputation(symbol, range) = action {
-                            log::info!("Pane: Requesting VP computation for {} in range {}-{}", symbol, range.start_ns, range.end_ns);
+                            log::info!("Pane: Requesting VP computation for {} in range {}-{}", symbol, range.start_us, range.end_us);
                             return Some(Effect::RequestVpComputation(symbol, range));
                         }
                     }

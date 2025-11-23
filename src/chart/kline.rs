@@ -790,8 +790,8 @@ impl KlineChart {
         let symbol = self.chart.state.ticker_info.ticker.to_string();
         // log::info!("Checking VP update for {}. visible_time_range_ns() call...", symbol);
         
-        if let Some(time_range) = self.chart.state.visible_time_range_ns() {
-            // log::info!("VP Update Needed: {} range {}-{}", symbol, time_range.start_ns, time_range.end_ns);
+        if let Some(time_range) = self.chart.state.visible_time_range_us() {
+            // log::info!("VP Update Needed: {} range {}-{}", symbol, time_range.start_us, time_range.end_us);
             Some(Action::RequestVpComputation(symbol, time_range))
         } else {
             // log::warn!("VP Update Skipped: visible_time_range_ns returned None (maybe Basis::Tick?)");

@@ -179,9 +179,26 @@ impl MmapStore {
 
     /// Retrieves the payload data for a given index entry.
     /// This is a zero-copy operation, returning a slice of the memory-mapped file.
+    /// Returns an empty slice if the payload region is not yet populated or the entry is out of bounds.
+    /// 
+    /// CRITICAL: For financial data integrity, if the payload is incomplete (truncated),
+    /// we return an empty slice rather than a partial payload that would corrupt Parquet files.
     pub fn get_payload<'a>(&'a self, entry: &IndexEntry) -> &'a [u8] {
         let start = entry.start_offset;
         let end = start + entry.length as usize;
+        
+        // Bounds check: ensure we don't access beyond the payload slice
+        if start >= self.payload.len() {
+            return &[];
+        }
+        
+        // CRITICAL: If the payload is incomplete (entry extends beyond available data),
+        // return empty slice to avoid corrupting Parquet files
+        // This ensures data integrity for financial data
+        if end > self.payload.len() {
+            return &[];
+        }
+        
         &self.payload[start..end]
     }
 }

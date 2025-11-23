@@ -1,5 +1,5 @@
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, TimestampNanosecondArray,
+    ArrayRef, BooleanArray, Float64Array, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -22,7 +22,44 @@ use std::path::PathBuf;
 
 const MAGIC_NUMBER: &[u8; 8] = b"ZEROCPY!";
 const DATA_VERSION: u16 = 1;
-const INDEX_CAPACITY: usize = 200_000; 
+const INDEX_CAPACITY: usize = 200_000;
+
+/// Convert ticker format (e.g., "ETH-USDT-SWAP") to Binance API format (e.g., "ETHUSDT").
+/// This handles various ticker formats used in the UI and converts them to the format
+/// expected by Binance REST API and WebSocket.
+pub fn normalize_binance_symbol(ticker: &str) -> String {
+    let ticker_upper = ticker.to_uppercase();
+    
+    // If already in Binance format (e.g., "BTCUSDT"), return as-is
+    if ticker_upper.ends_with("USDT") || ticker_upper.ends_with("USD") || ticker_upper.ends_with("BUSD") {
+        return ticker_upper.replace("-", "").replace("_", "");
+    }
+    
+    // Remove common suffixes and separators
+    let normalized = ticker_upper
+        .replace("-USDT-SWAP", "")
+        .replace("-USDT", "")
+        .replace("-USD", "")
+        .replace("_PERP", "")
+        .replace("-", "")
+        .replace("_", "");
+    
+    // If it still contains separators, try to extract base and quote
+    if normalized.contains("-") {
+        let parts: Vec<&str> = normalized.split('-').collect();
+        if parts.len() >= 2 {
+            return format!("{}{}", parts[0], parts[1]);
+        }
+    }
+    
+    // If it's a pure coin name (e.g., "BTC", "ETH"), add "USDT" suffix
+    // This is the default quote currency for Binance spot trading
+    if normalized.len() <= 10 && normalized.chars().all(|c| c.is_alphabetic()) {
+        return format!("{}USDT", normalized);
+    }
+    
+    normalized
+} 
 
 #[derive(Debug, Deserialize)]
 struct AggTrade {
@@ -63,8 +100,27 @@ impl IngestionService {
         }
     }
 
+    /// Synchronously creates the default Mmap file for a symbol.
+    /// This should be called before starting the async run loop to ensure the file exists.
+    /// CRITICAL: Uses normalized symbol to match the filename used in run_ingest_task.
+    pub fn ensure_mmap_file(symbol: &str, data_dir: &PathBuf) {
+        let normalized_symbol = normalize_binance_symbol(symbol);
+        let mmap_path = data_dir.join(format!("{}.mmap", normalized_symbol));
+        info!("Pre-creating Mmap file for '{}' (normalized: '{}') at {:?}...", symbol, normalized_symbol, mmap_path);
+        let (mut writer, _) = MmapWriter::open_or_create(mmap_path.to_str().unwrap());
+        writer.write_header();
+        writer.write_indices();
+        drop(writer); // Close the file
+        info!("Mmap file created/verified at {:?}.", mmap_path);
+    }
+
     pub async fn run(mut self) {
         info!("IngestionService started.");
+        
+        // Auto-subscribe to BTCUSDT on startup (async download will happen in background)
+        info!("Auto-subscribing to BTCUSDT on startup...");
+        self.switch_symbol("BTCUSDT").await;
+        
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
                 IngestCommand::Subscribe(symbol) => {
@@ -100,6 +156,10 @@ impl IngestionService {
         
         self.stop_current_task();
         
+        // Pre-create the Mmap file synchronously before starting the async task
+        // This ensures the file exists immediately when VP computation tries to read it
+        Self::ensure_mmap_file(symbol, &self.data_dir);
+        
         let symbol_clone = symbol.to_string();
         let data_dir = self.data_dir.clone();
         
@@ -116,19 +176,26 @@ impl IngestionService {
 async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
     info!("Starting ingestion task for {}", symbol);
     
-    let filename = format!("{}.mmap", symbol);
+    // Normalize symbol for Binance API (e.g., "ETH-USDT-SWAP" -> "ETHUSDT", "BTC" -> "BTCUSDT")
+    let api_symbol = normalize_binance_symbol(&symbol);
+    info!("Normalized symbol: {} -> {}", symbol, api_symbol);
+    
+    // Use normalized symbol for filename to ensure consistency
+    // This ensures VP computation can find the file using the same normalization
+    let filename = format!("{}.mmap", api_symbol);
     let mmap_path = data_dir.join(filename);
     let mmap_path_str = mmap_path.to_str().unwrap();
     
-    // Construct WS URL dynamically
-    let ws_url = format!("wss://stream.binance.com:9443/ws/{}@aggTrade", symbol.to_lowercase());
+    // Construct WS URL dynamically using normalized symbol
+    let ws_url = format!("wss://stream.binance.com:9443/ws/{}@aggTrade", api_symbol.to_lowercase());
 
     // 1. Initialize Mmap Writer
     let (mut writer, last_timestamp) = MmapWriter::open_or_create(mmap_path_str);
     
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-    // Default 2h history
-    let default_duration_hours = 2;
+    // Default 24h history to cover typical chart viewing ranges
+    // Users often view charts with time ranges spanning several hours or even days
+    let default_duration_hours = 24;
     
     let start_ms = if let Some(last_ts) = last_timestamp {
         info!("[{}] Resuming download from: {}", symbol, last_ts);
@@ -139,21 +206,34 @@ async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
 
     if start_ms < now_ms {
         let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
-        let history_trades = fetch_binance_trades(&client, &symbol, start_ms, now_ms).await;
+        let history_trades = fetch_binance_trades(&client, &api_symbol, start_ms, now_ms).await;
 
-        let chunk_interval_ns: u64 = 60 * 1_000_000_000; // 1 minute
+        let chunk_interval_us: u64 = 60 * 1_000_000; // 1 minute in microseconds
         if !history_trades.is_empty() {
             info!("[{}] Appending {} history trades...", symbol, history_trades.len());
-            let mut current_chunk_start = history_trades[0].time - (history_trades[0].time % chunk_interval_ns);
+            let mut current_chunk_start = history_trades[0].time - (history_trades[0].time % chunk_interval_us);
             let mut chunk_trades = Vec::new();
 
             for trade in history_trades {
-                if trade.time >= current_chunk_start + chunk_interval_ns {
-                    writer.append_chunk(&chunk_trades, current_chunk_start);
-                    chunk_trades.clear();
-                    while trade.time >= current_chunk_start + chunk_interval_ns {
-                        current_chunk_start += chunk_interval_ns;
+                // Use checked_add to avoid overflow when calculating next chunk boundary
+                if let Some(next_chunk_start) = current_chunk_start.checked_add(chunk_interval_us) {
+                    if trade.time >= next_chunk_start {
+                        writer.append_chunk(&chunk_trades, current_chunk_start);
+                        chunk_trades.clear();
+                        // Advance to the correct chunk for this trade
+                        while let Some(next_start) = current_chunk_start.checked_add(chunk_interval_us) {
+                            if trade.time >= next_start {
+                                current_chunk_start = next_start;
+                            } else {
+                                break;
+                            }
+                        }
                     }
+                } else {
+                    // Chunk boundary overflow - this should never happen with valid timestamps
+                    // but we handle it gracefully by stopping chunk processing
+                    error!("[{}] CRITICAL: Chunk boundary overflow at time {} us. This indicates a serious timestamp issue. Stopping chunk processing.", symbol, trade.time);
+                    break;
                 }
                 chunk_trades.push(trade);
             }
@@ -187,8 +267,19 @@ async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
                     let price_f = trade.price.parse::<f32>().unwrap_or(0.0);
                     let qty_f = trade.qty.parse::<f32>().unwrap_or(0.0);
                     
+                    // Convert ms to microseconds (us) for better range support
+                    // Microsecond precision is sufficient for financial data (1us = 0.001ms)
+                    let time_us = trade.time.checked_mul(1_000)
+                        .unwrap_or_else(|| {
+                            error!("CRITICAL: Time overflow detected in WebSocket stream! Timestamp {} ms * 1000 exceeds u64::MAX. This trade will be REJECTED to preserve data integrity.", trade.time);
+                            u64::MAX // Will be filtered out below
+                        });
+                    if time_us == u64::MAX {
+                        continue; // Skip this trade - data integrity is paramount
+                    }
+                    
                     live_buffer.push(Trade {
-                        time: trade.time * 1_000_000,
+                        time: time_us, // Now in microseconds
                         is_sell: trade.is_buyer_maker,
                         price: Price::from_f32(price_f),
                         qty: qty_f,
@@ -230,7 +321,7 @@ fn write_as_bytes<T>(writer: &mut impl Write, data: &T) -> std::io::Result<()> {
 
 fn get_trades_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("timestamp_ns", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("timestamp_us", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         Field::new("price", DataType::Float64, false),
         Field::new("volume", DataType::Float64, false), 
         Field::new("is_bid_aggressor", DataType::Boolean, false),
@@ -239,7 +330,7 @@ fn get_trades_schema() -> Arc<Schema> {
 
 fn trades_to_record_batch(trades: &[Trade]) -> Result<RecordBatch, arrow::error::ArrowError> {
     let schema = get_trades_schema();
-    let mut timestamps = TimestampNanosecondArray::builder(trades.len());
+    let mut timestamps = TimestampMicrosecondArray::builder(trades.len());
     let mut prices = Float64Array::builder(trades.len());
     let mut volumes = Float64Array::builder(trades.len());
     let mut is_bid_aggressors = BooleanArray::builder(trades.len());
@@ -272,6 +363,8 @@ fn record_batch_to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, parquet
 async fn fetch_binance_trades(client: &Client, symbol: &str, start_time_ms: u64, end_time_ms: u64) -> Vec<Trade> {
     let mut trades = Vec::new();
     let mut current_start = start_time_ms;
+    let mut consecutive_failures = 0;
+    const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
     info!("Fetching trades for {} from {} to {}...", symbol, start_time_ms, end_time_ms);
 
@@ -286,6 +379,7 @@ async fn fetch_binance_trades(client: &Client, symbol: &str, start_time_ms: u64,
                 if resp.status().is_success() {
                     match resp.json::<Vec<AggTrade>>().await {
                         Ok(agg_trades) => {
+                            consecutive_failures = 0; // Reset on success
                             if agg_trades.is_empty() {
                                 break;
                             }
@@ -302,21 +396,53 @@ async fn fetch_binance_trades(client: &Client, symbol: &str, start_time_ms: u64,
                                 }
                                 let price_f = at.price.parse::<f32>().unwrap_or(0.0);
                                 let qty_f = at.qty.parse::<f32>().unwrap_or(0.0);
+                                // Convert ms to microseconds (us) for better range support
+                                // Microsecond precision is sufficient for financial data (1us = 0.001ms)
+                                // This allows representing timestamps up to year 584,542 (far beyond any practical need)
+                                let time_us = at.time.checked_mul(1_000)
+                                    .unwrap_or_else(|| {
+                                        error!("CRITICAL: Time overflow detected! Timestamp {} ms * 1000 exceeds u64::MAX. This trade will be REJECTED to preserve data integrity.", at.time);
+                                        u64::MAX // Will be filtered out below
+                                    });
+                                if time_us == u64::MAX {
+                                    continue; // Skip this trade - data integrity is paramount
+                                }
                                 trades.push(Trade {
-                                    time: at.time * 1_000_000,
+                                    time: time_us, // Now in microseconds
                                     is_sell: at.is_buyer_maker,
                                     price: Price::from_f32(price_f),
                                     qty: qty_f,
                                 });
                             }
                         }
-                        Err(e) => { error!("JSON Error: {}", e); tokio::time::sleep(Duration::from_secs(1)).await; }
+                        Err(e) => { 
+                            error!("JSON Error: {}", e); 
+                            consecutive_failures += 1;
+                            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                warn!("[{}] Too many consecutive failures ({}), stopping history download. Will proceed with live streaming only.", symbol, consecutive_failures);
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await; 
+                        }
                     }
                 } else {
-                     tokio::time::sleep(Duration::from_secs(1)).await;
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                        warn!("[{}] Too many consecutive HTTP errors ({}), stopping history download. Will proceed with live streaming only.", symbol, consecutive_failures);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
-            Err(e) => { error!("Conn Error: {}", e); tokio::time::sleep(Duration::from_secs(1)).await; }
+            Err(e) => { 
+                error!("Conn Error: {}", e); 
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    warn!("[{}] Too many consecutive connection errors ({}), stopping history download. Will proceed with live streaming only.", symbol, consecutive_failures);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await; 
+            }
         }
         // tokio::time::sleep(Duration::from_millis(10)).await; // Rate limit niceness
     }
@@ -352,7 +478,7 @@ impl MmapWriter {
         let file_len = file.metadata().unwrap().len();
         let mut last_timestamp = None;
 
-        let mut writer = if file_len >= header_size as u64 {
+        let writer = if file_len >= header_size as u64 {
             // Try to read existing file
             info!("Found existing Mmap file {}, checking validity...", path);
             let mut header_buf = vec![0u8; header_size];
@@ -375,7 +501,18 @@ impl MmapWriter {
                     }
                     
                     if let Some(last) = index_entries.last() {
-                        last_timestamp = Some(last.key_hash / 1_000_000); 
+                        // CRITICAL: Detect and fix timestamp unit issues
+                        // If key_hash is suspiciously large (looks like nanoseconds instead of microseconds),
+                        // convert it. A reasonable microsecond timestamp for 2025 would be around 1.7e15,
+                        // so anything above 1e18 is likely nanoseconds.
+                        let key_hash_us = if last.key_hash > 1_000_000_000_000_000_000 {
+                            // Likely nanoseconds, convert to microseconds
+                            warn!("Detected suspiciously large key_hash {} (likely nanoseconds), converting to microseconds", last.key_hash);
+                            last.key_hash / 1_000
+                        } else {
+                            last.key_hash
+                        };
+                        last_timestamp = Some(key_hash_us / 1_000); // Convert us to ms
                     }
                     
                     let current_payload_offset = if let Some(last) = index_entries.last() {
@@ -384,7 +521,29 @@ impl MmapWriter {
                         0
                     };
                     
-                    info!("Resuming from existing file. Entries: {}, Last Time: {:?}", index_count, last_timestamp);
+                    // CRITICAL: Validate that the file actually contains payload data
+                    // If the file is too short or all entries have empty payload, the file is corrupted
+                    let min_file_size = expected_payload_start + current_payload_offset;
+                    let has_valid_payload = file_len >= min_file_size as u64 && 
+                        index_entries.iter().any(|e| e.length > 0);
+                    
+                    if !has_valid_payload {
+                        warn!("Existing file has invalid or empty payload (file_len={}, expected_min={}, entries_with_data={}). Re-creating file.", 
+                            file_len, min_file_size, index_entries.iter().filter(|e| e.length > 0).count());
+                        // Close the file and re-create it
+                        drop(file);
+                        let new_file = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(path)
+                            .expect("Failed to re-create file");
+                        return (Self::create_new(new_file, expected_payload_start), None);
+                    }
+                    
+                    info!("Resuming from existing file. Entries: {}, Last Time: {:?}, Payload offset: {}", 
+                        index_count, last_timestamp, current_payload_offset);
 
                     Self {
                         file,
@@ -435,12 +594,37 @@ impl MmapWriter {
     fn write_indices(&mut self) {
         let header_size = mem::size_of::<FileHeader>();
         self.file.seek(SeekFrom::Start(header_size as u64)).unwrap();
+        
+        // Write all index entries
         for entry in &self.index_entries {
             write_as_bytes(&mut self.file, entry).unwrap();
         }
+        
+        // Write zero-filled entries for the remaining index capacity
+        // This ensures the index region is complete and matches payload_start_offset
+        let empty_entry = IndexEntry {
+            key_hash: 0,
+            start_offset: 0,
+            length: 0,
+            reserved: 0,
+        };
+        let remaining_entries = INDEX_CAPACITY - self.index_entries.len();
+        for _ in 0..remaining_entries {
+            write_as_bytes(&mut self.file, &empty_entry).unwrap();
+        }
+        
+        // Ensure file is at least payload_start_offset bytes (header + index region)
+        // This is required for MmapStore::open to work correctly
+        // But don't truncate if file is larger (has payload data)
+        let current_len = self.file.metadata().unwrap().len();
+        let min_len = self.payload_start_offset as u64;
+        if current_len < min_len {
+            self.file.set_len(min_len).unwrap();
+        }
+        // Note: Don't sync here - let append_chunk handle syncing after all writes are complete
     }
 
-    fn append_chunk(&mut self, trades: &[Trade], chunk_start_ns: u64) {
+    fn append_chunk(&mut self, trades: &[Trade], chunk_start_us: u64) {
         if trades.is_empty() { return; }
         
         if self.index_entries.len() >= INDEX_CAPACITY {
@@ -448,19 +632,50 @@ impl MmapWriter {
             return;
         }
 
-        let record_batch = trades_to_record_batch(trades).unwrap();
-        let payload = record_batch_to_parquet_bytes(&record_batch).unwrap();
+        let record_batch = match trades_to_record_batch(trades) {
+            Ok(batch) => batch,
+            Err(e) => {
+                error!("Failed to convert trades to record batch: {}", e);
+                return;
+            }
+        };
+        
+        let payload = match record_batch_to_parquet_bytes(&record_batch) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to convert record batch to parquet: {}", e);
+                return;
+            }
+        };
 
         let payload_file_offset = self.payload_start_offset + self.current_payload_offset;
-        self.file.seek(SeekFrom::Start(payload_file_offset as u64)).unwrap();
-        self.file.write_all(&payload).unwrap();
+        if let Err(e) = self.file.seek(SeekFrom::Start(payload_file_offset as u64)) {
+            error!("Failed to seek to payload offset {}: {}", payload_file_offset, e);
+            return;
+        }
+        
+        if let Err(e) = self.file.write_all(&payload) {
+            error!("Failed to write payload ({} bytes) at offset {}: {}", payload.len(), payload_file_offset, e);
+            return;
+        }
+        
+        // CRITICAL: Sync payload to disk before updating index
+        // This ensures data integrity - if another thread opens MmapStore while we're writing,
+        // it won't read incomplete Parquet files. We sync here (before updating index) so that
+        // the payload is fully written to disk before the index points to it.
+        if let Err(e) = self.file.sync_all() {
+            error!("Failed to sync payload to disk: {}", e);
+            return;
+        }
+        
+        info!("Wrote {} bytes of payload at offset {}", payload.len(), payload_file_offset);
 
-        let existing_idx = self.index_entries.iter().position(|e| e.key_hash == chunk_start_ns);
+        let existing_idx = self.index_entries.iter().position(|e| e.key_hash == chunk_start_us);
 
         if let Some(idx) = existing_idx {
             // Replace
              self.index_entries[idx] = IndexEntry {
-                key_hash: chunk_start_ns,
+                key_hash: chunk_start_us,
                 start_offset: self.current_payload_offset,
                 length: payload.len() as u32,
                 reserved: 0,
@@ -468,7 +683,7 @@ impl MmapWriter {
         } else {
             // New
             let index_entry = IndexEntry {
-                key_hash: chunk_start_ns,
+                key_hash: chunk_start_us,
                 start_offset: self.current_payload_offset,
                 length: payload.len() as u32,
                 reserved: 0,

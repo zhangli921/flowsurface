@@ -7,13 +7,15 @@ use arrow::array; // Required for downcasting Arrow arrays
 
 use crate::{kline::KLine, arbiter_error::ArbiterError, compute::vp::TickDataBuffer};
 
-/// Defines a time range with nanosecond precision.
+/// Defines a time range with microsecond precision.
+/// Microsecond precision is sufficient for financial data and allows representing
+/// timestamps up to year 584,542 (far beyond any practical need).
 #[derive(Debug, Clone, Copy)]
 pub struct TimeRange {
-    /// Start of the time range, inclusive.
-    pub start_ns: u64,
-    /// End of the time range, exclusive.
-    pub end_ns: u64,
+    /// Start of the time range, inclusive, in microseconds.
+    pub start_us: u64,
+    /// End of the time range, exclusive, in microseconds.
+    pub end_us: u64,
 }
 
 /// A lightweight representation of a trade for aggregation.
@@ -23,6 +25,19 @@ struct LightweightTrade {
     price: f64,
     qty: f64,
     is_buy: bool,
+}
+
+/// Helper function to normalize key_hash to microseconds.
+/// Detects and fixes timestamp unit issues (e.g., nanoseconds stored as microseconds).
+/// A reasonable microsecond timestamp for 2025 would be around 1.7e15,
+/// so anything above 1e18 is likely nanoseconds.
+fn normalize_key_hash_to_us(key_hash: u64) -> u64 {
+    if key_hash > 1_000_000_000_000_000_000 {
+        // Likely nanoseconds, convert to microseconds
+        key_hash / 1_000
+    } else {
+        key_hash
+    }
 }
 
 /// A service dedicated to handling blocking I/O tasks.
@@ -59,19 +74,23 @@ impl IoService {
         let index = self.store.index();
 
         // Find the first data block that *could* contain data for our time range.
-        let start_idx = index.partition_point(|entry| entry.key_hash() < range.start_ns);
+        let start_idx = index.partition_point(|entry| entry.key_hash() < range.start_us);
 
         let mut all_trades: Vec<LightweightTrade> = Vec::new();
 
         // Iterate through index entries that overlap with the requested time range.
         for entry in &index[start_idx..] {
             // If the block's start time is already after our range ends, we can stop.
-            if entry.key_hash() >= range.end_ns {
+            if entry.key_hash() >= range.end_us {
                 break;
             }
 
             // Load and deserialize payload
             let payload = self.store.get_payload(entry);
+            if payload.is_empty() {
+                // Skip entries with empty payload (e.g., file truncated or data not yet written)
+                continue;
+            }
             let payload_bytes = bytes::Bytes::from(payload.to_vec());
             
             let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(payload_bytes)?
@@ -84,7 +103,7 @@ impl IoService {
                 let timestamps = batch
                     .column(0)
                     .as_any()
-                    .downcast_ref::<array::TimestampNanosecondArray>()
+                    .downcast_ref::<array::TimestampMicrosecondArray>()
                     .ok_or(ArbiterError::InvalidInput("Timestamp column has wrong type"))?;
                 let prices = batch
                     .column(1)
@@ -105,7 +124,7 @@ impl IoService {
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i) as u64;
                     // Filter ticks to be within the requested range
-                    if ts >= range.start_ns && ts < range.end_ns {
+                    if ts >= range.start_us && ts < range.end_us {
                         all_trades.push(LightweightTrade {
                             time: ts,
                             price: prices.value(i),
@@ -121,16 +140,16 @@ impl IoService {
         all_trades.sort_by_key(|t| t.time);
 
         // --- K-line Aggregation ---
-        const AGGREGATION_INTERVAL_NS: u64 = 60 * 1_000_000_000; // 1 minute in nanoseconds
+        const AGGREGATION_INTERVAL_US: u64 = 60 * 1_000_000; // 1 minute in microseconds
         let mut klines: Vec<KLine> = Vec::new();
         let mut current_kline: Option<KLine> = None;
 
         for trade in all_trades {
-            // Calculate the K-line's open_time_ns for this trade
-            let kline_open_time_ns = (trade.time / AGGREGATION_INTERVAL_NS) * AGGREGATION_INTERVAL_NS;
+            // Calculate the K-line's open_time_us for this trade
+            let kline_open_time_us = (trade.time / AGGREGATION_INTERVAL_US) * AGGREGATION_INTERVAL_US;
 
             if let Some(mut kline) = current_kline {
-                if kline.open_time_ns == kline_open_time_ns {
+                if kline.open_time_us == kline_open_time_us {
                     // Update existing K-line
                     kline.high = kline.high.max(trade.price);
                     kline.low = kline.low.min(trade.price);
@@ -143,7 +162,7 @@ impl IoService {
                     klines.push(kline);
                     // Start a new K-line
                     current_kline = Some(KLine {
-                        open_time_ns: kline_open_time_ns,
+                        open_time_us: kline_open_time_us,
                         open: trade.price,
                         high: trade.price,
                         low: trade.price,
@@ -155,7 +174,7 @@ impl IoService {
             } else {
                 // First trade, start the first K-line
                 current_kline = Some(KLine {
-                    open_time_ns: kline_open_time_ns,
+                    open_time_us: kline_open_time_us,
                     open: trade.price,
                     high: trade.price,
                     low: trade.price,
@@ -172,7 +191,7 @@ impl IoService {
         }
 
         // Filter klines to match the exact requested range, as some might spill over
-        klines.retain(|k| k.open_time_ns >= range.start_ns && k.open_time_ns < range.end_ns);
+        klines.retain(|k| k.open_time_us >= range.start_us && k.open_time_us < range.end_us);
 
         Ok(klines)
     }
@@ -187,38 +206,92 @@ impl IoService {
     /// * `range` - The time range for which to fetch tick data.
     pub fn fetch_ticks_blocking(&self, range: TimeRange) -> Result<TickDataBuffer, ArbiterError> {
         let index = self.store.index();
+        
+        log::debug!("fetch_ticks_blocking: index has {} entries, querying range {} - {} us", 
+            index.len(), range.start_us, range.end_us);
 
         // Find the first data block that *could* contain data for our time range.
-        // partition_point returns the index where entry.key_hash() >= range.start_ns
-        let start_idx = index.partition_point(|entry| entry.key_hash() < range.start_ns);
+        // partition_point returns the index where entry.key_hash() >= range.start_us
+        // CRITICAL: Normalize key_hash to microseconds to handle old data with wrong units
+        let start_idx = index.partition_point(|entry| {
+            let normalized_key = normalize_key_hash_to_us(entry.key_hash());
+            normalized_key < range.start_us
+        });
         
         // IMPORTANT: We must check the previous chunk as well, because:
         // 1. The query range start might fall within the duration of the previous chunk
         // 2. key_hash is the chunk's START time, but the chunk contains data that extends beyond that
-        // 3. If start_idx == index.len(), all chunks start before range.start_ns, but the last chunk might contain our data
+        // 3. If start_idx == index.len(), all chunks start before range.start_us, but the last chunk might contain our data
         let scan_start_idx = if start_idx == 0 {
             0
         } else {
             start_idx.saturating_sub(1)
         };
+        
+        if index.is_empty() {
+            log::warn!("fetch_ticks_blocking: MmapStore index is empty, no data available");
+            return Ok(TickDataBuffer { prices: Vec::new(), volumes: Vec::new() });
+        }
+        
+        if scan_start_idx < index.len() {
+            let raw_key = index[scan_start_idx].key_hash();
+            let normalized_key = normalize_key_hash_to_us(raw_key);
+            if raw_key != normalized_key {
+                log::warn!("fetch_ticks_blocking: Detected timestamp unit issue in chunk at index {}: raw={}, normalized={} us", 
+                    scan_start_idx, raw_key, normalized_key);
+            }
+            log::debug!("fetch_ticks_blocking: scanning from index {} (chunk start: {} us) to end",
+                scan_start_idx, normalized_key);
+        }
 
         let mut prices: Vec<u32> = Vec::new();
         let mut volumes: Vec<f32> = Vec::new();
+        let mut chunks_checked = 0;
+        let mut chunks_with_data = 0;
+        let mut ticks_before_filter = 0;
 
         // Iterate through index entries that overlap with the requested time range.
         for entry in &index[scan_start_idx..] {
+            // CRITICAL: Normalize key_hash to microseconds to handle old data with wrong units
+            let chunk_start_us = normalize_key_hash_to_us(entry.key_hash());
+            
             // If the block's start time is already after our range ends, we can stop.
-            if entry.key_hash() >= range.end_ns {
+            if chunk_start_us >= range.end_us {
+                log::debug!("fetch_ticks_blocking: chunk start {} >= range end {}, stopping", 
+                    chunk_start_us, range.end_us);
                 break;
             }
+            
+            chunks_checked += 1;
 
             // Load and deserialize payload
             let payload = self.store.get_payload(entry);
+            if payload.is_empty() {
+                log::debug!("fetch_ticks_blocking: chunk at {} us has empty payload, skipping", chunk_start_us);
+                // Skip entries with empty payload (e.g., file truncated or data not yet written)
+                continue;
+            }
+            
+            // CRITICAL: Verify payload length matches index entry length
+            // This ensures we don't read incomplete Parquet files that could cause "Corrupt footer" errors
+            if payload.len() != entry.length as usize {
+                log::warn!("fetch_ticks_blocking: chunk at {} us has mismatched length: index says {} bytes, actual payload is {} bytes. Skipping to avoid corrupt Parquet.", 
+                    chunk_start_us, entry.length, payload.len());
+                continue;
+            }
+            
+            chunks_with_data += 1;
             let payload_bytes = bytes::Bytes::from(payload.to_vec());
             
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(payload_bytes)?
-                .with_batch_size(8192)
-                .build()?;
+            // Wrap Parquet parsing in a more descriptive error context
+            let reader = match parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(payload_bytes) {
+                Ok(builder) => builder.with_batch_size(8192).build(),
+                Err(e) => {
+                    log::warn!("fetch_ticks_blocking: Failed to create Parquet reader for chunk at {} us (length {} bytes): {}. This may indicate incomplete file write. Skipping.", 
+                        chunk_start_us, payload.len(), e);
+                    continue;
+                }
+            }?;
 
             for batch_result in reader {
                 let batch = batch_result?;
@@ -226,7 +299,7 @@ impl IoService {
                 let timestamps = batch
                     .column(0)
                     .as_any()
-                    .downcast_ref::<array::TimestampNanosecondArray>()
+                    .downcast_ref::<array::TimestampMicrosecondArray>()
                     .ok_or(ArbiterError::InvalidInput("Timestamp column has wrong type"))?;
                 let price_array = batch
                     .column(1)
@@ -241,8 +314,9 @@ impl IoService {
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i) as u64;
+                    ticks_before_filter += 1;
                     // Filter ticks to be within the requested range
-                    if ts >= range.start_ns && ts < range.end_ns {
+                    if ts >= range.start_us && ts < range.end_us {
                         // Convert price from f64 to u32 (fixed-point representation)
                         // Assuming price is in dollars with 2 decimal places, multiply by 100
                         // u32 max (~4.2 billion) represents prices up to ~42 million
@@ -253,6 +327,9 @@ impl IoService {
                 }
             }
         }
+        
+        log::info!("fetch_ticks_blocking: checked {} chunks, {} had data, {} total ticks, {} ticks in range", 
+            chunks_checked, chunks_with_data, ticks_before_filter, prices.len());
 
         Ok(TickDataBuffer { prices, volumes })
     }

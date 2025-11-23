@@ -374,14 +374,14 @@ impl ChartState {
         }
     }
 
-    pub fn visible_time_range_ns(&self) -> Option<data::io_service::TimeRange> {
+    pub fn visible_time_range_us(&self) -> Option<data::io_service::TimeRange> {
         match self.basis {
             Basis::Time(_) => {
                 let region = self.visible_region(self.bounds.size());
                 let (start, end) = self.interval_range(&region);
                 Some(data::io_service::TimeRange {
-                    start_ns: start * 1_000_000,
-                    end_ns: end * 1_000_000,
+                    start_us: start.checked_mul(1_000).unwrap_or(0), // Convert ms to microseconds
+                    end_us: end.checked_mul(1_000).unwrap_or(0),
                 })
             }
             _ => None,

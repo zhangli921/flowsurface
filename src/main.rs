@@ -12,7 +12,7 @@ mod window;
 use data::{
     self,
     arbiter_service::ArbiterService,
-    ingester::{IngestionService, IngestCommand},
+    ingester::{IngestionService, IngestCommand, normalize_binance_symbol},
     compute::service::VpComputeService,
     config::theme::default_theme,
     io_service::{IoService, TimeRange},
@@ -116,7 +116,11 @@ impl Flowsurface {
     fn new() -> (Self, Task<Message>) {
         // --- Start Ingestion Service ---
         let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(100);
-        let data_dir = data::data_path(Some("market_data")); 
+        let data_dir = data::data_path(Some("market_data"));
+        
+        // Pre-create the default Mmap file synchronously before starting the async service
+        IngestionService::ensure_mmap_file("BTCUSDT", &data_dir);
+        
         let ingestion_service = IngestionService::new(ingest_rx, data_dir);
         tokio::spawn(ingestion_service.run());
         // -------------------------------
@@ -277,12 +281,99 @@ impl Flowsurface {
             Message::ComputeVp(symbol, range) => {
                 if let Some(service) = &self.vp_service {
                     let service = service.clone();
-                    let io_service = self.arbiter.io_service().clone();
                     let symbol_clone = symbol.clone();
+                    let data_dir = data::data_path(Some("market_data"));
+                    
+                    // Normalize symbol to match filename (e.g., "BTC" -> "BTCUSDT")
+                    let normalized_symbol = normalize_binance_symbol(&symbol_clone);
+                    log::debug!("VP computation: normalizing symbol '{}' -> '{}'", symbol_clone, normalized_symbol);
+                    
+                    // Check if file exists, if not, trigger Ingester to create it
+                    let mmap_path = {
+                        let mut path = data_dir.clone();
+                        std::fs::create_dir_all(&path).ok();
+                        path.push(format!("{}.mmap", normalized_symbol));
+                        path
+                    };
+                    
+                    // Check if file exists and has valid size, if not, trigger Ingester to create it
+                    let file_ready = mmap_path.exists() && {
+                        if let Ok(metadata) = std::fs::metadata(&mmap_path) {
+                            metadata.len() > 1024 // At least 1KB to be considered valid
+                        } else {
+                            false
+                        }
+                    };
+                    
+                    if !file_ready {
+                        log::info!("Mmap file for {} (normalized: {}) does not exist or is empty, triggering Ingester to create it", symbol_clone, normalized_symbol);
+                        // Send the original symbol to ingester, it will normalize it internally
+                        let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone()));
+                    }
                     
                     return Task::future(async move {
-                        // Fetch ticks from IoService in a blocking task
+                        // Clone symbol for use inside the closure
+                        let symbol_for_closure = symbol_clone.clone();
+                        let mmap_path_for_closure = mmap_path.clone();
+                        
+                        // If file is not ready, wait with retries for ingester to create and write data
+                        if !file_ready {
+                            log::debug!("Waiting for Mmap file to be created and populated...");
+                            const MAX_RETRIES: u32 = 10;
+                            const RETRY_INTERVAL_MS: u64 = 500;
+                            
+                            for attempt in 1..=MAX_RETRIES {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_INTERVAL_MS)).await;
+                                
+                                let file_size = std::fs::metadata(&mmap_path_for_closure)
+                                    .ok()
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                                
+                                if file_size >= 1024 {
+                                    log::debug!("Mmap file for {} is ready after {} attempts ({} bytes)", 
+                                        symbol_for_closure, attempt, file_size);
+                                    break;
+                                }
+                                
+                                if attempt == MAX_RETRIES {
+                                    log::warn!("Mmap file for {} still not ready after {} attempts ({} bytes). Proceeding anyway.", 
+                                        symbol_for_closure, MAX_RETRIES, file_size);
+                                }
+                            }
+                        }
+                        
+                        // Fetch ticks from the symbol-specific Mmap file in a blocking task
                         let ticks = match tokio::task::spawn_blocking(move || {
+                            // Final check file size before opening
+                            let file_size = std::fs::metadata(&mmap_path_for_closure)
+                                .ok()
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            
+                            if file_size < 1024 {
+                                log::debug!("Mmap file for {} is too small ({} bytes), returning empty result", symbol_for_closure, file_size);
+                                return Ok(data::compute::vp::TickDataBuffer {
+                                    prices: Vec::new(),
+                                    volumes: Vec::new(),
+                                });
+                            }
+                            
+                            // Open the MmapStore for this symbol
+                            let store = match MmapStore::open(&mmap_path_for_closure) {
+                                Ok(store) => Arc::new(store),
+                                Err(e) => {
+                                    log::warn!("Failed to open MmapStore for {} at {:?}: {}. File may not exist yet or is being created.", symbol_for_closure, mmap_path_for_closure, e);
+                                    // Return empty ticks if file doesn't exist yet or is invalid
+                                    return Ok(data::compute::vp::TickDataBuffer {
+                                        prices: Vec::new(),
+                                        volumes: Vec::new(),
+                                    });
+                                }
+                            };
+                            
+                            // Create a temporary IoService for this symbol
+                            let io_service = data::IoService::new(store);
                             io_service.fetch_ticks_blocking(range)
                         }).await {
                             Ok(result) => match result {
@@ -499,15 +590,25 @@ impl Flowsurface {
                             Task::none()
                         }
                         Some(dashboard::Event::ResolveStreams { pane_id, streams }) => {
+                            log::debug!("ResolveStreams event received with {} streams", streams.len());
                             // Notify Ingestion Service
                             if let Some(stream) = streams.first() {
                                 let symbol = match stream {
                                     exchange::adapter::PersistStreamKind::Kline(pk) => pk.ticker.to_string(),
                                     exchange::adapter::PersistStreamKind::DepthAndTrades(pd) => pd.ticker.to_string(),
                                 };
+                                log::debug!("Extracted symbol from stream: '{}'", symbol);
                                 if !symbol.is_empty() {
-                                    let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol));
+                                    log::info!("Sending IngestCommand::Subscribe({}) to IngestionService", symbol);
+                                    match self.ingest_tx.try_send(IngestCommand::Subscribe(symbol.clone())) {
+                                        Ok(()) => log::info!("IngestCommand::Subscribe({}) sent successfully", symbol),
+                                        Err(e) => log::warn!("Failed to send IngestCommand::Subscribe({}): {:?}", symbol, e),
+                                    }
+                                } else {
+                                    log::warn!("Empty symbol extracted from stream, skipping IngestCommand::Subscribe");
                                 }
+                            } else {
+                                log::warn!("ResolveStreams event received but streams is empty");
                             }
 
                             let tickers_info = self.sidebar.tickers_info();

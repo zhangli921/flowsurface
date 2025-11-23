@@ -196,7 +196,7 @@ impl KlineRenderer {
             // 1. Update Instance Data (CPU Heavy, but only on data change)
             
             // Update base time to first element to keep offsets small
-            self.base_time_ms = (klines[0].open_time_ns / 1_000_000) as f64;
+            self.base_time_ms = (klines[0].open_time_us / 1_000) as f64;
             
             // Update base price to first element
             self.base_price_units = Price::from_f32(klines[0].close as f32).units;
@@ -204,7 +204,7 @@ impl KlineRenderer {
             let instances: Vec<KlineInstance> = klines
                 .iter()
                 .map(|k| {
-                    let time_ms = (k.open_time_ns / 1_000_000) as f64;
+                    let time_ms = (k.open_time_us / 1_000) as f64;
                     let time_offset = (time_ms - self.base_time_ms) as f32;
                     
                     // Price offsets relative to base_price_units
