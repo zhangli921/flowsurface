@@ -20,6 +20,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
 
+use crate::kline_cache::KlineCache;
+use crate::kline::KLine;
+
 const MAGIC_NUMBER: &[u8; 8] = b"ZEROCPY!";
 const DATA_VERSION: u16 = 1;
 const INDEX_CAPACITY: usize = 200_000;
@@ -88,6 +91,7 @@ pub struct RealtimeIngesterService {
     active_symbol: Option<String>,
     abort_handle: Option<tokio::task::JoinHandle<()>>,
     data_dir: PathBuf,
+    kline_cache: Option<Arc<KlineCache>>,
 }
 
 impl RealtimeIngesterService {
@@ -97,7 +101,14 @@ impl RealtimeIngesterService {
             active_symbol: None,
             abort_handle: None,
             data_dir,
+            kline_cache: None,
         }
+    }
+
+    /// Sets the K-line cache for this service.
+    /// This allows the service to cache K-line data for fast retrieval.
+    pub fn set_kline_cache(&mut self, cache: Arc<KlineCache>) {
+        self.kline_cache = Some(cache);
     }
 
     /// Synchronously creates the default Mmap file for a symbol.
@@ -164,8 +175,9 @@ impl RealtimeIngesterService {
         let data_dir = self.data_dir.clone();
         
         // Spawn a new task for this symbol
+        let kline_cache_clone = self.kline_cache.clone();
         let handle = tokio::spawn(async move {
-            run_ingest_task(symbol_clone, data_dir).await;
+            run_ingest_task(symbol_clone, data_dir, kline_cache_clone).await;
         });
         
         self.abort_handle = Some(handle);
@@ -173,7 +185,7 @@ impl RealtimeIngesterService {
     }
 }
 
-async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
+async fn run_ingest_task(symbol: String, data_dir: PathBuf, kline_cache: Option<Arc<KlineCache>>) {
     info!("Starting ingestion task for {}", symbol);
     
     // Normalize symbol for Binance API (e.g., "ETH-USDT-SWAP" -> "ETHUSDT", "BTC" -> "BTCUSDT")
@@ -189,6 +201,15 @@ async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
     // Construct WS URL dynamically using normalized symbol
     let ws_url = format!("wss://stream.binance.com:9443/ws/{}@aggTrade", api_symbol.to_lowercase());
 
+    // Start K-line cache update task if cache is available
+    let kline_cache_clone = kline_cache.clone();
+    let api_symbol_for_kline = api_symbol.clone();
+    if let Some(cache) = kline_cache_clone {
+        tokio::spawn(async move {
+            update_kline_cache_periodically(api_symbol_for_kline, cache).await;
+        });
+    }
+
     // 1. Initialize Mmap Writer
     let (mut writer, last_timestamp) = MmapWriter::open_or_create(mmap_path_str);
     
@@ -198,11 +219,15 @@ async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
     let default_duration_hours = 24;
     
     let start_ms = if let Some(last_ts) = last_timestamp {
-        info!("[{}] Resuming download from: {}", symbol, last_ts);
+        info!("[{}] Resuming download from: {} ms (last timestamp in file)", symbol, last_ts);
         last_ts + 1 // Start from next ms to avoid duplication logic (or let append_chunk handle it)
     } else {
-        now_ms - (default_duration_hours * 60 * 60 * 1000)
+        let default_start = now_ms - (default_duration_hours * 60 * 60 * 1000);
+        info!("[{}] Starting fresh download from: {} ms ({} hours ago)", symbol, default_start, default_duration_hours);
+        default_start
     };
+    
+    info!("[{}] Downloading historical data: {} ms - {} ms (now)", symbol, start_ms, now_ms);
 
     if start_ms < now_ms {
         let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
@@ -305,6 +330,91 @@ async fn run_ingest_task(symbol: String, data_dir: PathBuf) {
         }
     }
     warn!("[{}] Ingestion task ended.", symbol);
+}
+
+/// Periodically updates K-line cache by fetching from Binance REST API.
+/// This runs in the background and updates the cache every minute.
+async fn update_kline_cache_periodically(api_symbol: String, cache: Arc<KlineCache>) {
+    let client = Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+    let update_interval = Duration::from_secs(60); // Update every minute
+    
+    // Common timeframes to cache
+    let timeframes = vec!["1m", "5m", "15m", "1h", "4h", "1d"];
+    
+    loop {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        // Fetch last 24 hours of data for each timeframe
+        let start_ms = now_ms - (24 * 60 * 60 * 1000);
+        
+        for timeframe in &timeframes {
+            let url = format!(
+                "https://api.binance.com/api/v3/klines?symbol={}&interval={}&startTime={}&endTime={}&limit=1000",
+                api_symbol, timeframe, start_ms, now_ms
+            );
+            
+            match client.get(&url).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.json::<Vec<Vec<serde_json::Value>>>().await {
+                            Ok(klines_json) => {
+                                let mut klines = Vec::new();
+                                for kline_array in klines_json {
+                                    if kline_array.len() < 9 {
+                                        continue;
+                                    }
+                                    
+                                    if let (Some(open_time_ms), Some(open_str), Some(high_str), Some(low_str), Some(close_str), Some(volume_str), _, _, Some(num_trades)) = (
+                                        kline_array[0].as_u64(),
+                                        kline_array[1].as_str(),
+                                        kline_array[2].as_str(),
+                                        kline_array[3].as_str(),
+                                        kline_array[4].as_str(),
+                                        kline_array[5].as_str(),
+                                        kline_array.get(6),
+                                        kline_array.get(7),
+                                        kline_array[8].as_u64(),
+                                    ) {
+                                        if let (Ok(open), Ok(high), Ok(low), Ok(close), Ok(volume)) = (
+                                            open_str.parse::<f64>(),
+                                            high_str.parse::<f64>(),
+                                            low_str.parse::<f64>(),
+                                            close_str.parse::<f64>(),
+                                            volume_str.parse::<f64>(),
+                                        ) {
+                                            klines.push(KLine {
+                                                open_time_us: open_time_ms * 1_000,
+                                                open,
+                                                high,
+                                                low,
+                                                close,
+                                                volume,
+                                                num_trades: num_trades as u32,
+                                            });
+                                        }
+                                    }
+                                }
+                                
+                                if !klines.is_empty() {
+                                    cache.insert_many(&api_symbol, timeframe, &klines);
+                                    info!("[{}] Updated K-line cache: {} K-lines for timeframe {}", api_symbol, klines.len(), timeframe);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("[{}] Failed to parse K-line JSON for {}: {}", api_symbol, timeframe, e);
+                            }
+                        }
+                    } else {
+                        warn!("[{}] Failed to fetch K-lines for {}: HTTP {}", api_symbol, timeframe, response.status());
+                    }
+                }
+                Err(e) => {
+                    warn!("[{}] Failed to fetch K-lines for {}: {}", api_symbol, timeframe, e);
+                }
+            }
+        }
+        
+        tokio::time::sleep(update_interval).await;
+    }
 }
 
 // --- Helpers from original main.rs ---
@@ -668,7 +778,6 @@ impl MmapWriter {
             return;
         }
         
-        info!("Wrote {} bytes of payload at offset {}", payload.len(), payload_file_offset);
 
         let existing_idx = self.index_entries.iter().position(|e| e.key_hash == chunk_start_us);
 

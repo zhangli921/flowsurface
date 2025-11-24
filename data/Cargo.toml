@@ -25,7 +25,7 @@ storage = { path = "../storage" }
 arrow = "57.0.0"
 parquet = { version = "57.0.0", features = ["arrow"] }
 tokio = { version = "1.0", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 zip = "0.6"

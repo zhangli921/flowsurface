@@ -17,6 +17,7 @@ use data::{
     config::theme::default_theme,
     realtime_data_service::{RealtimeDataService, TimeRange},
     kline::KLine,
+    kline_cache::KlineCache,
     layout::WindowSpec,
     sidebar, DataError,
     historical_data_service::HistoricalDataService,
@@ -123,23 +124,23 @@ impl Flowsurface {
         // Pre-create the default Mmap file synchronously before starting the async service
         RealtimeIngesterService::ensure_mmap_file("BTCUSDT", &data_dir);
 
-        let ingestion_service = RealtimeIngesterService::new(ingest_rx, data_dir);
+        // Create shared K-line cache
+        let kline_cache = Arc::new(KlineCache::new());
+        
+        // Initialize RealtimeIngesterService with K-line cache
+        let mut ingestion_service = RealtimeIngesterService::new(ingest_rx, data_dir);
+        ingestion_service.set_kline_cache(kline_cache.clone());
         tokio::spawn(ingestion_service.run());
         // -------------------------------
 
-        // --- Start of Arbiter Service Initialization ---
-        let mmap_path = {
-            let mut path = data::data_path(Some("market_data"));
-            std::fs::create_dir_all(&path).ok();
-            path.push("BTCUSDT.mmap"); // Default to BTCUSDT
-            path
-        };
+        // --- Start of Unified Data Service Initialization ---
+        let data_dir = data::data_path(Some("market_data"));
+        std::fs::create_dir_all(&data_dir).ok();
 
-        let store = MmapStore::open(&mmap_path)
-            .unwrap_or_else(|e| panic!("Failed to open MmapStore at {:?}: {}", mmap_path, e));
-
+        let mut realtime_data_service = RealtimeDataService::new(data_dir.clone());
+        realtime_data_service.set_kline_cache(kline_cache.clone());
         let unified_data_service = Arc::new(UnifiedDataService::new(
-            Arc::new(RealtimeDataService::new(Arc::new(store))),
+            Arc::new(realtime_data_service),
             Arc::new(HistoricalDataService::new(Arc::new(HistoricalIngesterService::new(None)))),
         ));
         // --- End of Arbiter Service Initialization ---

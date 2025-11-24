@@ -5,7 +5,7 @@ use std::sync::Arc;
 use storage::MmapStore;
 use arrow::array; // Required for downcasting Arrow arrays
 
-use crate::{kline::KLine, data_error::DataError, compute::vp::TickDataBuffer};
+use crate::{kline::KLine, data_error::DataError, compute::vp::TickDataBuffer, realtime_ingester::normalize_binance_symbol};
 
 /// Defines a time range with microsecond precision.
 /// Microsecond precision is sufficient for financial data and allows representing
@@ -42,22 +42,103 @@ fn normalize_key_hash_to_us(key_hash: u64) -> u64 {
 
 /// A service dedicated to reading real-time data from memory-mapped files.
 ///
-/// It holds a reference to the `MmapStore` and provides methods to fetch
-/// and process data from it. These methods are designed to be run within
-/// `tokio::task::spawn_blocking` to avoid blocking the main async runtime.
+/// It can dynamically open MmapStore files for different symbols.
+/// These methods are designed to be run within `tokio::task::spawn_blocking`
+/// to avoid blocking the main async runtime.
 #[derive(Clone)]
 pub struct RealtimeDataService {
-    store: Arc<MmapStore>,
+    data_dir: std::path::PathBuf,
+    kline_cache: Option<std::sync::Arc<crate::kline_cache::KlineCache>>,
 }
 
 impl RealtimeDataService {
-    /// Creates a new `IoService`.
+    /// Creates a new `RealtimeDataService`.
     ///
     /// # Arguments
     ///
-    /// * `store` - An `Arc`-wrapped `MmapStore` instance.
-    pub fn new(store: Arc<MmapStore>) -> Self {
-        Self { store }
+    /// * `data_dir` - The base directory where MmapStore files are stored.
+    pub fn new(data_dir: std::path::PathBuf) -> Self {
+        Self {
+            data_dir,
+            kline_cache: None,
+        }
+    }
+
+    /// Sets the K-line cache for this service.
+    /// This allows the service to read K-line data from cache instead of always fetching from API.
+    pub fn set_kline_cache(&mut self, cache: std::sync::Arc<crate::kline_cache::KlineCache>) {
+        self.kline_cache = Some(cache);
+    }
+    
+    /// Opens the MmapStore for a given symbol.
+    /// Returns None if the file doesn't exist or is invalid.
+    /// 
+    /// This method will retry opening the file a few times with short delays,
+    /// as the file may be in the process of being created by RealtimeIngesterService.
+    fn open_store_for_symbol(&self, symbol: &str) -> Option<Arc<MmapStore>> {
+        use crate::realtime_ingester::normalize_binance_symbol;
+        let normalized_symbol = normalize_binance_symbol(symbol);
+        // RealtimeIngesterService creates files as {normalized_symbol}.mmap directly in data_dir
+        let mmap_path = self.data_dir.join(format!("{}.mmap", normalized_symbol));
+        
+        // Retry logic: file may be in the process of being created
+        const MAX_RETRIES: u32 = 5;
+        const RETRY_DELAY_MS: u64 = 200;
+        
+        for attempt in 0..=MAX_RETRIES {
+            match MmapStore::open(&mmap_path) {
+                Ok(store) => {
+                    let index_len = store.index().len();
+                    if index_len > 0 || attempt == MAX_RETRIES {
+                        // File exists and has data, or we've exhausted retries
+                        log::debug!(
+                            "RealtimeDataService: opened MmapStore for {} at {:?} (index entries: {})",
+                            symbol,
+                            mmap_path,
+                            index_len
+                        );
+                        return Some(Arc::new(store));
+                    } else {
+                        // File exists but index is empty, wait a bit and retry
+                        log::debug!(
+                            "RealtimeDataService: MmapStore for {} exists but index is empty (attempt {}/{})",
+                            symbol,
+                            attempt + 1,
+                            MAX_RETRIES + 1
+                        );
+                        if attempt < MAX_RETRIES {
+                            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES {
+                        log::debug!(
+                            "RealtimeDataService: failed to open MmapStore for {} at {:?} (attempt {}/{}): {}. Retrying...",
+                            symbol,
+                            mmap_path,
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            e
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                        continue;
+                    } else {
+                        log::warn!(
+                            "RealtimeDataService: failed to open MmapStore for {} at {:?} after {} attempts: {}",
+                            symbol,
+                            mmap_path,
+                            MAX_RETRIES + 1,
+                            e
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+        
+        None
     }
 
     /// Fetches tick data for a given time range from the MmapStore and aggregates
@@ -69,128 +150,181 @@ impl RealtimeDataService {
     /// # Arguments
     ///
     /// * `range` - The time range for which to fetch and aggregate data.
-    pub fn fetch_kline_blocking(&self, range: TimeRange) -> Result<Vec<KLine>, DataError> {
-        let index = self.store.index();
+    /// Fetches K-line data for a given symbol and time range.
+    ///
+    /// This is a synchronous, CPU-intensive, and potentially blocking operation.
+    /// It **must** be called within `tokio::task::spawn_blocking`.
+    ///
+    /// # Arguments
+    ///
+    /// Fetches K-line data from Binance REST API.
+    /// 
+    /// This method directly fetches K-line data from Binance API instead of aggregating from trade data,
+    /// providing much faster response times for K-line chart display.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `symbol` - The trading pair symbol (e.g., "BTCUSDT", "SOLUSDT")
+    /// * `range` - The time range for which to fetch K-line data
+    /// * `timeframe` - The K-line interval (e.g., "1m", "5m", "1h")
+    pub fn fetch_klines_blocking(&self, symbol: &str, range: TimeRange, timeframe: &str) -> Result<Vec<KLine>, DataError> {
+        // Normalize symbol to Binance API format
+        let api_symbol = normalize_binance_symbol(symbol);
+        
+        log::info!(
+            "RealtimeDataService: fetching K-lines for {} (timeframe: {}, range: {} - {} us)",
+            api_symbol,
+            timeframe,
+            range.start_us,
+            range.end_us
+        );
 
-        // Find the first data block that *could* contain data for our time range.
-        let start_idx = index.partition_point(|entry| entry.key_hash() < range.start_us);
-
-        let mut all_trades: Vec<LightweightTrade> = Vec::new();
-
-        // Iterate through index entries that overlap with the requested time range.
-        for entry in &index[start_idx..] {
-            // If the block's start time is already after our range ends, we can stop.
-            if entry.key_hash() >= range.end_us {
-                break;
-            }
-
-            // Load and deserialize payload
-            let payload = self.store.get_payload(entry);
-            if payload.is_empty() {
-                // Skip entries with empty payload (e.g., file truncated or data not yet written)
-                continue;
-            }
-            let payload_bytes = bytes::Bytes::from(payload.to_vec());
-            
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(payload_bytes)?
-                .with_batch_size(8192)
-                .build()?;
-
-            for batch_result in reader {
-                let batch = batch_result?;
-                
-                let timestamps = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<array::TimestampMicrosecondArray>()
-                    .ok_or(DataError::InvalidInput("Timestamp column has wrong type"))?;
-                let prices = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<array::Float64Array>()
-                    .ok_or(DataError::InvalidInput("Price column has wrong type"))?;
-                let volumes = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<array::Float64Array>()
-                    .ok_or(DataError::InvalidInput("Volume column has wrong type"))?;
-                let is_bid_aggressors = batch
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<array::BooleanArray>()
-                    .ok_or(DataError::InvalidInput("IsBidAggressor column has wrong type"))?;
-
-                for i in 0..batch.num_rows() {
-                    let ts = timestamps.value(i) as u64;
-                    // Filter ticks to be within the requested range
-                    if ts >= range.start_us && ts < range.end_us {
-                        all_trades.push(LightweightTrade {
-                            time: ts,
-                            price: prices.value(i),
-                            qty: volumes.value(i),
-                            is_buy: !is_bid_aggressors.value(i), // If it's not a bid aggressor, it's a buy (taker)
-                        });
+        // 1. Try to get from cache first
+        if let Some(cache) = &self.kline_cache {
+            let cached_klines = cache.get_range(&api_symbol, timeframe, range.start_us, range.end_us);
+            if !cached_klines.is_empty() {
+                // Check if cache covers the requested range
+                if let Some((cache_min, cache_max)) = cache.time_range(&api_symbol, timeframe) {
+                    let cache_coverage = cache_min <= range.start_us && cache_max >= range.end_us;
+                    if cache_coverage {
+                        log::info!(
+                            "RealtimeDataService: retrieved {} K-lines from cache for {}",
+                            cached_klines.len(),
+                            api_symbol
+                        );
+                        return Ok(cached_klines);
+                    } else {
+                        log::debug!(
+                            "RealtimeDataService: cache partial coverage (cache: {} - {} us, requested: {} - {} us), will fetch from API",
+                            cache_min,
+                            cache_max,
+                            range.start_us,
+                            range.end_us
+                        );
                     }
                 }
             }
         }
 
-        // Sort trades by time, just in case (though ingester should provide them sorted within batches)
-        all_trades.sort_by_key(|t| t.time);
+        // 2. Cache miss or insufficient coverage: fetch from API
+        log::info!(
+            "RealtimeDataService: fetching K-lines from Binance API for {} (timeframe: {}, range: {} - {} us)",
+            api_symbol,
+            timeframe,
+            range.start_us,
+            range.end_us
+        );
 
-        // --- K-line Aggregation ---
-        const AGGREGATION_INTERVAL_US: u64 = 60 * 1_000_000; // 1 minute in microseconds
-        let mut klines: Vec<KLine> = Vec::new();
-        let mut current_kline: Option<KLine> = None;
+        // Binance K-line API endpoint
+        let url = format!(
+            "https://api.binance.com/api/v3/klines?symbol={}&interval={}&startTime={}&endTime={}&limit=1000",
+            api_symbol,
+            timeframe,
+            range.start_us / 1_000, // Convert us to ms
+            range.end_us / 1_000    // Convert us to ms
+        );
 
-        for trade in all_trades {
-            // Calculate the K-line's open_time_us for this trade
-            let kline_open_time_us = (trade.time / AGGREGATION_INTERVAL_US) * AGGREGATION_INTERVAL_US;
+        // Use blocking HTTP client
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| DataError::Network(reqwest::Error::from(e)))?;
 
-            if let Some(mut kline) = current_kline {
-                if kline.open_time_us == kline_open_time_us {
-                    // Update existing K-line
-                    kline.high = kline.high.max(trade.price);
-                    kline.low = kline.low.min(trade.price);
-                    kline.close = trade.price; // Update close price with every new trade
-                    kline.volume += trade.qty;
-                    kline.num_trades += 1;
-                    current_kline = Some(kline);
-                } else {
-                    // New K-line interval, finalize the current one
-                    klines.push(kline);
-                    // Start a new K-line
-                    current_kline = Some(KLine {
-                        open_time_us: kline_open_time_us,
-                        open: trade.price,
-                        high: trade.price,
-                        low: trade.price,
-                        close: trade.price,
-                        volume: trade.qty,
-                        num_trades: 1,
-                    });
-                }
-            } else {
-                // First trade, start the first K-line
-                current_kline = Some(KLine {
-                    open_time_us: kline_open_time_us,
-                    open: trade.price,
-                    high: trade.price,
-                    low: trade.price,
-                    close: trade.price,
-                    volume: trade.qty,
-                    num_trades: 1,
+        let response = client.get(&url).send()
+            .map_err(|e| DataError::Network(e))?;
+
+        if !response.status().is_success() {
+            return Err(DataError::Network(
+                response.error_for_status().unwrap_err()
+            ));
+        }
+
+        // Parse JSON response
+        // Binance returns an array of arrays: [[open_time, open, high, low, close, volume, close_time, ...], ...]
+        let klines_json: Vec<Vec<serde_json::Value>> = response.json()
+            .map_err(|e| DataError::InvalidInput("Failed to parse JSON response"))?;
+
+        let mut klines = Vec::new();
+        for kline_array in klines_json {
+            if kline_array.len() < 9 {
+                continue; // Skip invalid entries
+        }
+
+            // Parse fields from Binance response
+            // [0] Open time (ms)
+            // [1] Open price (string)
+            // [2] High price (string)
+            // [3] Low price (string)
+            // [4] Close price (string)
+            // [5] Volume (string)
+            // [6] Close time (ms)
+            // [7] Quote asset volume (string)
+            // [8] Number of trades (u64)
+            // [9] Taker buy base asset volume (string)
+            // [10] Taker buy quote asset volume (string)
+            // [11] Ignore
+
+            let open_time_ms = kline_array[0].as_u64()
+                .ok_or_else(|| DataError::InvalidInput("Invalid open_time"))?;
+            
+            let open = kline_array[1].as_str()
+                .ok_or_else(|| DataError::InvalidInput("Invalid open price"))?
+                .parse::<f64>()
+                .map_err(|_| DataError::InvalidInput("Failed to parse open price"))?;
+            
+            let high = kline_array[2].as_str()
+                .ok_or_else(|| DataError::InvalidInput("Invalid high price"))?
+                .parse::<f64>()
+                .map_err(|_| DataError::InvalidInput("Failed to parse high price"))?;
+            
+            let low = kline_array[3].as_str()
+                .ok_or_else(|| DataError::InvalidInput("Invalid low price"))?
+                .parse::<f64>()
+                .map_err(|_| DataError::InvalidInput("Failed to parse low price"))?;
+            
+            let close = kline_array[4].as_str()
+                .ok_or_else(|| DataError::InvalidInput("Invalid close price"))?
+                .parse::<f64>()
+                .map_err(|_| DataError::InvalidInput("Failed to parse close price"))?;
+            
+            let volume = kline_array[5].as_str()
+                .ok_or_else(|| DataError::InvalidInput("Invalid volume"))?
+                .parse::<f64>()
+                .map_err(|_| DataError::InvalidInput("Failed to parse volume"))?;
+            
+            let num_trades = kline_array[8].as_u64()
+                .ok_or_else(|| DataError::InvalidInput("Invalid num_trades"))?
+                as u32;
+
+            klines.push(KLine {
+                open_time_us: open_time_ms * 1_000, // Convert ms to us
+                open,
+                high,
+                low,
+                close,
+                volume,
+                num_trades,
                 });
-            }
         }
 
-        // Push the last K-line if it exists
-        if let Some(kline) = current_kline {
-            klines.push(kline);
-        }
-
-        // Filter klines to match the exact requested range, as some might spill over
+        // Filter to requested range (Binance API may return slightly more data)
         klines.retain(|k| k.open_time_us >= range.start_us && k.open_time_us < range.end_us);
+
+        // 3. Update cache with fetched data
+        if let Some(cache) = &self.kline_cache {
+            cache.insert_many(&api_symbol, timeframe, &klines);
+            log::debug!(
+                "RealtimeDataService: updated cache with {} K-lines for {}",
+                klines.len(),
+                api_symbol
+            );
+        }
+
+        log::info!(
+            "RealtimeDataService: fetched {} K-lines from Binance API for {}",
+            klines.len(),
+            api_symbol
+        );
 
         Ok(klines)
     }
@@ -203,8 +337,25 @@ impl RealtimeDataService {
     /// # Arguments
     ///
     /// * `range` - The time range for which to fetch tick data.
-    pub fn fetch_ticks_blocking(&self, range: TimeRange) -> Result<TickDataBuffer, DataError> {
-        let index = self.store.index();
+    /// Fetches tick data for a given symbol and time range.
+    ///
+    /// This is a synchronous, CPU-intensive, and potentially blocking operation.
+    /// It **must** be called within `tokio::task::spawn_blocking`.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - The trading pair symbol (e.g., "BTCUSDT", "SOLUSDT")
+    /// * `range` - The time range for which to fetch tick data.
+    pub fn fetch_ticks_blocking(&self, symbol: &str, range: TimeRange) -> Result<TickDataBuffer, DataError> {
+        let store = match self.open_store_for_symbol(symbol) {
+            Some(store) => store,
+            None => {
+                log::warn!("RealtimeDataService: MmapStore not available for {}, returning empty result", symbol);
+                return Ok(TickDataBuffer { prices: Vec::new(), volumes: Vec::new() });
+            }
+        };
+        
+        let index = store.index();
         
         log::debug!("fetch_ticks_blocking: index has {} entries, querying range {} - {} us", 
             index.len(), range.start_us, range.end_us);
@@ -264,7 +415,7 @@ impl RealtimeDataService {
             chunks_checked += 1;
 
             // Load and deserialize payload
-            let payload = self.store.get_payload(entry);
+            let payload = store.get_payload(entry);
             if payload.is_empty() {
                 log::debug!("fetch_ticks_blocking: chunk at {} us has empty payload, skipping", chunk_start_us);
                 // Skip entries with empty payload (e.g., file truncated or data not yet written)
@@ -314,6 +465,7 @@ impl RealtimeDataService {
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i) as u64;
                     ticks_before_filter += 1;
+                    // Filter ticks to be within the requested range
                     // Filter ticks to be within the requested range
                     if ts >= range.start_us && ts < range.end_us {
                         // Convert price from f64 to u32 (fixed-point representation)

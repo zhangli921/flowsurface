@@ -163,6 +163,10 @@ impl Chart for KlineChart {
     fn yaxis_cache(&self) -> &Cache {
         &self.yaxis_cache
     }
+    
+    fn kline_data_for_price_range(&self) -> Option<&[data::kline::KLine]> {
+        Some(&self.render_cache_kline)
+    }
 }
 
 impl PlotConstants for KlineChart {
@@ -628,12 +632,68 @@ impl KlineChart {
     }
 
     pub fn insert_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+        log::info!(
+            "KlineChart: insert_klines called with {} K-lines, req_id: {}",
+            klines_raw.len(),
+            req_id
+        );
+        
+        // Debug: log time range of incoming data
+        if !klines_raw.is_empty() {
+            let data_start = klines_raw.first().map(|k| k.time).unwrap_or(0);
+            let data_end = klines_raw.last().map(|k| k.time).unwrap_or(0);
+            log::debug!(
+                "KlineChart: incoming K-lines time range: {} - {} ms",
+                data_start,
+                data_end
+            );
+        }
+        
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
+                let before_count = timeseries.datapoints.len();
                 timeseries.insert_klines(klines_raw);
+                let after_count = timeseries.datapoints.len();
+                
+                // Debug: log time range after insertion
+                if !timeseries.datapoints.is_empty() {
+                    let inserted_start = timeseries.datapoints.keys().next().copied().unwrap_or(0);
+                    let inserted_end = timeseries.datapoints.keys().last().copied().unwrap_or(0);
+                    log::debug!(
+                        "KlineChart: timeseries time range after insertion: {} - {} ms",
+                        inserted_start,
+                        inserted_end
+                    );
+                }
+                
+                log::info!(
+                    "KlineChart: inserted {} K-lines. Data points: {} -> {}",
+                    klines_raw.len(),
+                    before_count,
+                    after_count
+                );
+                
                 timeseries.insert_trades_existing_buckets(&self.raw_trades);
                 
+                // Update latest_x from timeseries to ensure it matches the data
+                if let Some(new_latest_x) = timeseries.latest_timestamp() {
+                    let chart = self.mut_state();
+                    if new_latest_x > chart.latest_x {
+                        chart.latest_x = new_latest_x;
+                        log::debug!(
+                            "KlineChart: updated latest_x from {} to {} ms",
+                            chart.latest_x,
+                            new_latest_x
+                        );
+                    }
+                }
+                
                 self.rebuild_render_cache();
+                
+                log::info!(
+                    "KlineChart: render_cache_kline now has {} K-lines",
+                    self.render_cache_kline.len()
+                );
 
                 self.indicators
                     .values_mut()
@@ -641,15 +701,23 @@ impl KlineChart {
                     .for_each(|indi| indi.rebuild_from_source(&self.data_source));
 
                 if klines_raw.is_empty() {
+                    log::warn!("KlineChart: received empty K-line data for req_id {}", req_id);
                     self.request_handler
                         .mark_failed(req_id, "No data received".to_string());
                 } else {
                     self.request_handler.mark_completed(req_id);
                 }
+                
+                // Reset last_visible_range to trigger re-check after data is inserted
+                // This ensures that if the visible range is still not covered, we'll fetch more
+                self.last_visible_range = None;
+                
                 self.invalidate(None);
                 self.chart.state.vp_needs_update = true;
             }
-            PlotData::TickBased(_) => {}
+            PlotData::TickBased(_) => {
+                log::warn!("KlineChart: insert_klines called but data_source is TickBased");
+            }
         }
     }
 
@@ -719,26 +787,223 @@ impl KlineChart {
                     let visible_region = chart.visible_region(chart.bounds.size());
                     let (start_interval, end_interval) = chart.interval_range(&visible_region);
 
-                    if let Some((lowest, highest)) = self
-                        .data_source
-                        .visible_price_range(start_interval, end_interval)
-                    {
-                        let padding = (highest - lowest) * 0.10;
-                        let price_span = (highest - lowest) + (2.0 * padding);
-
-                        if price_span > 0.0 && chart.bounds.height > f32::EPSILON {
-                            let padded_highest = highest + padding;
-                            let chart_height = chart.bounds.height;
-                            let tick_size = chart.tick_size.to_f32_lossy();
-
-                            if tick_size > 0.0 {
-                                chart.cell_height = (chart_height * tick_size) / price_span;
-                                chart.base_price_y = Price::from_f32(padded_highest);
-                                chart.translation.y = -chart_height / 2.0;
+                    // Calculate price range from K-lines that are actually visible on screen
+                    // Use the same coordinate calculation as the renderer to ensure consistency
+                    let base_time_ms = if !self.render_cache_kline.is_empty() {
+                        (self.render_cache_kline[0].open_time_us / 1_000) as f64
+                    } else {
+                        chart.latest_x as f64
+                    };
+                    
+                    let interval_ms = match chart.basis {
+                        Basis::Time(tf) => tf.to_milliseconds() as f64,
+                        _ => 1.0,
+                    };
+                    let cell_width = chart.cell_width as f64;
+                    let latest_x = chart.latest_x as f64;
+                    let scale_factor = cell_width / interval_ms.max(1.0);
+                    
+                    // Calculate transform parameters (same as renderer)
+                    let transform_x = (scale_factor as f32) * chart.scaling;
+                    let base_diff = base_time_ms - latest_x;
+                    let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
+                    
+                    let candle_width = chart.cell_width;
+                    let half_candle_width = candle_width / 2.0;
+                    let half_candle_width_screen = half_candle_width * chart.scaling;
+                    
+                    // Filter K-lines that are visible on screen using renderer's coordinate system
+                    let visible_klines_refs: Vec<_> = self.render_cache_kline.iter()
+                        .filter_map(|k| {
+                            let kline_time_ms = (k.open_time_us / 1_000) as f64;
+                            let time_offset = (kline_time_ms - base_time_ms) as f32;
+                            let kline_center_x_screen = (time_offset * transform_x) + transform_y;
+                            
+                            let kline_left_screen = kline_center_x_screen - half_candle_width_screen;
+                            let kline_right_screen = kline_center_x_screen + half_candle_width_screen;
+                            
+                            // Check if K-line overlaps with visible region [0, bounds.width]
+                            let is_visible = kline_left_screen <= chart.bounds.width && kline_right_screen >= 0.0;
+                            
+                            if is_visible {
+                                Some(k)
+                            } else {
+                                None
                             }
+                        })
+                        .collect();
+                    
+                    
+                    let (lowest, highest) = if !visible_klines_refs.is_empty() {
+                        let lowest = visible_klines_refs.iter()
+                            .map(|k| k.low)
+                            .fold(f64::INFINITY, |a, b| a.min(b)) as f32;
+                        let highest = visible_klines_refs.iter()
+                            .map(|k| k.high)
+                            .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
+                        
+                        (lowest, highest)
+                    } else {
+                        // Fallback to time-based filtering
+                        let start_interval_us = start_interval * 1000;
+                        let end_interval_us = end_interval * 1000;
+                        let time_filtered_klines: Vec<_> = self.render_cache_kline.iter()
+                            .filter(|k| k.open_time_us >= start_interval_us && k.open_time_us <= end_interval_us)
+                            .collect();
+                        
+                        if !time_filtered_klines.is_empty() {
+                            let lowest = time_filtered_klines.iter()
+                                .map(|k| k.low)
+                                .fold(f64::INFINITY, |a, b| a.min(b)) as f32;
+                            let highest = time_filtered_klines.iter()
+                                .map(|k| k.high)
+                                .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
+                            (lowest, highest)
+                        } else if let Some((lowest, highest)) = self
+                            .data_source
+                            .visible_price_range(start_interval, end_interval)
+                        {
+                            (lowest, highest)
+                        } else {
+                            return None;
+                        }
+                    };
+                    
+                    // Save debug info to state
+                    chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
+                    
+                    // No padding - use exact price range from visible K-lines
+                    let padded_lowest = lowest;
+                    let padded_highest = highest;
+                    let price_span = padded_highest - padded_lowest;
+
+                    if price_span > 0.0 && chart.bounds.height > f32::EPSILON {
+                        let chart_height = chart.bounds.height;
+                        let tick_size = chart.tick_size.to_f32_lossy();
+
+                        if tick_size > 0.0 {
+                            // Calculate cell_height so that price_span fits exactly in chart_height
+                            // Formula: cell_height = (chart_height * tick_size) / price_span
+                            // This ensures that price_span / tick_size * cell_height = chart_height
+                            chart.cell_height = (chart_height * tick_size) / price_span;
+                            
+                            // Set base_price_y to padded_highest so that highest price maps to y=0 in chart coordinates
+                            chart.base_price_y = Price::from_f32(padded_highest);
+                            
+                            // Calculate translation.y to ensure:
+                            // - Highest price (y=0 in chart coords) maps to top of screen
+                            // - Lowest price (y=price_span_in_chart_coords in chart coords) maps to bottom of screen
+                            //
+                            // In chart coordinates:
+                            // - price_to_y(padded_highest) = 0 (since base_price_y = padded_highest)
+                            // - price_to_y(padded_lowest) = (padded_highest - padded_lowest) / tick_size * cell_height = price_span / tick_size * cell_height
+                            //
+                            // From the calculation: cell_height = (chart_height * tick_size) / price_span
+                            // So: price_to_y(padded_lowest) = price_span / tick_size * (chart_height * tick_size / price_span) = chart_height
+                            //
+                            // In screen coordinates (from shader):
+                            // screen_y = (y_chart + translation.y) * scaling + height/2
+                            //
+                            // We want:
+                            // - y_chart=0 (highest) -> screen_y=0 (top)
+                            // - y_chart=chart_height (lowest) -> screen_y=height (bottom)
+                            //
+                            // So: (0 + translation.y) * scaling + height/2 = 0
+                            //     => translation.y * scaling = -height/2
+                            //     => translation.y = -height/(2*scaling)
+                            //
+                            // And: (chart_height + translation.y) * scaling + height/2 = height
+                            //     => (chart_height + translation.y) * scaling = height/2
+                            //     => chart_height * scaling + translation.y * scaling = height/2
+                            //     => chart_height * scaling - height/2 = height/2
+                            //     => chart_height * scaling = height
+                            //     => chart_height = height / scaling
+                            //
+                            // So we need: chart_height (in chart coords) = height / scaling
+                            // But we calculated cell_height using screen pixels (chart.bounds.height),
+                            // so chart_height in chart coords = chart.bounds.height / scaling
+                            let chart_coord_height = chart_height / chart.scaling;
+                            
+                            // Calculate translation.y so that y=0 maps to screen top
+                            // screen_y = (y_chart + translation.y) * scaling + height/2
+                            // For y_chart=0 to map to screen_y=0:
+                            // 0 = (0 + translation.y) * scaling + height/2
+                            // translation.y = -height/(2*scaling) = -(height/scaling)/2 = -chart_coord_height/2
+                            // Calculate translation.y so that y=0 maps to screen top
+                            chart.translation.y = -chart_coord_height / 2.0;
                         }
                     }
                 }
+            }
+        }
+
+        // Update debug_visible_range for UI display
+        let visible_region = chart.visible_region(chart.bounds.size());
+        let (start_interval, end_interval) = chart.interval_range(&visible_region);
+        
+        // Use renderer's coordinate system to find visible K-lines
+        let base_time_ms = if !self.render_cache_kline.is_empty() {
+            (self.render_cache_kline[0].open_time_us / 1_000) as f64
+        } else {
+            chart.latest_x as f64
+        };
+        
+        let interval_ms = match chart.basis {
+            Basis::Time(tf) => tf.to_milliseconds() as f64,
+            _ => 1.0,
+        };
+        let cell_width = chart.cell_width as f64;
+        let latest_x = chart.latest_x as f64;
+        let scale_factor = cell_width / interval_ms.max(1.0);
+        let transform_x = (scale_factor as f32) * chart.scaling;
+        let base_diff = base_time_ms - latest_x;
+        let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
+        
+        let candle_width = chart.cell_width;
+        let half_candle_width_screen = (candle_width / 2.0) * chart.scaling;
+        
+        let visible_klines: Vec<_> = self.render_cache_kline.iter()
+            .filter(|k| {
+                let kline_time_ms = (k.open_time_us / 1_000) as f64;
+                let time_offset = (kline_time_ms - base_time_ms) as f32;
+                let kline_center_x_screen = (time_offset * transform_x) + transform_y;
+                let kline_left_screen = kline_center_x_screen - half_candle_width_screen;
+                let kline_right_screen = kline_center_x_screen + half_candle_width_screen;
+                kline_left_screen <= chart.bounds.width && kline_right_screen >= 0.0
+            })
+            .collect();
+        
+        if !visible_klines.is_empty() {
+            let lowest = visible_klines.iter()
+                .map(|k| k.low)
+                .fold(f64::INFINITY, |a, b| a.min(b)) as f32;
+            let highest = visible_klines.iter()
+                .map(|k| k.high)
+                .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
+            chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
+        } else {
+            // Fallback to time-based filtering if no K-lines found by X coordinate
+            let start_interval_us = start_interval * 1000;
+            let end_interval_us = end_interval * 1000;
+            let time_filtered_klines: Vec<_> = self.render_cache_kline.iter()
+                .filter(|k| k.open_time_us >= start_interval_us && k.open_time_us <= end_interval_us)
+                .collect();
+            
+            if !time_filtered_klines.is_empty() {
+                let lowest = time_filtered_klines.iter()
+                    .map(|k| k.low)
+                    .fold(f64::INFINITY, |a, b| a.min(b)) as f32;
+                let highest = time_filtered_klines.iter()
+                    .map(|k| k.high)
+                    .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
+                chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
+            } else if let Some((lowest, highest)) = self
+                .data_source
+                .visible_price_range(start_interval, end_interval)
+            {
+                chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
+            } else {
+                chart.debug_visible_range = None;
             }
         }
 
@@ -746,6 +1011,10 @@ impl KlineChart {
         for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
             indi.clear_all_caches();
         }
+        
+        // Original project doesn't use cached_y_range for Y-axis labels
+        // Y-axis labels are recalculated every time based on visible range
+        // So we don't need to update cached_y_range here
 
         if let Some(t) = now {
             self.last_tick = t;
@@ -753,6 +1022,47 @@ impl KlineChart {
             self.check_data_update_needed()
         } else {
             None
+        }
+    }
+    
+    /// Update Y-axis range cache based on visible K-lines (for stabilization)
+    fn update_y_axis_range_cache(&mut self) {
+        use crate::chart::axes::YAxis;
+        use exchange::util::PriceStep;
+        
+        let chart = &self.chart.state;
+        let visible_region = chart.visible_region(chart.bounds.size());
+        let (start_ts, end_ts) = chart.interval_range(&visible_region);
+        
+        // Convert to microseconds for comparison with K-line timestamps
+        let start_ts_us = start_ts.checked_mul(1_000).unwrap_or(0);
+        let end_ts_us = end_ts.checked_mul(1_000).unwrap_or(0);
+        
+        // Filter K-lines within visible time range
+        let visible_klines: Vec<_> = self.render_cache_kline.iter()
+            .filter(|k| k.open_time_us >= start_ts_us && k.open_time_us <= end_ts_us)
+            .collect();
+        
+        if !visible_klines.is_empty() {
+            // Find min low and max high from visible K-lines
+            let min_low = visible_klines.iter()
+                .map(|k| k.low)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+            let max_high = visible_klines.iter()
+                .map(|k| k.high)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+            
+            // Round the price range to nice values
+            let rounded = YAxis::round_price_range(min_low, max_high, chart.tick_size);
+            
+            // Apply stabilization: only update cache if change is significant
+            // This ensures Y-axis labels remain stable
+            if YAxis::should_update_range(chart.cached_y_range, rounded) {
+                self.chart.state.cached_y_range = Some(rounded);
+            }
+            // If change is small, keep using the existing cached_y_range
         }
     }
     
@@ -771,8 +1081,8 @@ impl KlineChart {
                 let interval = timeframe.to_milliseconds();
                 let (earliest, latest) = chart.interval_range(&region);
                 
-                // Add padding to ensure we fetch enough data
-                let padding = interval * 2; // Fetch 2 intervals before and after
+                // Add padding to ensure we fetch enough data (fetch more data to cover scrolling)
+                let padding = interval * 10; // Fetch 10 intervals before and after for better coverage
                 Some((
                     earliest.saturating_sub(padding),
                     latest.saturating_add(padding),
@@ -788,34 +1098,12 @@ impl KlineChart {
             return None;
         };
         
-        // Check if visible range has changed significantly
-        let range_changed = match self.last_visible_range {
-            Some((last_start, last_end)) => {
-                // Consider range changed if it moved by more than 10% of the range size
-                let range_size = visible_end.saturating_sub(visible_start);
-                let threshold = range_size / 10;
-                let start_diff = visible_start.max(last_start) - visible_start.min(last_start);
-                let end_diff = visible_end.max(last_end) - visible_end.min(last_end);
-                start_diff > threshold || end_diff > threshold
-            }
-            None => true, // First time, always fetch
-        };
-        
-        if !range_changed {
-            // Range hasn't changed, no need to fetch
-            return None;
-        }
-        
-        // Update last visible range
-        self.last_visible_range = Some((visible_start, visible_end));
-        
         // Check if we have data covering the visible range
         let has_data = match &self.data_source {
             PlotData::TimeBased(timeseries) => {
                 if timeseries.datapoints.is_empty() {
                     false
                 } else {
-                    // Check if we have data covering the visible range
                     let data_start = timeseries.datapoints.values()
                         .next()
                         .map(|dp| dp.kline.time)
@@ -824,13 +1112,7 @@ impl KlineChart {
                         .last()
                         .map(|dp| dp.kline.time)
                         .unwrap_or(0);
-                    
-                    // Convert to milliseconds for comparison
-                    let visible_start_ms = visible_start;
-                    let visible_end_ms = visible_end;
-                    
-                    // Check if data covers the visible range (with some margin)
-                    data_start <= visible_start_ms && data_end >= visible_end_ms
+                    data_start <= visible_start && data_end >= visible_end
                 }
             }
             PlotData::TickBased(_) => {
@@ -839,43 +1121,121 @@ impl KlineChart {
             }
         };
         
-        if has_data {
-            // We have data covering the visible range, no need to fetch
-            return None;
+        // If we don't have data covering the range, fetch it
+        if !has_data {
+            self.last_visible_range = Some((visible_start, visible_end));
+            
+            let ticker_info = chart.ticker_info.clone();
+            let timeframe = match chart.basis {
+                Basis::Time(tf) => tf,
+                Basis::Tick(_) => return None,
+            };
+            
+            let fetch_range = exchange::fetcher::FetchRange::Kline(visible_start, visible_end);
+            
+            match self.request_handler.add_request(fetch_range) {
+                Ok(Some(req_id)) => {
+                    log::info!(
+                        "KlineChart: created fetch request {} for range {} - {}",
+                        req_id,
+                        visible_start,
+                        visible_end
+                    );
+                    let stream = exchange::adapter::StreamKind::Kline {
+                        ticker_info,
+                        timeframe,
+                    };
+                    let fetch_spec = exchange::fetcher::FetchSpec {
+                        req_id,
+                        fetch: fetch_range,
+                        stream: Some(stream),
+                    };
+                    let requests = exchange::fetcher::FetchRequests::from(vec![fetch_spec]);
+                    return Some(Action::RequestFetch(requests));
+                }
+                Ok(None) => {
+                    return None;
+                }
+                Err(e) => {
+                    log::warn!("KlineChart: request handler error: {:?}", e);
+                    // Request error (overlap, etc.)
+                    return None;
+                }
+            }
         }
         
-        // We need to fetch data for the visible range
-        let ticker_info = chart.ticker_info.clone();
-        let timeframe = match chart.basis {
-            Basis::Time(tf) => tf,
-            Basis::Tick(_) => return None,
+        // If we have data, check if visible range has changed significantly
+        let range_changed = match self.last_visible_range {
+            Some((last_start, last_end)) => {
+                // Consider range changed if it moved by more than 20% of the range size
+                let range_size = visible_end.saturating_sub(visible_start);
+                if range_size == 0 {
+                    return None;
+                }
+                let threshold = range_size / 5; // 20% threshold
+                let start_diff = visible_start.max(last_start) - visible_start.min(last_start);
+                let end_diff = visible_end.max(last_end) - visible_end.min(last_end);
+                let changed = start_diff > threshold || end_diff > threshold;
+                
+                if changed {
+                    log::debug!(
+                        "KlineChart: visible range changed significantly. Last: {}-{}, Current: {}-{}",
+                        last_start,
+                        last_end,
+                        visible_start,
+                        visible_end
+                    );
+                }
+                
+                changed
+            }
+            None => {
+                self.last_visible_range = Some((visible_start, visible_end));
+                false
+            }
         };
         
-        // Use RequestHandler to avoid duplicate requests
-        let fetch_range = exchange::fetcher::FetchRange::Kline(visible_start, visible_end);
-        
-        match self.request_handler.add_request(fetch_range) {
-            Ok(Some(req_id)) => {
-                let stream = exchange::adapter::StreamKind::Kline {
-                    ticker_info,
-                    timeframe,
-                };
-                let fetch_spec = exchange::fetcher::FetchSpec {
-                    req_id,
-                    fetch: fetch_range,
-                    stream: Some(stream),
-                };
-                let requests = exchange::fetcher::FetchRequests::from(vec![fetch_spec]);
-                Some(Action::RequestFetch(requests))
+        if range_changed {
+            // Range changed significantly, update and fetch
+            self.last_visible_range = Some((visible_start, visible_end));
+            
+            let ticker_info = chart.ticker_info.clone();
+            let timeframe = match chart.basis {
+                Basis::Time(tf) => tf,
+                Basis::Tick(_) => return None,
+            };
+            
+            let fetch_range = exchange::fetcher::FetchRange::Kline(visible_start, visible_end);
+            
+            match self.request_handler.add_request(fetch_range) {
+                Ok(Some(req_id)) => {
+                    log::info!(
+                        "KlineChart: range changed, created fetch request {} for range {} - {}",
+                        req_id,
+                        visible_start,
+                        visible_end
+                    );
+                    let stream = exchange::adapter::StreamKind::Kline {
+                        ticker_info,
+                        timeframe,
+                    };
+                    let fetch_spec = exchange::fetcher::FetchSpec {
+                        req_id,
+                        fetch: fetch_range,
+                        stream: Some(stream),
+                    };
+                    let requests = exchange::fetcher::FetchRequests::from(vec![fetch_spec]);
+                    Some(Action::RequestFetch(requests))
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    log::warn!("KlineChart: request handler error on range change");
+                    None
+                }
             }
-            Ok(None) => {
-                // Request already in progress or recently completed
-                None
-            }
-            Err(_) => {
-                // Request error (overlap, etc.)
-                None
-            }
+        } else {
+            // Range hasn't changed and we have data, no need to fetch
+            None
         }
     }
 

@@ -132,6 +132,16 @@ impl HistoricalIngesterService {
         // Download ZIP file
         let response = self.client.get(&url).send().await?;
         if !response.status().is_success() {
+            // Handle 404 gracefully - historical data for today may not be available yet
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                log::warn!(
+                    "Historical K-line data not available for {}/{}/{} (404). This is normal for today's data which may not be published yet (2-6 hour delay).",
+                    symbol,
+                    timeframe,
+                    date
+                );
+                return Ok(Vec::new());
+            }
             return Err(DataError::Network(
                 reqwest::Error::from(response.error_for_status().unwrap_err())
             ));
@@ -234,6 +244,18 @@ impl HistoricalIngesterService {
         // Download ZIP file
         let response = self.client.get(&url).send().await?;
         if !response.status().is_success() {
+            // Handle 404 gracefully - historical data for today may not be available yet
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                log::warn!(
+                    "Historical Tick data not available for {}/{} (404). This is normal for today's data which may not be published yet (2-6 hour delay).",
+                    symbol,
+                    date
+                );
+                return Ok(TickDataBuffer {
+                    prices: Vec::new(),
+                    volumes: Vec::new(),
+                });
+            }
             return Err(DataError::Network(
                 reqwest::Error::from(response.error_for_status().unwrap_err())
             ));
@@ -484,8 +506,18 @@ fn record_batch_to_klines(batch: &RecordBatch) -> Result<Vec<KLine>, DataError> 
 
     let mut klines = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
+        let timestamp_value = open_time_us_array.value(i);
+        // TimestampMicrosecondArray::value() returns microseconds as i64
+        // But if the value is suspiciously large (looks like nanoseconds), convert it
+        let open_time_us = if timestamp_value > 1_000_000_000_000_000 {
+            // Value looks like nanoseconds, convert to microseconds
+            (timestamp_value / 1_000) as u64
+        } else {
+            timestamp_value as u64
+        };
+        
         klines.push(KLine {
-            open_time_us: open_time_us_array.value(i) as u64,
+            open_time_us,
             open: open_array.value(i),
             high: high_array.value(i),
             low: low_array.value(i),

@@ -5,8 +5,7 @@
 //! based on the requested time range and the dynamic time boundary (safe_cutoff).
 
 use std::sync::Arc;
-use tokio::task::JoinHandle;
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 
 use crate::{
     data_error::DataError,
@@ -54,19 +53,59 @@ impl UnifiedDataService {
         timeframe: &str, // e.g., "1m", "5m", "1h"
     ) -> Result<Vec<KLine>, DataError> {
         let safe_cutoff = calculate_safe_historical_cutoff();
+        
+        log::info!(
+            "UnifiedDataService: fetch_klines for {} timeframe {}, range: {} - {} us, safe_cutoff: {} us",
+            symbol,
+            timeframe,
+            range.start_us,
+            range.end_us,
+            safe_cutoff
+        );
 
         if range.start_us >= safe_cutoff {
             // Pure real-time data: read from Mmap and aggregate to K-lines
-            tokio::task::spawn_blocking({
+            log::info!("UnifiedDataService: attempting real-time data source (Mmap)");
+            let symbol_clone = symbol.clone();
+            let timeframe_clone = timeframe.to_string();
+            let result = tokio::task::spawn_blocking({
                 let service = self.speed_layer.clone();
-                move || service.fetch_kline_blocking(range)
-            }).await?
+                move || service.fetch_klines_blocking(&symbol_clone, range, &timeframe_clone)
+            }).await??;
+            
+            if result.is_empty() {
+                // Real-time data source returned empty. This could mean:
+                // 1. RealtimeIngesterService hasn't started downloading data yet
+                // 2. The data in MmapStore is from an earlier time period
+                // 3. The requested time range is in the future
+                // 
+                // Since the requested range is >= safe_cutoff, we should NOT fallback to historical data
+                // (historical data doesn't exist for future dates). Instead, we return empty and let
+                // the UI wait for RealtimeIngesterService to download the data.
+                log::warn!(
+                    "UnifiedDataService: real-time data source returned 0 K-lines for range {} - {} us. \
+                    This likely means RealtimeIngesterService hasn't downloaded data for this time range yet. \
+                    The UI should trigger IngestCommand::Subscribe to start data ingestion, or wait for data to be downloaded.",
+                    range.start_us,
+                    range.end_us
+                );
+            } else {
+                log::info!("UnifiedDataService: real-time data returned {} K-lines", result.len());
+            }
+            
+            Ok(result)
         } else if range.end_us < safe_cutoff {
             // Pure historical data: download or read from cache
-            self.batch_layer.fetch_kline(&symbol, range, timeframe).await
+            log::info!("UnifiedDataService: using historical data source (cache/download)");
+            let result = self.batch_layer.fetch_klines(&symbol, range, timeframe).await;
+            match &result {
+                Ok(klines) => log::info!("UnifiedDataService: historical data returned {} K-lines", klines.len()),
+                Err(e) => log::warn!("UnifiedDataService: historical data fetch failed: {:?}", e),
+            }
+            result
         } else {
             // Cross-boundary: fetch separately and merge
-            let historical_future = self.batch_layer.fetch_kline(
+            let historical_future = self.batch_layer.fetch_klines(
                 &symbol,
                 TimeRange {
                     start_us: range.start_us,
@@ -74,15 +113,18 @@ impl UnifiedDataService {
                 },
                 timeframe,
             );
+            let symbol_clone = symbol.clone();
+            let timeframe_clone = timeframe.to_string();
             let realtime_future = tokio::task::spawn_blocking({
                 let service = self.speed_layer.clone();
-                move || service.fetch_kline_blocking(TimeRange {
+                move || service.fetch_klines_blocking(&symbol_clone, TimeRange {
                     start_us: safe_cutoff,
                     end_us: range.end_us,
-                })
+                }, &timeframe_clone)
             });
 
             // Await both futures concurrently
+            log::info!("UnifiedDataService: cross-boundary query, fetching from both sources");
             let (historical_result, realtime_join_result) = tokio::join!(
                 historical_future,
                 realtime_future
@@ -91,11 +133,23 @@ impl UnifiedDataService {
             // Merge historical and real-time data
             let mut historical = historical_result?;
             let realtime = realtime_join_result??;
+            
+            log::info!(
+                "UnifiedDataService: cross-boundary merge - historical: {} K-lines, real-time: {} K-lines",
+                historical.len(),
+                realtime.len()
+            );
 
-            // Combine and sort by timestamp
+            // If real-time data is empty, we still have historical data
+            // If both are empty, we'll return an empty vector (which is correct)
             historical.extend(realtime);
             historical.sort_by_key(|k| k.open_time_us);
             historical.dedup_by_key(|k| k.open_time_us);
+            
+            log::info!(
+                "UnifiedDataService: merged result: {} K-lines",
+                historical.len()
+            );
 
             Ok(historical)
         }
@@ -119,10 +173,12 @@ impl UnifiedDataService {
 
         if range.start_us >= safe_cutoff {
             // Pure real-time data range (>= safe_cutoff)
-            tokio::task::spawn_blocking({
+            let symbol_clone = symbol.clone();
+            let result = tokio::task::spawn_blocking({
                 let service = self.speed_layer.clone();
-                move || service.fetch_ticks_blocking(range)
-            }).await?
+                move || service.fetch_ticks_blocking(&symbol_clone, range)
+            }).await.map_err(|e| DataError::InternalTask(e.to_string()))??;
+            Ok(result)
         } else if range.end_us < safe_cutoff {
             // Pure historical data range (< safe_cutoff)
             self.batch_layer.fetch_ticks(&symbol, range).await
@@ -135,9 +191,10 @@ impl UnifiedDataService {
                     end_us: safe_cutoff,
                 },
             );
+            let symbol_clone = symbol.clone();
             let realtime_future = tokio::task::spawn_blocking({
                 let service = self.speed_layer.clone();
-                move || service.fetch_ticks_blocking(TimeRange {
+                move || service.fetch_ticks_blocking(&symbol_clone, TimeRange {
                     start_us: safe_cutoff,
                     end_us: range.end_us,
                 })
@@ -180,17 +237,47 @@ fn calculate_safe_historical_cutoff() -> u64 {
     let now = Utc::now();
     let today = now.date_naive();
     let midnight = today.and_hms_opt(0, 0, 0).unwrap();
-    let cutoff = midnight.and_utc().timestamp_micros() as u64;
+    let midnight_utc = midnight.and_utc();
+    let cutoff = midnight_utc.timestamp_micros() as u64;
 
-    // If current time is less than 6 hours since UTC midnight, use previous day's boundary
-    let hours_since_midnight = (now.timestamp_micros() as u64 - cutoff) / 3_600_000_000;
+    // Calculate hours since midnight (in microseconds, then convert to hours)
+    // timestamp_micros() returns i64, convert to u64 safely
+    let now_micros = now.timestamp_micros() as u64;
+    let hours_since_midnight = if now_micros >= cutoff {
+        (now_micros - cutoff) / 3_600_000_000
+    } else {
+        // This shouldn't happen (now should always be >= midnight), but handle it gracefully
+        24 // Force use of yesterday's boundary
+    };
+    
+    log::info!(
+        "calculate_safe_historical_cutoff: now={:?} ({} us), today={:?}, midnight={:?} ({} us), hours_since_midnight={}",
+        now,
+        now_micros,
+        today,
+        midnight_utc,
+        cutoff,
+        hours_since_midnight
+    );
+    
     if hours_since_midnight < 6 {
         // Use previous day's boundary (historical data may not be published yet)
         let yesterday = today.pred_opt().unwrap_or(today);
         let yesterday_midnight = yesterday.and_hms_opt(0, 0, 0).unwrap();
-        yesterday_midnight.and_utc().timestamp_micros() as u64
+        let yesterday_cutoff = yesterday_midnight.and_utc().timestamp_micros() as u64;
+        log::info!(
+            "calculate_safe_historical_cutoff: using yesterday's boundary: {} us ({:?})",
+            yesterday_cutoff,
+            yesterday_midnight.and_utc()
+        );
+        yesterday_cutoff
     } else {
         // Use today's boundary (historical data should be published)
+        log::info!(
+            "calculate_safe_historical_cutoff: using today's boundary: {} us ({:?})",
+            cutoff,
+            midnight_utc
+        );
         cutoff
     }
 }

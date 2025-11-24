@@ -95,15 +95,45 @@ impl<D: DataPoint> TimeSeries<D> {
         let (_, first) = it.next()?;
         let mut min_price = first.value_low();
         let mut max_price = first.value_high();
+        
+        // Debug: collect all prices for logging
+        let mut all_lows = vec![min_price.to_f32()];
+        let mut all_highs = vec![max_price.to_f32()];
+        let mut kline_count = 1;
 
-        for (_, dp) in it {
+        for (_ts, dp) in it {
             let low = dp.value_low();
             let high = dp.value_high();
+            all_lows.push(low.to_f32());
+            all_highs.push(high.to_f32());
+            kline_count += 1;
+            
             if low < min_price {
                 min_price = low;
             }
             if high > max_price {
                 max_price = high;
+            }
+        }
+        
+        // Debug logging
+        log::debug!(
+            "min_max_price_in_range: query range {} - {} ms, found {} K-lines",
+            earliest, latest, kline_count
+        );
+        if kline_count > 0 {
+            log::debug!(
+                "min_max_price_in_range: min_low = {:.8}, max_high = {:.8}",
+                min_price.to_f32(),
+                max_price.to_f32()
+            );
+            if kline_count <= 10 {
+                // Only log details if there are few K-lines
+                log::debug!(
+                    "min_max_price_in_range: all lows = {:?}, all highs = {:?}",
+                    all_lows,
+                    all_highs
+                );
             }
         }
 

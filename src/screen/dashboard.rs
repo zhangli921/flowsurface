@@ -95,7 +95,7 @@ impl Default for Dashboard {
                 panic!("Dashboard::default() should not be used. Use Dashboard::new() instead.");
             });
         let unified_service = Arc::new(data::UnifiedDataService::new(
-            Arc::new(data::RealtimeDataService::new(Arc::new(dummy_store))),
+            Arc::new(data::RealtimeDataService::new(data::data_path(Some("market_data")))),
             Arc::new(data::HistoricalDataService::new(Arc::new(
                 data::HistoricalIngesterService::new(None),
             ))),
@@ -1461,11 +1461,27 @@ fn create_kline_fetch_task(
                 },
                 move |result| match result {
                     Ok(klines) => {
+                        log::debug!(
+                            "Dashboard: received {} K-lines from UnifiedDataService",
+                            klines.len()
+                        );
+                        
                         // Convert data::kline::KLine to exchange::Kline
                         let exchange_klines: Vec<Kline> = klines
                             .iter()
                             .map(|k| convert_to_exchange_kline(k, &ticker_info_clone))
                             .collect();
+                        
+                        // Debug: log time range after conversion
+                        if !exchange_klines.is_empty() {
+                            let converted_start = exchange_klines.first().map(|k| k.time).unwrap_or(0);
+                            let converted_end = exchange_klines.last().map(|k| k.time).unwrap_or(0);
+                            log::debug!(
+                                "Dashboard: converted K-lines time range: {} - {} ms",
+                                converted_start,
+                                converted_end
+                            );
+                        }
                         
                         let data = FetchedData::Klines {
                             data: exchange_klines,

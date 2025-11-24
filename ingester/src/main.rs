@@ -135,7 +135,7 @@ async fn fetch_binance_trades(client: &Client, symbol: &str, start_time_ms: u64,
                         }
                         Err(e) => { eprintln!("JSON Error: {}", e); tokio::time::sleep(Duration::from_secs(1)).await; }
                     }
-                } else {
+        } else {
                     if resp.status().as_u16() == 429 { tokio::time::sleep(Duration::from_secs(60)).await; }
                     else { tokio::time::sleep(Duration::from_secs(1)).await; }
                 }
@@ -241,13 +241,13 @@ impl MmapWriter {
 
     fn write_header(&mut self) {
         self.file.seek(SeekFrom::Start(0)).unwrap();
-        let header = FileHeader {
-            magic_number: *MAGIC_NUMBER,
-            data_version: DATA_VERSION,
+    let header = FileHeader {
+        magic_number: *MAGIC_NUMBER,
+        data_version: DATA_VERSION,
             index_count: self.index_entries.len(),
             payload_start_offset: self.payload_start_offset,
-            reserved: [0; 38],
-        };
+        reserved: [0; 38],
+    };
         write_as_bytes(&mut self.file, &header).unwrap();
     }
 
@@ -256,7 +256,7 @@ impl MmapWriter {
         self.file.seek(SeekFrom::Start(header_size as u64)).unwrap();
         for entry in &self.index_entries {
             write_as_bytes(&mut self.file, entry).unwrap();
-        }
+    }
     }
 
     fn append_chunk(&mut self, trades: &[Trade], chunk_start_ns: u64) {
@@ -389,7 +389,7 @@ async fn main() {
                 let chunk_time = live_buffer[0].time;
                 writer.append_chunk(&live_buffer, chunk_time);
                 live_buffer.clear();
-            }
+}
             last_flush_time = SystemTime::now();
         }
     }

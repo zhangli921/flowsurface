@@ -111,6 +111,10 @@ impl Chart for HeatmapChart {
     fn is_empty(&self) -> bool {
         self.trades.datapoints.is_empty()
     }
+    
+    fn kline_data_for_price_range(&self) -> Option<&[data::kline::KLine]> {
+        None // Heatmap doesn't use K-line data for price range
+    }
 
     fn xaxis_cache(&self) -> &Cache {
         &self.xaxis_cache

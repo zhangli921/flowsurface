@@ -20,6 +20,7 @@ use iced::{
     padding, Alignment, Element, Length, Point, Rectangle, Size, Theme, Vector,
     widget::{button, center, column, container, mouse_area, row, rule, text, shader, canvas},
 };
+use chrono::DateTime;
 use iced::widget::canvas::Cache;
 use crate::chart::renderer::UnifiedChartProgram;
 use crate::chart::axes::{XAxis, YAxis};
@@ -63,6 +64,9 @@ pub trait Chart: PlotConstants {
     
     fn xaxis_cache(&self) -> &Cache;
     fn yaxis_cache(&self) -> &Cache;
+    
+    /// Get K-line data for calculating price range from visible K-lines
+    fn kline_data_for_price_range(&self) -> Option<&[data::kline::KLine]>;
 }
 
 pub enum Action {
@@ -195,7 +199,9 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
             let min_cell_height = T::min_cell_height(chart);
             let max_cell_height = T::max_cell_height(chart);
             let state = chart.mut_state();
-            if state.layout.autoscale == Some(Autoscale::FitToVisible) {
+            // Don't disable FitToVisible autoscale - it should continue to work
+            // Only disable CenterLatest when user manually zooms
+            if state.layout.autoscale == Some(Autoscale::CenterLatest) {
                 state.layout.autoscale = None;
             }
             if *delta < 0.0 && state.cell_height > min_cell_height || *delta > 0.0 && state.cell_height < max_cell_height {
@@ -211,9 +217,9 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
                 state.cell_height = new_height;
                 let new_cursor_y = state.price_to_y(cursor_price);
                 state.translation.y -= new_cursor_y - cursor_chart_y;
-                if *is_wheel_scroll {
-                    state.layout.autoscale = None;
-                }
+                // Don't disable autoscale on wheel scroll - let FitToVisible continue to work
+                // Trigger invalidate to re-apply FitToVisible if enabled
+                state.vp_needs_update = true;
             }
         }
         Message::BoundsChanged(bounds) => {
@@ -238,10 +244,13 @@ pub fn update<T: Chart>(chart: &mut T, message: &Message) {
     chart.xaxis_cache().clear();
     chart.yaxis_cache().clear();
     
+    // Don't clear cached_y_range here - let stabilization work
+    // It will be updated in KlineChart::invalidate if needed
+    
     chart.invalidate_all();
 }
 
-pub fn view<'a, T: Chart>(chart: &'a T, indicators: &'a [T::IndicatorKind], _timezone: data::UserTimezone) -> Element<'a, Message> {
+pub fn view<'a, T: Chart>(chart: &'a T, indicators: &'a [T::IndicatorKind], timezone: data::UserTimezone) -> Element<'a, Message> {
     if chart.is_empty() {
         return center(text("Waiting for data...").size(16)).into();
     }
@@ -272,7 +281,14 @@ pub fn view<'a, T: Chart>(chart: &'a T, indicators: &'a [T::IndicatorKind], _tim
     };
     let y_labels_width = state.y_labels_width();
     let content = {
-        let axis_labels_y = Element::from(canvas(YAxis::new(state, chart.yaxis_cache()))
+        // Update Y-axis range cache before rendering (for stabilization)
+        // This needs to be done here because we need mutable access to chart state
+        // but view() only has immutable access. We'll update it in YAxis::draw instead
+        // by using interior mutability or by calculating it here if possible.
+        // For now, we'll let YAxis handle the stabilization logic internally.
+        
+        let kline_data = chart.kline_data_for_price_range();
+        let axis_labels_y = Element::from(canvas(YAxis::new(state, chart.yaxis_cache(), kline_data))
             .width(Length::Fill)
             .height(Length::Fill))
             .map(|_| Message::CrosshairMoved);
@@ -309,7 +325,42 @@ pub fn view<'a, T: Chart>(chart: &'a T, indicators: &'a [T::IndicatorKind], _tim
                 .width(Length::FillPortion(10))
                 .height(Length::Fixed(26.0)),
             buttons.width(y_labels_width).height(Length::Fixed(26.0))
-        ]
+        ],
+        // Debug info display - use Local timezone to match X-axis
+        if let Some((start_time, end_time, lowest, highest)) = state.debug_visible_range {
+            let start_str = DateTime::from_timestamp_millis(start_time as i64)
+                .map(|dt| {
+                    let dt_local = dt.with_timezone(&chrono::Local);
+                    dt_local.format("%Y-%m-%d %H:%M:%S").to_string()
+                })
+                .unwrap_or_else(|| format!("{} ms", start_time));
+            let end_str = DateTime::from_timestamp_millis(end_time as i64)
+                .map(|dt| {
+                    let dt_local = dt.with_timezone(&chrono::Local);
+                    dt_local.format("%Y-%m-%d %H:%M:%S").to_string()
+                })
+                .unwrap_or_else(|| format!("{} ms", end_time));
+            
+            container(
+                text(format!(
+                    "时间范围: {} - {} | 价格范围: {:.8} - {:.8}",
+                    start_str, end_str, lowest, highest
+                ))
+                .size(10)
+                .style(move |_theme: &Theme| {
+                    iced::widget::text::Style {
+                        color: Some(iced::Color::from_rgb(0.7, 0.7, 0.7)),
+                    }
+                })
+            )
+            .padding(padding::left(4).top(2))
+            .width(Length::Fill)
+            .height(Length::Shrink)
+        } else {
+            container(text("").size(10))
+                .width(Length::Fill)
+                .height(Length::Shrink)
+        }
     ]
     .padding(padding::left(1).right(1).bottom(1))
     .into()
@@ -342,6 +393,10 @@ pub struct ChartState {
     pub layout: ViewConfig,
     pub volume_profile: Option<data::compute::vp::VolumeProfile>,
     pub vp_needs_update: bool,
+    // Cached Y-axis range for stabilization (rounded min/max prices)
+    pub cached_y_range: Option<(Price, Price)>,
+    // Debug info for visible range
+    pub debug_visible_range: Option<(u64, u64, f32, f32)>, // (start_time, end_time, lowest_price, highest_price)
 }
 
 impl ChartState {
@@ -364,11 +419,11 @@ impl ChartState {
     pub fn interval_range(&self, region: &Rectangle) -> (u64, u64) {
         match self.basis {
             Basis::Tick(_) => (self.x_to_interval(region.x + region.width), self.x_to_interval(region.x)),
-            Basis::Time(timeframe) => {
-                let interval = timeframe.to_milliseconds();
+            Basis::Time(_) => {
+                // No padding - use exact visible region boundaries
                 (
-                    self.x_to_interval(region.x).saturating_sub(interval / 2),
-                    self.x_to_interval(region.x + region.width).saturating_add(interval / 2),
+                    self.x_to_interval(region.x),
+                    self.x_to_interval(region.x + region.width),
                 )
             }
         }
@@ -482,6 +537,8 @@ impl ViewState {
                 layout,
                 volume_profile: None,
                 vp_needs_update: true,
+                cached_y_range: None,
+                debug_visible_range: None,
             },
             // cache: Caches::default(),
         }
