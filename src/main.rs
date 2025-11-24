@@ -11,14 +11,16 @@ mod window;
 
 use data::{
     self,
-    arbiter_service::ArbiterService,
-    ingester::{IngestionService, IngestCommand, normalize_binance_symbol},
+    unified_data_service::UnifiedDataService,
+    realtime_ingester::{RealtimeIngesterService, IngestCommand, normalize_binance_symbol},
     compute::service::VpComputeService,
     config::theme::default_theme,
-    io_service::{IoService, TimeRange},
+    realtime_data_service::{RealtimeDataService, TimeRange},
     kline::KLine,
     layout::WindowSpec,
-    sidebar, ArbiterError, ExternalAdapter,
+    sidebar, DataError,
+    historical_data_service::HistoricalDataService,
+    historical_ingester::HistoricalIngesterService,
 };
 use layout::{configuration, Layout};
 use modal::{audio, dashboard_modal, main_dialog_modal, LayoutManager, ThemeEditor};
@@ -71,7 +73,7 @@ fn main() {
 struct Flowsurface {
     main_window: window::Window,
     sidebar: dashboard::Sidebar,
-    arbiter: Arc<ArbiterService>,
+    unified_data_service: Arc<UnifiedDataService>,
     vp_service: Option<Arc<VpComputeService>>,
     layout_manager: LayoutManager,
     theme_editor: ThemeEditor,
@@ -90,8 +92,8 @@ enum Message {
     Sidebar(dashboard::sidebar::Message),
     MarketWsEvent(exchange::Event),
     Dashboard(Option<uuid::Uuid>, dashboard::Message),
-    FetchKLines(String, TimeRange),
-    KLineDataFetched(Result<Vec<KLine>, Arc<ArbiterError>>),
+    FetchKLines(String, TimeRange, String), // symbol, time range, timeframe
+    KLineDataFetched(Result<Vec<KLine>, Arc<DataError>>),
     ComputeVp(String, TimeRange), // symbol, time range
     VpComputed(String, Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>), // (symbol, result)
     VpServiceInitialized(Result<Arc<VpComputeService>, String>),
@@ -119,9 +121,9 @@ impl Flowsurface {
         let data_dir = data::data_path(Some("market_data"));
         
         // Pre-create the default Mmap file synchronously before starting the async service
-        IngestionService::ensure_mmap_file("BTCUSDT", &data_dir);
-        
-        let ingestion_service = IngestionService::new(ingest_rx, data_dir);
+        RealtimeIngesterService::ensure_mmap_file("BTCUSDT", &data_dir);
+
+        let ingestion_service = RealtimeIngesterService::new(ingest_rx, data_dir);
         tokio::spawn(ingestion_service.run());
         // -------------------------------
 
@@ -136,9 +138,9 @@ impl Flowsurface {
         let store = MmapStore::open(&mmap_path)
             .unwrap_or_else(|e| panic!("Failed to open MmapStore at {:?}: {}", mmap_path, e));
 
-        let arbiter = Arc::new(ArbiterService::new(
-            IoService::new(Arc::new(store)),
-            ExternalAdapter::new(),
+        let unified_data_service = Arc::new(UnifiedDataService::new(
+            Arc::new(RealtimeDataService::new(Arc::new(store))),
+            Arc::new(HistoricalDataService::new(Arc::new(HistoricalIngesterService::new(None)))),
         ));
         // --- End of Arbiter Service Initialization ---
 
@@ -169,7 +171,7 @@ impl Flowsurface {
 
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
-            arbiter,
+            unified_data_service,
             vp_service: None, // Will be initialized asynchronously
             layout_manager: saved_state.layout_manager,
             theme_editor: ThemeEditor::new(saved_state.custom_theme),
@@ -240,12 +242,12 @@ impl Flowsurface {
                     }
                 }
             }
-            Message::FetchKLines(symbol, range) => {
-                let arbiter = self.arbiter.clone();
+            Message::FetchKLines(symbol, range, timeframe) => {
+                let unified_service = self.unified_data_service.clone();
                 return Task::perform(
                     async move {
-                        arbiter
-                            .arbitrate_kline_data(symbol, range)
+                        unified_service
+                            .fetch_klines(symbol, range, &timeframe)
                             .await
                             .map_err(Arc::new)
                     },
@@ -281,14 +283,12 @@ impl Flowsurface {
             Message::ComputeVp(symbol, range) => {
                 if let Some(service) = &self.vp_service {
                     let service = service.clone();
+                    let unified_service = self.unified_data_service.clone();
                     let symbol_clone = symbol.clone();
-                    let data_dir = data::data_path(Some("market_data"));
                     
-                    // Normalize symbol to match filename (e.g., "BTC" -> "BTCUSDT")
+                    // Trigger ingestion if needed (for real-time data)
                     let normalized_symbol = normalize_binance_symbol(&symbol_clone);
-                    log::debug!("VP computation: normalizing symbol '{}' -> '{}'", symbol_clone, normalized_symbol);
-                    
-                    // Check if file exists, if not, trigger Ingester to create it
+                    let data_dir = data::data_path(Some("market_data"));
                     let mmap_path = {
                         let mut path = data_dir.clone();
                         std::fs::create_dir_all(&path).ok();
@@ -296,10 +296,10 @@ impl Flowsurface {
                         path
                     };
                     
-                    // Check if file exists and has valid size, if not, trigger Ingester to create it
+                    // Check if real-time data file exists, if not, trigger Ingester
                     let file_ready = mmap_path.exists() && {
                         if let Ok(metadata) = std::fs::metadata(&mmap_path) {
-                            metadata.len() > 1024 // At least 1KB to be considered valid
+                            metadata.len() > 1024
                         } else {
                             false
                         }
@@ -307,85 +307,17 @@ impl Flowsurface {
                     
                     if !file_ready {
                         log::info!("Mmap file for {} (normalized: {}) does not exist or is empty, triggering Ingester to create it", symbol_clone, normalized_symbol);
-                        // Send the original symbol to ingester, it will normalize it internally
                         let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone()));
                     }
                     
                     return Task::future(async move {
-                        // Clone symbol for use inside the closure
-                        let symbol_for_closure = symbol_clone.clone();
-                        let mmap_path_for_closure = mmap_path.clone();
-                        
-                        // If file is not ready, wait with retries for ingester to create and write data
-                        if !file_ready {
-                            log::debug!("Waiting for Mmap file to be created and populated...");
-                            const MAX_RETRIES: u32 = 10;
-                            const RETRY_INTERVAL_MS: u64 = 500;
-                            
-                            for attempt in 1..=MAX_RETRIES {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(RETRY_INTERVAL_MS)).await;
-                                
-                                let file_size = std::fs::metadata(&mmap_path_for_closure)
-                                    .ok()
-                                    .map(|m| m.len())
-                                    .unwrap_or(0);
-                                
-                                if file_size >= 1024 {
-                                    log::debug!("Mmap file for {} is ready after {} attempts ({} bytes)", 
-                                        symbol_for_closure, attempt, file_size);
-                                    break;
-                                }
-                                
-                                if attempt == MAX_RETRIES {
-                                    log::warn!("Mmap file for {} still not ready after {} attempts ({} bytes). Proceeding anyway.", 
-                                        symbol_for_closure, MAX_RETRIES, file_size);
-                                }
-                            }
-                        }
-                        
-                        // Fetch ticks from the symbol-specific Mmap file in a blocking task
-                        let ticks = match tokio::task::spawn_blocking(move || {
-                            // Final check file size before opening
-                            let file_size = std::fs::metadata(&mmap_path_for_closure)
-                                .ok()
-                                .map(|m| m.len())
-                                .unwrap_or(0);
-                            
-                            if file_size < 1024 {
-                                log::debug!("Mmap file for {} is too small ({} bytes), returning empty result", symbol_for_closure, file_size);
-                                return Ok(data::compute::vp::TickDataBuffer {
-                                    prices: Vec::new(),
-                                    volumes: Vec::new(),
-                                });
-                            }
-                            
-                            // Open the MmapStore for this symbol
-                            let store = match MmapStore::open(&mmap_path_for_closure) {
-                                Ok(store) => Arc::new(store),
-                                Err(e) => {
-                                    log::warn!("Failed to open MmapStore for {} at {:?}: {}. File may not exist yet or is being created.", symbol_for_closure, mmap_path_for_closure, e);
-                                    // Return empty ticks if file doesn't exist yet or is invalid
-                                    return Ok(data::compute::vp::TickDataBuffer {
-                                        prices: Vec::new(),
-                                        volumes: Vec::new(),
-                                    });
-                                }
-                            };
-                            
-                            // Create a temporary IoService for this symbol
-                            let io_service = data::IoService::new(store);
-                            io_service.fetch_ticks_blocking(range)
-                        }).await {
-                            Ok(result) => match result {
-                                Ok(ticks) => ticks,
-                                Err(e) => {
-                                    let compute_err: data::compute::vp::ComputeError = e.into();
-                                    return Message::VpComputed(symbol_clone.clone(), Err(compute_err));
-                                },
+                        // Use UnifiedDataService to fetch ticks (automatically handles real-time and historical)
+                        let ticks = match unified_service.fetch_ticks(symbol_clone.clone(), range).await {
+                            Ok(ticks) => ticks,
+                            Err(e) => {
+                                let compute_err: data::compute::vp::ComputeError = e.into();
+                                return Message::VpComputed(symbol_clone.clone(), Err(compute_err));
                             },
-                            Err(e) => return Message::VpComputed(symbol_clone.clone(), Err(
-                                data::compute::vp::ComputeError::Other(format!("Spawn blocking failed: {}", e))
-                            )),
                         };
                         
                         // Calculate compute parameters

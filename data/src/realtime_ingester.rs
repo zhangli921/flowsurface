@@ -75,7 +75,7 @@ struct AggTrade {
     is_buyer_maker: bool,
 }
 
-// Command enum for controlling the Ingestion Service
+// Command enum for controlling the Realtime Ingestion Service
 #[derive(Debug, Clone)]
 pub enum IngestCommand {
     Subscribe(String), // Symbol
@@ -83,14 +83,14 @@ pub enum IngestCommand {
     Shutdown,
 }
 
-pub struct IngestionService {
+pub struct RealtimeIngesterService {
     command_rx: mpsc::Receiver<IngestCommand>,
     active_symbol: Option<String>,
     abort_handle: Option<tokio::task::JoinHandle<()>>,
     data_dir: PathBuf,
 }
 
-impl IngestionService {
+impl RealtimeIngesterService {
     pub fn new(command_rx: mpsc::Receiver<IngestCommand>, data_dir: PathBuf) -> Self {
         Self {
             command_rx,
@@ -115,7 +115,7 @@ impl IngestionService {
     }
 
     pub async fn run(mut self) {
-        info!("IngestionService started.");
+        info!("RealtimeIngesterService started.");
         
         // Auto-subscribe to BTCUSDT on startup (async download will happen in background)
         info!("Auto-subscribing to BTCUSDT on startup...");
@@ -134,7 +134,7 @@ impl IngestionService {
                      }
                 }
                 IngestCommand::Shutdown => {
-                    info!("IngestionService shutting down.");
+                    info!("RealtimeIngesterService shutting down.");
                     self.stop_current_task();
                     break;
                 }

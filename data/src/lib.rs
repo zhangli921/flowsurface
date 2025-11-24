@@ -1,19 +1,20 @@
 pub mod aggr;
-pub mod arbiter_error;
-pub mod arbiter_service;
 pub mod audio;
+pub mod data_error;
 pub mod chart;
 pub mod compute;
 pub mod config;
-pub mod external_adapter;
-pub mod ingester; // Added
-pub mod io_service;
+pub mod historical_data_service;
+pub mod historical_ingester;
 pub mod kline;
 pub mod layout;
 pub mod loader;
 pub mod log;
 pub mod panel;
+pub mod realtime_data_service;
+pub mod realtime_ingester;
 pub mod tickers_table;
+pub mod unified_data_service;
 pub mod util;
 
 use std::fs::File;
@@ -28,12 +29,14 @@ pub use config::theme::Theme;
 pub use config::timezone::UserTimezone;
 
 use ::log::{error, info, warn};
-pub use arbiter_error::ArbiterError;
-pub use arbiter_service::ArbiterService;
-pub use external_adapter::ExternalAdapter;
-pub use io_service::{IoService, TimeRange};
+pub use data_error::DataError;
+pub use historical_data_service::HistoricalDataService;
+pub use historical_ingester::HistoricalIngesterService;
 pub use kline::KLine;
 pub use layout::{Dashboard, Layout, Pane};
+pub use realtime_data_service::{RealtimeDataService, TimeRange};
+pub use realtime_ingester::{RealtimeIngesterService, IngestCommand};
+pub use unified_data_service::UnifiedDataService;
 
 pub const SAVED_STATE_PATH: &str = "saved-state.json";
 

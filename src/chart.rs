@@ -68,7 +68,7 @@ pub trait Chart: PlotConstants {
 pub enum Action {
     ErrorOccurred(data::InternalError),
     RequestFetch(exchange::fetcher::FetchRequests),
-    RequestVpComputation(String, data::io_service::TimeRange),
+    RequestVpComputation(String, data::TimeRange),
 }
 
 pub fn update<T: Chart>(chart: &mut T, message: &Message) {
@@ -374,12 +374,12 @@ impl ChartState {
         }
     }
 
-    pub fn visible_time_range_us(&self) -> Option<data::io_service::TimeRange> {
+    pub fn visible_time_range_us(&self) -> Option<data::TimeRange> {
         match self.basis {
             Basis::Time(_) => {
                 let region = self.visible_region(self.bounds.size());
                 let (start, end) = self.interval_range(&region);
-                Some(data::io_service::TimeRange {
+                Some(data::TimeRange {
                     start_us: start.checked_mul(1_000).unwrap_or(0), // Convert ms to microseconds
                     end_us: end.checked_mul(1_000).unwrap_or(0),
                 })

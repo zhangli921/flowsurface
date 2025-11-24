@@ -52,7 +52,7 @@ pub enum Message {
         data: FetchedData,
     },
     ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
-    ComputeVp(String, data::io_service::TimeRange),
+    ComputeVp(String, data::TimeRange),
 }
 
 pub struct Dashboard {

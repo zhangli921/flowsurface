@@ -1,8 +1,15 @@
-//! Defines the unified error type for the data arbitration service.
+//! Defines the unified error type for the data service layer.
+//!
+//! This error type is used across all data services including:
+//! - UnifiedDataService
+//! - RealtimeDataService
+//! - HistoricalDataService
+//! - HistoricalIngesterService
+//! - VP computation services
 
 use thiserror::Error;
 
-/// A comprehensive error enum for the K-line data arbitration and I/O services.
+/// A comprehensive error enum for the data service layer.
 ///
 /// This type consolidates errors from various sources, including:
 /// - Mmap storage access (`storage::StoreError`).
@@ -10,8 +17,10 @@ use thiserror::Error;
 /// - Network requests (`reqwest::Error`).
 /// - Data serialization/deserialization (e.g., Parquet, JSON).
 /// - Standard I/O operations.
+/// - ZIP archive operations.
+/// - CSV parsing.
 #[derive(Debug, Error)]
-pub enum ArbiterError {
+pub enum DataError {
     #[error("Mmap storage error: {0}")]
     Store(#[from] storage::StoreError),
 
@@ -35,13 +44,20 @@ pub enum ArbiterError {
 
     #[error("Invalid input or configuration: {0}")]
     InvalidInput(&'static str),
+
+    #[error("ZIP archive error: {0}")]
+    Zip(#[from] zip::result::ZipError),
+
+    #[error("CSV parsing error: {0}")]
+    Csv(#[from] csv::Error),
 }
 
 // Manual implementation of From<tokio::task::JoinError> to convert it into a concrete string.
 // This is necessary because JoinError is not `Send` or `Sync` in all cases if the panic
 // payload is not, so we convert it to a string immediately.
-impl From<tokio::task::JoinError> for ArbiterError {
+impl From<tokio::task::JoinError> for DataError {
     fn from(err: tokio::task::JoinError) -> Self {
-        ArbiterError::InternalTask(err.to_string())
+        DataError::InternalTask(err.to_string())
     }
 }
+

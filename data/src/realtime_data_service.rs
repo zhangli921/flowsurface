@@ -5,7 +5,7 @@ use std::sync::Arc;
 use storage::MmapStore;
 use arrow::array; // Required for downcasting Arrow arrays
 
-use crate::{kline::KLine, arbiter_error::ArbiterError, compute::vp::TickDataBuffer};
+use crate::{kline::KLine, data_error::DataError, compute::vp::TickDataBuffer};
 
 /// Defines a time range with microsecond precision.
 /// Microsecond precision is sufficient for financial data and allows representing
@@ -40,18 +40,17 @@ fn normalize_key_hash_to_us(key_hash: u64) -> u64 {
     }
 }
 
-/// A service dedicated to handling blocking I/O tasks.
+/// A service dedicated to reading real-time data from memory-mapped files.
 ///
 /// It holds a reference to the `MmapStore` and provides methods to fetch
 /// and process data from it. These methods are designed to be run within
-
 /// `tokio::task::spawn_blocking` to avoid blocking the main async runtime.
 #[derive(Clone)]
-pub struct IoService {
+pub struct RealtimeDataService {
     store: Arc<MmapStore>,
 }
 
-impl IoService {
+impl RealtimeDataService {
     /// Creates a new `IoService`.
     ///
     /// # Arguments
@@ -70,7 +69,7 @@ impl IoService {
     /// # Arguments
     ///
     /// * `range` - The time range for which to fetch and aggregate data.
-    pub fn fetch_live_kline_blocking(&self, range: TimeRange) -> Result<Vec<KLine>, ArbiterError> {
+    pub fn fetch_kline_blocking(&self, range: TimeRange) -> Result<Vec<KLine>, DataError> {
         let index = self.store.index();
 
         // Find the first data block that *could* contain data for our time range.
@@ -104,22 +103,22 @@ impl IoService {
                     .column(0)
                     .as_any()
                     .downcast_ref::<array::TimestampMicrosecondArray>()
-                    .ok_or(ArbiterError::InvalidInput("Timestamp column has wrong type"))?;
+                    .ok_or(DataError::InvalidInput("Timestamp column has wrong type"))?;
                 let prices = batch
                     .column(1)
                     .as_any()
                     .downcast_ref::<array::Float64Array>()
-                    .ok_or(ArbiterError::InvalidInput("Price column has wrong type"))?;
+                    .ok_or(DataError::InvalidInput("Price column has wrong type"))?;
                 let volumes = batch
                     .column(2)
                     .as_any()
                     .downcast_ref::<array::Float64Array>()
-                    .ok_or(ArbiterError::InvalidInput("Volume column has wrong type"))?;
+                    .ok_or(DataError::InvalidInput("Volume column has wrong type"))?;
                 let is_bid_aggressors = batch
                     .column(3)
                     .as_any()
                     .downcast_ref::<array::BooleanArray>()
-                    .ok_or(ArbiterError::InvalidInput("IsBidAggressor column has wrong type"))?;
+                    .ok_or(DataError::InvalidInput("IsBidAggressor column has wrong type"))?;
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i) as u64;
@@ -204,7 +203,7 @@ impl IoService {
     /// # Arguments
     ///
     /// * `range` - The time range for which to fetch tick data.
-    pub fn fetch_ticks_blocking(&self, range: TimeRange) -> Result<TickDataBuffer, ArbiterError> {
+    pub fn fetch_ticks_blocking(&self, range: TimeRange) -> Result<TickDataBuffer, DataError> {
         let index = self.store.index();
         
         log::debug!("fetch_ticks_blocking: index has {} entries, querying range {} - {} us", 
@@ -300,17 +299,17 @@ impl IoService {
                     .column(0)
                     .as_any()
                     .downcast_ref::<array::TimestampMicrosecondArray>()
-                    .ok_or(ArbiterError::InvalidInput("Timestamp column has wrong type"))?;
+                    .ok_or(DataError::InvalidInput("Timestamp column has wrong type"))?;
                 let price_array = batch
                     .column(1)
                     .as_any()
                     .downcast_ref::<array::Float64Array>()
-                    .ok_or(ArbiterError::InvalidInput("Price column has wrong type"))?;
+                    .ok_or(DataError::InvalidInput("Price column has wrong type"))?;
                 let volume_array = batch
                     .column(2)
                     .as_any()
                     .downcast_ref::<array::Float64Array>()
-                    .ok_or(ArbiterError::InvalidInput("Volume column has wrong type"))?;
+                    .ok_or(DataError::InvalidInput("Volume column has wrong type"))?;
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i) as u64;

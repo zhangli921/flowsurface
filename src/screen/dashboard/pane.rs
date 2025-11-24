@@ -44,7 +44,7 @@ pub enum Effect {
     RequestFetch(FetchRequests),
     SwitchTickersInGroup(TickerInfo),
     FocusWidget(iced::widget::Id),
-    RequestVpComputation(String, data::io_service::TimeRange),
+    RequestVpComputation(String, data::TimeRange),
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]

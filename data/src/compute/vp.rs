@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use bytemuck::{self, Pod, Zeroable};
-use crate::arbiter_error::ArbiterError;
+use crate::data_error::DataError;
 use wgpu::{self, util::DeviceExt, BindingType, BufferBindingType, MapMode};
 use tokio::sync::oneshot;
 use thiserror::Error;
@@ -42,15 +42,15 @@ pub enum ComputeError {
     MapError,
     #[error("Channel closed unexpectedly")]
     ChannelClosed,
-    #[error("Arbiter error: {0}")]
-    ArbiterError(String),
+    #[error("Data error: {0}")]
+    DataError(String),
     #[error("Compute error: {0}")]
     Other(String),
 }
 
-impl From<ArbiterError> for ComputeError {
-    fn from(err: ArbiterError) -> Self {
-        ComputeError::ArbiterError(err.to_string())
+impl From<DataError> for ComputeError {
+    fn from(err: DataError) -> Self {
+        ComputeError::DataError(err.to_string())
     }
 }
 
