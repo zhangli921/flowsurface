@@ -16,6 +16,7 @@ use crate::{
 use data::{
     UserTimezone,
     layout::{WindowSpec, pane::ContentKind},
+    UnifiedDataService,
 };
 use exchange::{
     Kline, PushFrequency, StreamPairKind, TickMultiplier, TickerInfo, Timeframe, Trade,
@@ -35,8 +36,10 @@ use iced::{
         pane_grid::{self, Configuration},
     },
 };
+use std::sync::Arc;
 use iced_futures::futures::TryFutureExt;
 use std::{collections::HashMap, path::PathBuf, time::Instant, vec};
+use chrono::Utc;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -61,17 +64,43 @@ pub struct Dashboard {
     pub popout: HashMap<window::Id, (pane_grid::State<pane::State>, WindowSpec)>,
     pub streams: UniqueStreams,
     layout_id: uuid::Uuid,
+    unified_data_service: Arc<data::UnifiedDataService>,
 }
 
-impl Default for Dashboard {
-    fn default() -> Self {
+impl Dashboard {
+    pub fn new(unified_data_service: Arc<data::UnifiedDataService>) -> Self {
         Self {
             panes: pane_grid::State::with_configuration(Self::default_pane_config()),
             focus: None,
             streams: UniqueStreams::default(),
             popout: HashMap::new(),
             layout_id: uuid::Uuid::new_v4(),
+            unified_data_service,
         }
+    }
+}
+
+impl Default for Dashboard {
+    fn default() -> Self {
+        // Note: Default implementation creates a dummy UnifiedDataService.
+        // In practice, Dashboard should be created with Dashboard::new().
+        // For Default, we'll create a minimal dummy service that won't be used.
+        // The actual service should be set via set_unified_data_service() after creation.
+        let temp_path = std::env::temp_dir().join("flowsurface_dummy.mmap");
+        let dummy_store = storage::MmapStore::open(&temp_path)
+            .unwrap_or_else(|_| {
+                // If file doesn't exist, we can't create it here.
+                // This is a fallback that will fail if actually used.
+                // In practice, Dashboard::default() should not be used.
+                panic!("Dashboard::default() should not be used. Use Dashboard::new() instead.");
+            });
+        let unified_service = Arc::new(data::UnifiedDataService::new(
+            Arc::new(data::RealtimeDataService::new(Arc::new(dummy_store))),
+            Arc::new(data::HistoricalDataService::new(Arc::new(
+                data::HistoricalIngesterService::new(None),
+            ))),
+        ));
+        Self::new(unified_service)
     }
 }
 
@@ -119,6 +148,7 @@ impl Dashboard {
         panes: Configuration<pane::State>,
         popout_windows: Vec<(Configuration<pane::State>, WindowSpec)>,
         layout_id: uuid::Uuid,
+        unified_data_service: Arc<UnifiedDataService>,
     ) -> Self {
         let panes = pane_grid::State::with_configuration(panes);
 
@@ -135,9 +165,16 @@ impl Dashboard {
             panes,
             focus: None,
             streams: UniqueStreams::default(),
+            unified_data_service,
             popout,
             layout_id,
         }
+    }
+    
+    /// Updates the unified_data_service for this dashboard.
+    /// This is useful when loading saved layouts that don't have the service.
+    pub fn set_unified_data_service(&mut self, unified_data_service: Arc<UnifiedDataService>) {
+        self.unified_data_service = unified_data_service;
     }
 
     pub fn load_layout(&mut self, main_window: window::Id) -> Task<Message> {
@@ -340,7 +377,17 @@ impl Dashboard {
                             for stream in &streams {
                                 if let StreamKind::Kline { .. } = stream {
                                     return (
-                                        kline_fetch_task(*layout_id, pane_id, *stream, None, None),
+                                        {
+                                            let unified_service = self.unified_data_service.clone();
+                                            create_kline_fetch_task(
+                                                *layout_id,
+                                                pane_id,
+                                                *stream,
+                                                None,
+                                                None,
+                                                unified_service,
+                                            )
+                                        },
                                         None,
                                     );
                                 }
@@ -355,6 +402,7 @@ impl Dashboard {
                     return (self.merge_pane(main_window), None);
                 }
                 pane::Message::PaneEvent(pane, local) => {
+                    let unified_service = self.unified_data_service.clone();
                     if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         let Some(effect) = state.update(local) else {
                             return (Task::none(), None);
@@ -366,6 +414,7 @@ impl Dashboard {
                                 state,
                                 *layout_id,
                                 reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
+                                unified_service,
                             )
                             .chain(self.refresh_streams(main_window.id)),
                             pane::Effect::SwitchTickersInGroup(ticker_info) => {
@@ -698,7 +747,17 @@ impl Dashboard {
 
             for stream in &streams {
                 if let StreamKind::Kline { .. } = stream {
-                    return kline_fetch_task(self.layout_id, pane_id, *stream, None, None);
+                    {
+                        let unified_service = self.unified_data_service.clone();
+                        return create_kline_fetch_task(
+                            self.layout_id,
+                            pane_id,
+                            *stream,
+                            None,
+                            None,
+                            unified_service,
+                        );
+                    }
                 }
             }
         }
@@ -734,7 +793,17 @@ impl Dashboard {
 
             for stream in &streams {
                 if let StreamKind::Kline { .. } = stream {
-                    return kline_fetch_task(self.layout_id, pane_id, *stream, None, None);
+                    {
+                        let unified_service = self.unified_data_service.clone();
+                        return create_kline_fetch_task(
+                            self.layout_id,
+                            pane_id,
+                            *stream,
+                            None,
+                            None,
+                            unified_service,
+                        );
+                    }
                 }
             }
             return Task::none();
@@ -857,7 +926,7 @@ impl Dashboard {
                     } = stream_type
                     {
                         if let Some(pane::Effect::RequestVpComputation(symbol, range)) = 
-                            pane_state.insert_hist_klines(req_id, timeframe, ticker_info, &data) 
+                            pane_state.insert_klines(req_id, timeframe, ticker_info, &data) 
                         {
                             return Task::future(async move { Message::ComputeVp(symbol, range) });
                         }
@@ -1017,6 +1086,7 @@ impl Dashboard {
     pub fn tick(&mut self, now: Instant, main_window: window::Id) -> Task<Message> {
         let mut tasks = vec![];
         let layout_id = self.layout_id;
+        let unified_service = self.unified_data_service.clone();
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(_window_id, _pane, state)| match state.tick(now) {
@@ -1030,6 +1100,7 @@ impl Dashboard {
                             state,
                             layout_id,
                             reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
+                            unified_service.clone(),
                         ));
                     }
                     chart::Action::RequestVpComputation(symbol, time_range) => {
@@ -1165,6 +1236,7 @@ fn request_fetch(
     req_id: uuid::Uuid,
     fetch: FetchRange,
     stream: Option<StreamKind>,
+    unified_service: Arc<UnifiedDataService>,
 ) -> Task<Message> {
     let pane_id = state.unique_id();
 
@@ -1185,12 +1257,13 @@ fn request_fetch(
             };
 
             if let Some((stream, pane_uid)) = kline_stream {
-                return kline_fetch_task(
+                return create_kline_fetch_task(
                     layout_id,
                     pane_uid,
                     stream,
                     Some(req_id),
                     Some((from, to)),
+                    unified_service,
                 );
             }
         }
@@ -1274,10 +1347,11 @@ fn request_fetch_many(
     state: &mut pane::State,
     layout_id: uuid::Uuid,
     reqs: impl IntoIterator<Item = (uuid::Uuid, FetchRange, Option<StreamKind>)>,
+    unified_service: Arc<UnifiedDataService>,
 ) -> Task<Message> {
     let tasks = reqs
         .into_iter()
-        .map(|(req_id, fetch, stream)| request_fetch(state, layout_id, req_id, fetch, stream))
+        .map(|(req_id, fetch, stream)| request_fetch(state, layout_id, req_id, fetch, stream, unified_service.clone()))
         .collect::<Vec<_>>();
     Task::batch(tasks)
 }
@@ -1320,12 +1394,34 @@ fn oi_fetch_task(
     update_status.chain(fetch_task)
 }
 
-fn kline_fetch_task(
+/// Converts data::kline::KLine to exchange::Kline format.
+fn convert_to_exchange_kline(k: &data::kline::KLine, ticker_info: &TickerInfo) -> Kline {
+    use exchange::util::Price;
+    
+    // Get min_tick_size from ticker_info for price rounding
+    let min_tick_size = ticker_info.min_ticksize;
+    
+    Kline {
+        time: k.open_time_us / 1_000,  // Convert microseconds to milliseconds
+        open: Price::from_f32(k.open as f32).round_to_min_tick(min_tick_size),
+        high: Price::from_f32(k.high as f32).round_to_min_tick(min_tick_size),
+        low: Price::from_f32(k.low as f32).round_to_min_tick(min_tick_size),
+        close: Price::from_f32(k.close as f32).round_to_min_tick(min_tick_size),
+        volume: (
+            k.volume as f32,  // Buy volume (simplified: use total volume)
+            0.0,              // Sell volume (not available in data::kline::KLine)
+        ),
+    }
+}
+
+/// Creates a task to fetch K-line data using UnifiedDataService.
+fn create_kline_fetch_task(
     layout_id: uuid::Uuid,
     pane_id: uuid::Uuid,
     stream: StreamKind,
     req_id: Option<uuid::Uuid>,
     range: Option<(u64, u64)>,
+    unified_service: Arc<UnifiedDataService>,
 ) -> Task<Message> {
     let update_status = Task::done(Message::ChangePaneStatus(
         pane_id,
@@ -1336,27 +1432,58 @@ fn kline_fetch_task(
         StreamKind::Kline {
             ticker_info,
             timeframe,
-        } => Task::perform(
-            adapter::fetch_klines(ticker_info, timeframe, range)
-                .map_err(|err| err.to_user_message()),
-            move |result| match result {
-                Ok(klines) => {
-                    let data = FetchedData::Klines {
-                        data: klines,
-                        req_id,
-                    };
-                    Message::DistributeFetchedData {
-                        layout_id,
-                        pane_id,
-                        data,
-                        stream,
+        } => {
+            let symbol = ticker_info.ticker.to_string();
+            let timeframe_str = timeframe.to_string();
+            let ticker_info_clone = ticker_info.clone();
+            
+            // Build TimeRange from optional range parameter
+            let time_range = range.map(|(from_ms, to_ms)| {
+                data::TimeRange {
+                    start_us: from_ms * 1_000,  // Convert milliseconds to microseconds
+                    end_us: to_ms * 1_000,
+                }
+            }).unwrap_or_else(|| {
+                // Default range: last 24 hours if not specified
+                let now = Utc::now().timestamp_micros() as u64;
+                data::TimeRange {
+                    start_us: now.saturating_sub(24 * 3600 * 1_000_000),  // 24 hours ago
+                    end_us: now,
+                }
+            });
+            
+            Task::perform(
+                async move {
+                    unified_service
+                        .fetch_klines(symbol, time_range, &timeframe_str)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                move |result| match result {
+                    Ok(klines) => {
+                        // Convert data::kline::KLine to exchange::Kline
+                        let exchange_klines: Vec<Kline> = klines
+                            .iter()
+                            .map(|k| convert_to_exchange_kline(k, &ticker_info_clone))
+                            .collect();
+                        
+                        let data = FetchedData::Klines {
+                            data: exchange_klines,
+                            req_id,
+                        };
+                        Message::DistributeFetchedData {
+                            layout_id,
+                            pane_id,
+                            data,
+                            stream,
+                        }
                     }
-                }
-                Err(err) => {
-                    Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(err.to_string()))
-                }
-            },
-        ),
+                    Err(err) => {
+                        Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(err))
+                    }
+                },
+            )
+        }
         _ => Task::none(),
     };
 

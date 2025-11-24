@@ -210,6 +210,7 @@ pub struct KlineChart {
     xaxis_cache: Cache,
     yaxis_cache: Cache,
     render_cache_kline: Arc<Vec<data::kline::KLine>>,
+    last_visible_range: Option<(u64, u64)>, // Track last visible time range for change detection
 }
 
 impl KlineChart {
@@ -301,6 +302,7 @@ impl KlineChart {
                     xaxis_cache: Cache::default(),
                     yaxis_cache: Cache::default(),
                     render_cache_kline,
+                    last_visible_range: None,
                 }
             }
             Basis::Tick(interval) => {
@@ -369,6 +371,7 @@ impl KlineChart {
                     xaxis_cache: Cache::default(),
                     yaxis_cache: Cache::default(),
                     render_cache_kline,
+                    last_visible_range: None,
                 }
             }
         }
@@ -624,7 +627,7 @@ impl KlineChart {
         }
     }
 
-    pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+    pub fn insert_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 timeseries.insert_klines(klines_raw);
@@ -746,9 +749,133 @@ impl KlineChart {
 
         if let Some(t) = now {
             self.last_tick = t;
-            self.missing_data_task()
+            // Check for visible range changes and data coverage
+            self.check_data_update_needed()
         } else {
             None
+        }
+    }
+    
+    /// Check if data update is needed based on visible range changes
+    fn check_data_update_needed(&mut self) -> Option<Action> {
+        let chart = &self.chart.state;
+        
+        // Get current visible time range
+        let current_range = match chart.basis {
+            Basis::Time(timeframe) => {
+                let region = chart.visible_region(chart.bounds.size());
+                if region.width == 0.0 {
+                    return None;
+                }
+                
+                let interval = timeframe.to_milliseconds();
+                let (earliest, latest) = chart.interval_range(&region);
+                
+                // Add padding to ensure we fetch enough data
+                let padding = interval * 2; // Fetch 2 intervals before and after
+                Some((
+                    earliest.saturating_sub(padding),
+                    latest.saturating_add(padding),
+                ))
+            }
+            Basis::Tick(_) => {
+                // Tick-based charts don't need time-based fetching
+                return None;
+            }
+        };
+        
+        let Some((visible_start, visible_end)) = current_range else {
+            return None;
+        };
+        
+        // Check if visible range has changed significantly
+        let range_changed = match self.last_visible_range {
+            Some((last_start, last_end)) => {
+                // Consider range changed if it moved by more than 10% of the range size
+                let range_size = visible_end.saturating_sub(visible_start);
+                let threshold = range_size / 10;
+                let start_diff = visible_start.max(last_start) - visible_start.min(last_start);
+                let end_diff = visible_end.max(last_end) - visible_end.min(last_end);
+                start_diff > threshold || end_diff > threshold
+            }
+            None => true, // First time, always fetch
+        };
+        
+        if !range_changed {
+            // Range hasn't changed, no need to fetch
+            return None;
+        }
+        
+        // Update last visible range
+        self.last_visible_range = Some((visible_start, visible_end));
+        
+        // Check if we have data covering the visible range
+        let has_data = match &self.data_source {
+            PlotData::TimeBased(timeseries) => {
+                if timeseries.datapoints.is_empty() {
+                    false
+                } else {
+                    // Check if we have data covering the visible range
+                    let data_start = timeseries.datapoints.values()
+                        .next()
+                        .map(|dp| dp.kline.time)
+                        .unwrap_or(0);
+                    let data_end = timeseries.datapoints.values()
+                        .last()
+                        .map(|dp| dp.kline.time)
+                        .unwrap_or(0);
+                    
+                    // Convert to milliseconds for comparison
+                    let visible_start_ms = visible_start;
+                    let visible_end_ms = visible_end;
+                    
+                    // Check if data covers the visible range (with some margin)
+                    data_start <= visible_start_ms && data_end >= visible_end_ms
+                }
+            }
+            PlotData::TickBased(_) => {
+                // Tick-based charts don't need time-based fetching
+                return None;
+            }
+        };
+        
+        if has_data {
+            // We have data covering the visible range, no need to fetch
+            return None;
+        }
+        
+        // We need to fetch data for the visible range
+        let ticker_info = chart.ticker_info.clone();
+        let timeframe = match chart.basis {
+            Basis::Time(tf) => tf,
+            Basis::Tick(_) => return None,
+        };
+        
+        // Use RequestHandler to avoid duplicate requests
+        let fetch_range = exchange::fetcher::FetchRange::Kline(visible_start, visible_end);
+        
+        match self.request_handler.add_request(fetch_range) {
+            Ok(Some(req_id)) => {
+                let stream = exchange::adapter::StreamKind::Kline {
+                    ticker_info,
+                    timeframe,
+                };
+                let fetch_spec = exchange::fetcher::FetchSpec {
+                    req_id,
+                    fetch: fetch_range,
+                    stream: Some(stream),
+                };
+                let requests = exchange::fetcher::FetchRequests::from(vec![fetch_spec]);
+                Some(Action::RequestFetch(requests))
+            }
+            Ok(None) => {
+                // Request already in progress or recently completed
+                None
+            }
+            Err(_) => {
+                // Request error (overlap, etc.)
+                None
+            }
         }
     }
 

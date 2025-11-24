@@ -3,10 +3,11 @@ use crate::screen::dashboard::{Dashboard, pane};
 use data::{
     UserTimezone,
     layout::{WindowSpec, pane::Axis},
+    UnifiedDataService,
 };
 
 use iced::widget::pane_grid::{self, Configuration};
-use std::{collections::HashMap, vec};
+use std::{collections::HashMap, sync::Arc, vec};
 use uuid::Uuid;
 
 #[derive(Eq, Hash, Debug, Clone, PartialEq)]
@@ -272,7 +273,7 @@ pub fn configuration(pane: data::Pane) -> Configuration<pane::State> {
     }
 }
 
-pub fn load_saved_state() -> SavedState {
+pub fn load_saved_state(unified_data_service: Arc<data::UnifiedDataService>) -> SavedState {
     match data::read_from_file(data::SAVED_STATE_PATH) {
         Ok(state) => {
             let mut de_layouts = vec![];
@@ -291,6 +292,7 @@ pub fn load_saved_state() -> SavedState {
                     configuration(layout.dashboard.pane.clone()),
                     popout_windows,
                     layout_id,
+                    unified_data_service.clone(),
                 );
 
                 de_layouts.push((layout.name.clone(), layout_id, dashboard));

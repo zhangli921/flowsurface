@@ -336,14 +336,14 @@ impl State {
         }
     }
 
-    pub fn insert_hist_klines(
+    pub fn insert_klines(
         &mut self,
         req_id: Option<uuid::Uuid>,
         timeframe: Timeframe,
         ticker_info: TickerInfo,
         klines: &[Kline],
     ) -> Option<Effect> {
-        log::info!("Pane: insert_hist_klines called. Klines count: {}", klines.len());
+        log::info!("Pane: insert_klines called. Klines count: {}", klines.len());
         match &mut self.content {
             Content::Kline {
                 chart, indicators, ..
@@ -353,11 +353,11 @@ impl State {
                 };
 
                 if let Some(id) = req_id {
-                    chart.insert_hist_klines(id, klines);
-                    log::info!("Pane: Calling check_vp_update_needed after insert_hist_klines");
+                    chart.insert_klines(id, klines);
+                    log::info!("Pane: Calling check_vp_update_needed after insert_klines");
                     if let Some(action) = chart.check_vp_update_needed() {
                         if let chart::Action::RequestVpComputation(symbol, range) = action {
-                            log::info!("Pane: insert_hist_klines requesting VP for {}", symbol);
+                            log::info!("Pane: insert_klines requesting VP for {}", symbol);
                             return Some(Effect::RequestVpComputation(symbol, range));
                         }
                     } else {
@@ -389,7 +389,7 @@ impl State {
                 }
             }
             _ => {
-                log::error!("insert_hist_klines called on non-kline pane");
+                log::error!("insert_klines called on non-kline pane");
             }
         }
         None

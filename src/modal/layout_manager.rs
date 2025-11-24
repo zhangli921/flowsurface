@@ -54,6 +54,8 @@ impl LayoutManager {
             name: "Layout 1".to_string(),
         };
 
+        // Note: LayoutManager::new() creates a dummy Dashboard.
+        // In practice, Dashboard should be created with Dashboard::new() or from_config().
         layouts.insert(layout1.id, (layout1.clone(), Dashboard::default()));
 
         LayoutManager {

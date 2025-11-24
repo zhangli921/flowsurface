@@ -144,7 +144,7 @@ impl Flowsurface {
         ));
         // --- End of Arbiter Service Initialization ---
 
-        let saved_state = layout::load_saved_state();
+        let saved_state = layout::load_saved_state(unified_data_service.clone());
 
         let (main_window_id, open_main_window) = {
             let (position, size) = saved_state.window();
@@ -171,7 +171,7 @@ impl Flowsurface {
 
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
-            unified_data_service,
+            unified_data_service: unified_data_service.clone(),
             vp_service: None, // Will be initialized asynchronously
             layout_manager: saved_state.layout_manager,
             theme_editor: ThemeEditor::new(saved_state.custom_theme),
@@ -185,6 +185,11 @@ impl Flowsurface {
             notifications: vec![],
             ingest_tx,
         };
+        
+        // Update all dashboards with the unified_data_service
+        for dashboard in state.layout_manager.iter_dashboards_mut() {
+            dashboard.set_unified_data_service(unified_data_service.clone());
+        }
 
         let last_active_layout = state.layout_manager.active_layout();
         let load_layout = state.load_layout(last_active_layout, main_window_id);
@@ -676,6 +681,7 @@ impl Flowsurface {
                                 configuration(ser_dashboard.pane.clone()),
                                 popout_windows,
                                 layout.id,
+                                self.unified_data_service.clone(),
                             );
 
                             manager.layout_order.push(new_layout.id);
