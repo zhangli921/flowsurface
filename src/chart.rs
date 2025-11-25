@@ -429,26 +429,99 @@ impl ChartState {
         }
     }
 
-    pub fn visible_time_range_us(&self) -> Option<data::TimeRange> {
+    /// Calculate visible time range with optional padding.
+    /// 
+    /// # Arguments
+    /// - `padding_intervals`: Number of intervals to add before and after the visible range (default: 0)
+    /// 
+    /// # Returns
+    /// - `Some((start_ms, end_ms))`: Time range in milliseconds
+    /// - `None`: If not a time-based chart or invalid range
+    pub fn visible_time_range_ms(&self, padding_intervals: u32) -> Option<(u64, u64)> {
         match self.basis {
-            Basis::Time(_) => {
+            Basis::Time(timeframe) => {
                 let region = self.visible_region(self.bounds.size());
+                if region.width == 0.0 {
+                    return None;
+                }
+                
                 let (start_ms, end_ms) = self.interval_range(&region);
-                let start_us = start_ms.checked_mul(1_000).unwrap_or(0);
-                let end_us = end_ms.checked_mul(1_000).unwrap_or(0);
+                let interval_ms = timeframe.to_milliseconds();
+                let padding_ms = interval_ms * padding_intervals as u64;
                 
-                log::debug!(
-                    "[visible_time_range_us] Calculated time range: {} - {} ms ({} - {} us), latest_x: {} ms, region: x={}, width={}",
-                    start_ms, end_ms, start_us, end_us, self.latest_x, region.x, region.width
-                );
-                
-                Some(data::TimeRange {
-                    start_us,
-                    end_us,
-                })
+                Some((
+                    start_ms.saturating_sub(padding_ms),
+                    end_ms.saturating_add(padding_ms),
+                ))
             }
             _ => None,
         }
+    }
+    
+    /// Calculate visible time range in microseconds (for data fetching).
+    /// Uses padding of 10 intervals to ensure sufficient data coverage for scrolling.
+    /// 
+    /// **Note**: This is for data fetching only. For computations (VP, price range, etc.),
+    /// use `visible_time_range_us_for_computation()` which uses exact visible range.
+    pub fn visible_time_range_us(&self) -> Option<data::TimeRange> {
+        match self.basis {
+            Basis::Time(timeframe) => {
+                // Use 10 intervals padding for data fetching to ensure sufficient coverage
+                if let Some((start_ms, end_ms)) = self.visible_time_range_ms(10) {
+                    let start_us = start_ms.checked_mul(1_000).unwrap_or(0);
+                    let end_us = end_ms.checked_mul(1_000).unwrap_or(0);
+                    
+                    log::debug!(
+                        "[visible_time_range_us] Calculated time range: {} - {} ms ({} - {} us), latest_x: {} ms",
+                        start_ms, end_ms, start_us, end_us, self.latest_x
+                    );
+                    
+                    Some(data::TimeRange {
+                        start_us,
+                        end_us,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    
+    /// Calculate visible time range in microseconds for computations (VP, price range, etc.).
+    /// Uses exact visible range with NO padding to ensure accuracy.
+    /// 
+    /// **Critical**: For financial calculations, we must use the exact visible range,
+    /// not padded range, to ensure data accuracy.
+    pub fn visible_time_range_us_for_computation(&self) -> Option<data::TimeRange> {
+        match self.basis {
+            Basis::Time(_) => {
+                // Use exact visible range (no padding) for computations
+                if let Some((start_ms, end_ms)) = self.visible_time_range_ms_for_render() {
+                    let start_us = start_ms.checked_mul(1_000).unwrap_or(0);
+                    let end_us = end_ms.checked_mul(1_000).unwrap_or(0);
+                    
+                    log::debug!(
+                        "[visible_time_range_us_for_computation] Calculated exact time range: {} - {} ms ({} - {} us), latest_x: {} ms",
+                        start_ms, end_ms, start_us, end_us, self.latest_x
+                    );
+                    
+                    Some(data::TimeRange {
+                        start_us,
+                        end_us,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+    
+    /// Calculate visible time range in milliseconds for rendering (no padding).
+    /// This is used for filtering data that should be displayed.
+    pub fn visible_time_range_ms_for_render(&self) -> Option<(u64, u64)> {
+        self.visible_time_range_ms(0)
     }
     pub fn price_range(&self, region: &Rectangle) -> (Price, Price) {
         let highest = self.y_to_price(region.y);

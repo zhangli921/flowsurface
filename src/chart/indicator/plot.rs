@@ -246,7 +246,12 @@ where
                 width,
                 height: frame.height() / ctx.state.scaling,
             };
-            let (earliest, latest) = ctx.state.interval_range(&region);
+            // Use unified time range calculation (no padding for rendering)
+            let (earliest, latest) = if let Some(range) = ctx.state.visible_time_range_ms_for_render() {
+                range
+            } else {
+                return; // Cannot calculate range
+            };
             if latest < earliest {
                 return;
             }

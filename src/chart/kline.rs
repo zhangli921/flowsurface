@@ -72,8 +72,12 @@ impl Chart for KlineChart {
 
     fn view_indicators(&'_ self, enabled: &[Self::IndicatorKind]) -> Vec<Element<'_, Message>> {
         let chart_state = self.state();
-        let visible_region = chart_state.visible_region(chart_state.bounds.size());
-        let (earliest, latest) = chart_state.interval_range(&visible_region);
+        // Use unified time range calculation (no padding for rendering)
+        let (earliest, latest) = if let Some(range) = chart_state.visible_time_range_ms_for_render() {
+            range
+        } else {
+            return vec![];
+        };
         if earliest > latest {
             return vec![];
         }
@@ -94,28 +98,8 @@ impl Chart for KlineChart {
     }
 
     fn visible_timerange(&self) -> Option<(u64, u64)> {
-        let chart = self.state();
-        let region = chart.visible_region(chart.bounds.size());
-
-        if region.width == 0.0 {
-            return None;
-        }
-
-        match &chart.basis {
-            Basis::Time(timeframe) => {
-                let interval = timeframe.to_milliseconds();
-
-                let (earliest, latest) = (
-                    chart.x_to_interval(region.x) - (interval / 2),
-                    chart.x_to_interval(region.x + region.width) + (interval / 2),
-                );
-
-                Some((earliest, latest))
-            }
-            Basis::Tick(_) => {
-                unimplemented!()
-            }
-        }
+        // Use unified time range calculation (no padding for rendering)
+        self.state().visible_time_range_ms_for_render()
     }
 
     fn interval_keys(&self) -> Option<Vec<u64>> {
@@ -798,8 +782,13 @@ impl KlineChart {
                     chart.translation.y = self.data_source.latest_y_midpoint(calculate_target_y);
                 }
                 super::Autoscale::FitToVisible => {
-                    let visible_region = chart.visible_region(chart.bounds.size());
-                    let (start_interval, end_interval) = chart.interval_range(&visible_region);
+                    // Use unified time range calculation (no padding for rendering)
+                    let (start_interval, end_interval) = if let Some(range) = chart.visible_time_range_ms_for_render() {
+                        range
+                    } else {
+                        // Cannot calculate range, skip autoscale
+                        return None;
+                    };
 
                     // Calculate price range from K-lines that are actually visible on screen
                     // Use the same coordinate calculation as the renderer to ensure consistency
@@ -957,8 +946,13 @@ impl KlineChart {
         }
 
         // Update debug_visible_range for UI display
-        let visible_region = chart.visible_region(chart.bounds.size());
-        let (start_interval, end_interval) = chart.interval_range(&visible_region);
+        // Use unified time range calculation (no padding for rendering)
+        let (start_interval, end_interval) = if let Some(range) = chart.visible_time_range_ms_for_render() {
+            range
+        } else {
+            // Cannot calculate range, skip debug info update
+            return None;
+        };
         
         // Use renderer's coordinate system to find visible K-lines
         let base_time_ms = if !self.render_cache_kline.is_empty() {
@@ -1050,8 +1044,12 @@ impl KlineChart {
         use exchange::util::PriceStep;
         
         let chart = &self.chart.state;
-        let visible_region = chart.visible_region(chart.bounds.size());
-        let (start_ts, end_ts) = chart.interval_range(&visible_region);
+        // Use unified time range calculation (no padding for rendering)
+        let (start_ts, end_ts) = if let Some(range) = chart.visible_time_range_ms_for_render() {
+            range
+        } else {
+            return; // Cannot calculate range
+        };
         
         // Convert to microseconds for comparison with K-line timestamps
         let start_ts_us = start_ts.checked_mul(1_000).unwrap_or(0);
@@ -1089,29 +1087,8 @@ impl KlineChart {
     fn check_data_update_needed(&mut self) -> Option<Action> {
         let chart = &self.chart.state;
         
-        // Get current visible time range
-        let current_range = match chart.basis {
-            Basis::Time(timeframe) => {
-                let region = chart.visible_region(chart.bounds.size());
-                if region.width == 0.0 {
-                    return None;
-                }
-                
-                let interval = timeframe.to_milliseconds();
-                let (earliest, latest) = chart.interval_range(&region);
-                
-                // Add padding to ensure we fetch enough data (fetch more data to cover scrolling)
-                let padding = interval * 10; // Fetch 10 intervals before and after for better coverage
-                Some((
-                    earliest.saturating_sub(padding),
-                    latest.saturating_add(padding),
-                ))
-            }
-            Basis::Tick(_) => {
-                // Tick-based charts don't need time-based fetching
-                return None;
-            }
-        };
+        // Use unified time range calculation with 10 intervals padding for data fetching
+        let current_range = chart.visible_time_range_ms(10);
         
         let Some((visible_start, visible_end)) = current_range else {
             return None;
@@ -1296,16 +1273,18 @@ impl KlineChart {
         let symbol = self.chart.state.ticker_info.ticker.to_string();
         // log::info!("Checking VP update for {}. visible_time_range_ns() call...", symbol);
         
-        if let Some(time_range) = self.chart.state.visible_time_range_us() {
+        // CRITICAL: Use exact visible range (NO padding) for VP computation to ensure accuracy
+        // Financial calculations must be based on exact visible range, not padded range
+        if let Some(time_range) = self.chart.state.visible_time_range_us_for_computation() {
             log::debug!(
-                "[check_vp_update_needed] Requesting VP computation for {}: {} - {} us ({} - {} ms), latest_x: {} ms",
+                "[check_vp_update_needed] Requesting VP computation for {}: {} - {} us ({} - {} ms), latest_x: {} ms (EXACT RANGE, NO PADDING)",
                 symbol, time_range.start_us, time_range.end_us,
                 time_range.start_us / 1_000, time_range.end_us / 1_000,
                 self.chart.state.latest_x
             );
             Some(Action::RequestVpComputation(symbol, time_range))
         } else {
-            // log::warn!("VP Update Skipped: visible_time_range_ns returned None (maybe Basis::Tick?)");
+            // log::warn!("VP Update Skipped: visible_time_range_us_for_computation returned None (maybe Basis::Tick?)");
             None
         }
     }

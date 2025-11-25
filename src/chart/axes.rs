@@ -45,7 +45,13 @@ impl<'a> canvas::Program<()> for XAxis<'a> {
             let ticks = match state.basis {
                 Basis::Time(tf) => {
                     let interval_ms = tf.to_milliseconds();
-                    let (start_ts, end_ts) = state.interval_range(&visible_region);
+                    // Use unified time range calculation (no padding for rendering)
+                    let (start_ts, end_ts) = if let Some(range) = state.visible_time_range_ms_for_render() {
+                        range
+                    } else {
+                        // Fallback to interval_range if visible_time_range_ms_for_render returns None
+                        state.interval_range(&visible_region)
+                    };
                     let range_ms = end_ts.saturating_sub(start_ts);
                     
                     if range_ms == 0 { return; }
@@ -300,8 +306,14 @@ impl<'a> canvas::Program<()> for YAxis<'a> {
             let visible_region = state.visible_region(content_bounds.size());
             
             // Calculate price range from visible K-lines if available, otherwise fallback to coordinate-based calculation
+            // Use unified time range calculation (no padding for rendering)
             let raw_range = if let Some(klines) = self.kline_data {
-                let (start_ts, end_ts) = state.interval_range(&visible_region);
+                let (start_ts, end_ts) = if let Some(range) = state.visible_time_range_ms_for_render() {
+                    range
+                } else {
+                    // Fallback to interval_range if visible_time_range_ms_for_render returns None
+                    state.interval_range(&visible_region)
+                };
                 // Convert to microseconds for comparison with K-line timestamps
                 let start_ts_us = start_ts.checked_mul(1_000).unwrap_or(0);
                 let end_ts_us = end_ts.checked_mul(1_000).unwrap_or(0);
@@ -330,60 +342,61 @@ impl<'a> canvas::Program<()> for YAxis<'a> {
                 None
             };
             
-            // Calculate rounded price range with stabilization
-            // IMPORTANT: Y-axis label range should be STABLE and not change frequently
-            // Use cached range if available, only update when change is significant
-            let (highest_price, lowest_price) = if let Some((min_low, max_high)) = raw_range {
-                // Round the price range to nice values
-                let rounded = Self::round_price_range(min_low, max_high, state.tick_size);
-                
-                // Apply stabilization: ALWAYS use cached range if available and change is small
-                // This prevents Y-axis labels from jumping around
-                if let Some(cached) = state.cached_y_range {
-                    if Self::should_update_range(Some(cached), rounded) {
-                        // Change is significant, use new rounded range
-                        // Cache will be updated in update_y_axis_range_cache
-                        rounded
-                    } else {
-                        // Change is small, use cached range for stability
-                        cached
-                    }
-                } else {
-                    // No cache yet, use rounded range
-                    rounded
-                }
-            } else {
-                // No K-line data, fallback to coordinate-based calculation
-                state.price_range(&visible_region)
-            };
+            // Note: cached_y_range is updated in KlineChart::update_y_axis_range_cache()
+            // We don't update it here because state is immutable in draw()
             
-            let range_units = highest_price.units - lowest_price.units;
+            // CRITICAL FIX: Generate labels based on screen Y coordinates, not price units
+            // This ensures labels are evenly distributed across the visible screen area
+            // regardless of price range or translation/scaling changes
+            
+            // Calculate the price range corresponding to the entire visible screen height
+            // Screen Y coordinates: 0 (top) to bounds.height (bottom)
+            let screen_top = 0.0;
+            let screen_bottom = bounds.height;
+            
+            // Convert screen Y to chart Y coordinates
+            // screen_y = (chart_y + translation.y) * scaling + height / 2.0
+            // chart_y = (screen_y - height / 2.0) / scaling - translation.y
+            let chart_y_top = (screen_top - content_bounds.height / 2.0) / state.scaling - state.translation.y;
+            let chart_y_bottom = (screen_bottom - content_bounds.height / 2.0) / state.scaling - state.translation.y;
+            
+            // Convert chart Y coordinates to prices
+            let price_at_top = state.y_to_price(chart_y_top);
+            let price_at_bottom = state.y_to_price(chart_y_bottom);
+            
+            // Determine the actual visible price range (may differ from cached range)
+            let visible_lowest = price_at_top.min(price_at_bottom);
+            let visible_highest = price_at_top.max(price_at_bottom);
+            
+            let range_units = visible_highest.units - visible_lowest.units;
             if range_units == 0 { return; }
             
-            let max_ticks = (bounds.height / 40.0).ceil() as usize; // Ticks every 40px
-            let step_units = range_units / (max_ticks as i64).max(1);
+            // Generate labels evenly distributed across screen height
+            let tick_spacing_px = 40.0; // Target spacing: 40 pixels between ticks
+            let num_ticks = (bounds.height / tick_spacing_px).ceil() as usize;
+            let num_ticks = num_ticks.max(2); // At least 2 ticks
             
-            let mut current_units = lowest_price.units;
-            let end_units = highest_price.units;
-            
-            // Align to step?
-            
-            while current_units <= end_units {
-                let price = Price { units: current_units };
-                let y = state.price_to_y(price);
+            // Generate labels at evenly spaced screen Y positions
+            for i in 0..=num_ticks {
+                let screen_y = (i as f32 / num_ticks as f32) * bounds.height;
                 
-                // Screen Y calculation
-                // Screen Y = (y + translation.y) * scaling + height / 2.0
-                let screen_y = (y + state.translation.y) * state.scaling + content_bounds.height / 2.0;
+                // Convert screen Y to chart Y, then to price
+                let chart_y = (screen_y - content_bounds.height / 2.0) / state.scaling - state.translation.y;
+                let price = state.y_to_price(chart_y);
                 
-                if screen_y >= -20.0 && screen_y <= bounds.height + 20.0 {
+                // Round price to nearest tick size for cleaner labels
+                let rounded_price = price.round_to_step(state.tick_size);
+                
+                // Only draw if within reasonable bounds (avoid extreme values)
+                if rounded_price.units >= visible_lowest.units.saturating_sub(range_units / 10) &&
+                   rounded_price.units <= visible_highest.units.saturating_add(range_units / 10) {
                     // Draw tick
                     let left = Point::new(0.0, screen_y);
                     let right = Point::new(5.0, screen_y);
                     frame.stroke(&Path::line(left, right), Stroke::default().with_color(Color::WHITE).with_width(1.0));
                     
                     // Draw text
-                    let price_str = price.to_string(state.ticker_info.min_ticksize);
+                    let price_str = rounded_price.to_string(state.ticker_info.min_ticksize);
                     let text = Text {
                         content: price_str,
                         position: Point::new(8.0, screen_y),
@@ -395,8 +408,6 @@ impl<'a> canvas::Program<()> for YAxis<'a> {
                     };
                     frame.fill_text(text);
                 }
-                
-                current_units += step_units;
             }
         });
         vec![geometry]
