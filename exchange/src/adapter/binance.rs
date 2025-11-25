@@ -15,6 +15,7 @@ use super::{
 
 use csv::ReaderBuilder;
 use fastwebsockets::OpCode;
+use zip::ZipArchive;
 use iced_futures::{
     futures::{SinkExt, Stream, channel::mpsc},
     stream,
@@ -1490,5 +1491,361 @@ pub async fn get_hist_trades(
         Err(e) => Err(AdapterError::ParseError(format!(
             "Failed to open compressed file: {e}"
         ))),
+    }
+}
+
+// BinanceAdapter implementation
+
+use super::super::adapter::{ExchangeAdapter, HistoricalData, HistoricalDataType};
+use async_trait::async_trait;
+use std::io::{Cursor, Read};
+
+/// Binance exchange adapter.
+///
+/// This adapter handles all communication with Binance, including:
+/// - Real-time WebSocket streams
+/// - REST API calls (requiring API Key)
+/// - Historical data downloads from Binance Data Vision (public data)
+pub struct BinanceAdapter {
+    client: reqwest::Client,
+    exchange: Exchange,  // Store which exchange type this adapter handles
+}
+
+impl BinanceAdapter {
+    /// Creates a new Binance adapter for the given exchange type.
+    pub fn new_for(exchange: Exchange) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            exchange,
+        }
+    }
+    
+    /// Creates a new Binance adapter (defaults to BinanceSpot for backward compatibility).
+    pub fn new() -> Self {
+        Self::new_for(Exchange::BinanceSpot)
+    }
+}
+
+#[async_trait]
+impl ExchangeAdapter for BinanceAdapter {
+    fn exchange(&self) -> Exchange {
+        self.exchange
+    }
+    
+    async fn fetch_klines(
+        &self,
+        ticker_info: TickerInfo,
+        timeframe: Timeframe,
+        range: Option<(u64, u64)>,
+    ) -> Result<Vec<Kline>, AdapterError> {
+        // Use existing fetch_klines function
+        fetch_klines(ticker_info, timeframe, range).await
+    }
+    
+    async fn fetch_historical_data(
+        &self,
+        symbol: &str,
+        date: &str,
+        data_type: HistoricalDataType,
+    ) -> Result<HistoricalData, AdapterError> {
+        match data_type {
+            HistoricalDataType::Kline { timeframe } => {
+                let klines = self.download_kline_from_data_vision(symbol, date, &timeframe).await?;
+                Ok(HistoricalData::Klines(klines))
+            }
+            HistoricalDataType::Tick => {
+                let trades = self.download_ticks_from_data_vision(symbol, date).await?;
+                Ok(HistoricalData::Ticks(trades))
+            }
+        }
+    }
+    
+    async fn fetch_ticker_info(
+        &self,
+    ) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
+        // Get market_type from the exchange this adapter handles
+        let market_type = self.exchange().market_type();
+        fetch_ticksize(market_type).await
+    }
+    
+    async fn fetch_ticker_prices(
+        &self,
+    ) -> Result<HashMap<Ticker, TickerStats>, AdapterError> {
+        // Get market_type from the exchange this adapter handles
+        let market_type = self.exchange().market_type();
+        fetch_ticker_prices(market_type).await
+    }
+    
+    async fn fetch_historical_oi(
+        &self,
+        ticker: Ticker,
+        range: Option<(u64, u64)>,
+        timeframe: Timeframe,
+    ) -> Result<Vec<OpenInterest>, AdapterError> {
+        fetch_historical_oi(ticker, range, timeframe).await
+    }
+    
+    fn rate_limiter(&self, market_type: MarketKind) -> &dyn limiter::RateLimiter {
+        // Return a static wrapper that delegates to the appropriate limiter
+        // Note: This is a workaround - the wrapper will need to lock the mutex
+        // when methods are called, but we can't do that in a &mut self method
+        // For now, we'll create a simple wrapper that panics if called
+        // This needs to be fixed in a future iteration
+        match market_type {
+            MarketKind::Spot => &BinanceLimiterRef::Spot,
+            MarketKind::LinearPerps => &BinanceLimiterRef::Linear,
+            MarketKind::InversePerps => &BinanceLimiterRef::Inverse,
+        }
+    }
+}
+
+/// Reference wrapper for BinanceLimiter that implements RateLimiter
+/// This is a workaround to return &dyn RateLimiter from the adapter
+/// TODO: This needs to be redesigned to properly handle Mutex locking
+struct BinanceLimiterRef {
+    _phantom: std::marker::PhantomData<()>,
+}
+
+impl BinanceLimiterRef {
+    const Spot: Self = Self { _phantom: std::marker::PhantomData };
+    const Linear: Self = Self { _phantom: std::marker::PhantomData };
+    const Inverse: Self = Self { _phantom: std::marker::PhantomData };
+}
+
+impl limiter::RateLimiter for BinanceLimiterRef {
+    fn prepare_request(&mut self, _weight: usize) -> Option<Duration> {
+        // TODO: This is a placeholder - we need to properly lock the mutex
+        // For now, we'll use a blocking approach (not ideal for async)
+        // This needs to be fixed to properly handle async mutex locking
+        log::warn!("BinanceLimiterRef::prepare_request called - this is a placeholder implementation");
+        None
+    }
+
+    fn update_from_response(&mut self, _response: &reqwest::Response, _weight: usize) {
+        // TODO: Same issue as above
+        log::warn!("BinanceLimiterRef::update_from_response called - this is a placeholder implementation");
+    }
+
+    fn should_exit_on_response(&self, response: &reqwest::Response) -> bool {
+        // This is safe because it's read-only
+        let status = response.status();
+        status == 429 || status == 418
+    }
+}
+
+impl BinanceAdapter {
+    /// Downloads K-line data from Binance Data Vision.
+    async fn download_kline_from_data_vision(
+        &self,
+        symbol: &str,
+        date: &str,
+        timeframe: &str,
+    ) -> Result<Vec<Kline>, AdapterError> {
+        // Convert timeframe to Binance interval format
+        let interval = match timeframe {
+            "1m" => "1m",
+            "3m" => "3m",
+            "5m" => "5m",
+            "15m" => "15m",
+            "30m" => "30m",
+            "1h" => "1h",
+            "2h" => "2h",
+            "4h" => "4h",
+            "6h" => "6h",
+            "8h" => "8h",
+            "12h" => "12h",
+            "1d" => "1d",
+            "3d" => "3d",
+            "1w" => "1w",
+            "1M" => "1mo",
+            _ => {
+                log::warn!("Unsupported timeframe {}, defaulting to 1m", timeframe);
+                "1m"
+            }
+        };
+
+        // URL format: https://data.binance.vision/data/spot/daily/klines/{SYMBOL}/{INTERVAL}/{SYMBOL}-{INTERVAL}-{DATE}.zip
+        let url = format!(
+            "https://data.binance.vision/data/spot/daily/klines/{}/{}/{}-{}-{}.zip",
+            symbol, interval, symbol, interval, date
+        );
+
+        // Download ZIP file
+        let response = self.client.get(&url).send().await?;
+        if !response.status().is_success() {
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                log::warn!(
+                    "Historical K-line data not available for {}/{}/{} (404). This is normal for today's data which may not be published yet (2-6 hour delay).",
+                    symbol, timeframe, date
+                );
+                return Ok(Vec::new());
+            }
+            return Err(AdapterError::FetchError(
+                response.error_for_status().unwrap_err()
+            ));
+        }
+
+        let zip_bytes = response.bytes().await?;
+
+        // Extract and parse CSV from ZIP
+        let mut archive = ZipArchive::new(Cursor::new(zip_bytes))?;
+        
+        // Find the CSV file in the ZIP
+        let mut csv_content = String::new();
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            if file.name().ends_with(".csv") {
+                file.read_to_string(&mut csv_content)?;
+                break;
+            }
+        }
+
+        if csv_content.is_empty() {
+            return Err(AdapterError::ParseError("No CSV file found in ZIP archive".to_string()));
+        }
+
+        // Parse CSV
+        // Format: Open time, Open, High, Low, Close, Volume, Close time, Quote asset volume, Number of trades, ...
+        let mut reader = csv::Reader::from_reader(csv_content.as_bytes());
+        let mut klines = Vec::new();
+
+        for result in reader.records() {
+            let record = result.map_err(|e| AdapterError::ParseError(e.to_string()))?;
+            if record.len() < 9 {
+                continue; // Skip invalid records
+            }
+
+            let open_time_ms: u64 = record.get(0)
+                .ok_or_else(|| AdapterError::ParseError("Missing open_time".to_string()))?
+                .parse()
+                .map_err(|_| AdapterError::ParseError("Invalid open_time".to_string()))?;
+            
+            let open: f32 = record.get(1)
+                .ok_or_else(|| AdapterError::ParseError("Missing open".to_string()))?
+                .parse()
+                .map_err(|_| AdapterError::ParseError("Invalid open".to_string()))?;
+            
+            let high: f32 = record.get(2)
+                .ok_or_else(|| AdapterError::ParseError("Missing high".to_string()))?
+                .parse()
+                .map_err(|_| AdapterError::ParseError("Invalid high".to_string()))?;
+            
+            let low: f32 = record.get(3)
+                .ok_or_else(|| AdapterError::ParseError("Missing low".to_string()))?
+                .parse()
+                .map_err(|_| AdapterError::ParseError("Invalid low".to_string()))?;
+            
+            let close: f32 = record.get(4)
+                .ok_or_else(|| AdapterError::ParseError("Missing close".to_string()))?
+                .parse()
+                .map_err(|_| AdapterError::ParseError("Invalid close".to_string()))?;
+            
+            let volume: f32 = record.get(5)
+                .ok_or_else(|| AdapterError::ParseError("Missing volume".to_string()))?
+                .parse()
+                .map_err(|_| AdapterError::ParseError("Invalid volume".to_string()))?;
+            
+            let quote_volume: f32 = record.get(7)
+                .ok_or_else(|| AdapterError::ParseError("Missing quote_volume".to_string()))?
+                .parse()
+                .map_err(|_| AdapterError::ParseError("Invalid quote_volume".to_string()))?;
+
+            klines.push(Kline {
+                time: open_time_ms,
+                open: Price::from_f32(open),
+                high: Price::from_f32(high),
+                low: Price::from_f32(low),
+                close: Price::from_f32(close),
+                volume: (volume, quote_volume),
+            });
+        }
+
+        Ok(klines)
+    }
+    
+    /// Downloads Tick data from Binance Data Vision.
+    async fn download_ticks_from_data_vision(
+        &self,
+        symbol: &str,
+        date: &str,
+    ) -> Result<Vec<Trade>, AdapterError> {
+        // URL format: https://data.binance.vision/data/spot/daily/aggTrades/{SYMBOL}/{SYMBOL}-aggTrades-{DATE}.zip
+        let url = format!(
+            "https://data.binance.vision/data/spot/daily/aggTrades/{}/{}-aggTrades-{}.zip",
+            symbol, symbol, date
+        );
+
+        // Download ZIP file
+        let response = self.client.get(&url).send().await?;
+        if !response.status().is_success() {
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                log::warn!(
+                    "Historical Tick data not available for {}/{} (404). This is normal for today's data which may not be published yet (2-6 hour delay).",
+                    symbol, date
+                );
+                return Ok(Vec::new());
+            }
+            return Err(AdapterError::FetchError(
+                response.error_for_status().unwrap_err()
+            ));
+        }
+
+        let zip_bytes = response.bytes().await?;
+
+        // Extract and parse CSV from ZIP
+        let mut archive = ZipArchive::new(Cursor::new(zip_bytes))?;
+        
+        // Find the CSV file in the ZIP
+        let mut csv_content = String::new();
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            if file.name().ends_with(".csv") {
+                file.read_to_string(&mut csv_content)?;
+                break;
+            }
+        }
+
+        if csv_content.is_empty() {
+            return Err(AdapterError::ParseError("No CSV file found in ZIP archive".to_string()));
+        }
+
+        // Parse CSV
+        // Format: Agg trade ID, Price, Quantity, First trade ID, Last trade ID, Timestamp, Was the buyer the maker
+        let mut reader = csv::Reader::from_reader(csv_content.as_bytes());
+        let mut trades = Vec::new();
+
+        for result in reader.records() {
+            let record = result.map_err(|e| AdapterError::ParseError(e.to_string()))?;
+            if record.len() < 7 {
+                continue; // Skip invalid records
+            }
+
+            let price_str = record.get(1)
+                .ok_or_else(|| AdapterError::ParseError("Missing price".to_string()))?;
+            let quantity_str = record.get(2)
+                .ok_or_else(|| AdapterError::ParseError("Missing quantity".to_string()))?;
+            let timestamp_str = record.get(5)
+                .ok_or_else(|| AdapterError::ParseError("Missing timestamp".to_string()))?;
+            let is_buyer_maker_str = record.get(6)
+                .ok_or_else(|| AdapterError::ParseError("Missing is_buyer_maker".to_string()))?;
+
+            let price: f32 = price_str.parse()
+                .map_err(|_| AdapterError::ParseError("Invalid price".to_string()))?;
+            let quantity: f32 = quantity_str.parse()
+                .map_err(|_| AdapterError::ParseError("Invalid quantity".to_string()))?;
+            let timestamp_ms: u64 = timestamp_str.parse()
+                .map_err(|_| AdapterError::ParseError("Invalid timestamp".to_string()))?;
+            let is_buyer_maker: bool = is_buyer_maker_str.parse()
+                .map_err(|_| AdapterError::ParseError("Invalid is_buyer_maker".to_string()))?;
+
+            trades.push(Trade {
+                time: timestamp_ms,
+                is_sell: is_buyer_maker,  // If buyer is maker, then it's a sell
+                price: Price::from_f32(price),
+                qty: quantity,
+            });
+        }
+
+        Ok(trades)
     }
 }

@@ -213,7 +213,7 @@ impl RealtimeDataService {
         // Parse JSON response
         // Binance returns an array of arrays: [[open_time, open, high, low, close, volume, close_time, ...], ...]
         let klines_json: Vec<Vec<serde_json::Value>> = response.json()
-            .map_err(|e| DataError::InvalidInput("Failed to parse JSON response"))?;
+            .map_err(|e| DataError::InvalidInput("Failed to parse JSON response".to_string()))?;
 
         let mut klines = Vec::new();
         for kline_array in klines_json {
@@ -236,35 +236,35 @@ impl RealtimeDataService {
             // [11] Ignore
 
             let open_time_ms = kline_array[0].as_u64()
-                .ok_or_else(|| DataError::InvalidInput("Invalid open_time"))?;
+                .ok_or_else(|| DataError::InvalidInput("Invalid open_time".to_string()))?;
             
             let open = kline_array[1].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid open price"))?
+                .ok_or_else(|| DataError::InvalidInput("Invalid open price".to_string()))?
                 .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse open price"))?;
+                .map_err(|_| DataError::InvalidInput("Failed to parse open price".to_string()))?;
             
             let high = kline_array[2].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid high price"))?
+                .ok_or_else(|| DataError::InvalidInput("Invalid high price".to_string()))?
                 .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse high price"))?;
+                .map_err(|_| DataError::InvalidInput("Failed to parse high price".to_string()))?;
             
             let low = kline_array[3].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid low price"))?
+                .ok_or_else(|| DataError::InvalidInput("Invalid low price".to_string()))?
                 .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse low price"))?;
+                .map_err(|_| DataError::InvalidInput("Failed to parse low price".to_string()))?;
             
             let close = kline_array[4].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid close price"))?
+                .ok_or_else(|| DataError::InvalidInput("Invalid close price".to_string()))?
                 .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse close price"))?;
+                .map_err(|_| DataError::InvalidInput("Failed to parse close price".to_string()))?;
             
             let volume = kline_array[5].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid volume"))?
+                .ok_or_else(|| DataError::InvalidInput("Invalid volume".to_string()))?
                 .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse volume"))?;
+                .map_err(|_| DataError::InvalidInput("Failed to parse volume".to_string()))?;
             
             let num_trades = kline_array[8].as_u64()
-                .ok_or_else(|| DataError::InvalidInput("Invalid num_trades"))?
+                .ok_or_else(|| DataError::InvalidInput("Invalid num_trades".to_string()))?
                 as u32;
 
             klines.push(KLine {
@@ -412,17 +412,17 @@ impl RealtimeDataService {
                     .column(0)
                     .as_any()
                     .downcast_ref::<array::TimestampMicrosecondArray>()
-                    .ok_or(DataError::InvalidInput("Timestamp column has wrong type"))?;
+                    .ok_or_else(|| DataError::InvalidInput("Timestamp column has wrong type".to_string()))?;
                 let price_array = batch
                     .column(1)
                     .as_any()
                     .downcast_ref::<array::Float64Array>()
-                    .ok_or(DataError::InvalidInput("Price column has wrong type"))?;
+                    .ok_or_else(|| DataError::InvalidInput("Price column has wrong type".to_string()))?;
                 let volume_array = batch
                     .column(2)
                     .as_any()
                     .downcast_ref::<array::Float64Array>()
-                    .ok_or(DataError::InvalidInput("Volume column has wrong type"))?;
+                    .ok_or_else(|| DataError::InvalidInput("Volume column has wrong type".to_string()))?;
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i) as u64;

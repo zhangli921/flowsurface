@@ -9,6 +9,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 
+use crate::limiter;
+use async_trait::async_trait;
+
 pub mod binance;
 pub mod bybit;
 pub mod hyperliquid;
@@ -126,6 +129,10 @@ pub enum AdapterError {
     WebsocketError(String),
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Zip error: {0}")]
+    ZipError(#[from] zip::result::ZipError),
 }
 
 impl AdapterError {
@@ -139,6 +146,8 @@ impl AdapterError {
                 "Unexpected response from the exchange. Check logs for details."
             }
             AdapterError::WebsocketError(_) => "Realtime connection error. Trying to reconnect...",
+            AdapterError::IoError(_) => "IO error occurred. Check logs for details.",
+            AdapterError::ZipError(_) => "Error processing ZIP archive. Check logs for details.",
         }
     }
 }
@@ -627,20 +636,28 @@ impl<I> StreamConfig<I> {
 pub async fn fetch_ticker_info(
     exchange: Exchange,
 ) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError> {
-    let market_type = exchange.market_type();
-
-    match exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_ticksize(market_type).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_ticksize(market_type).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_ticksize(market_type).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_ticksize(market_type).await
+    // Use Trait pattern through AdapterRegistry
+    let registry = AdapterRegistry::global();
+    
+    if let Some(adapter) = registry.get(exchange) {
+        // Try to use Trait pattern first
+        adapter.fetch_ticker_info().await
+    } else {
+        // Fallback to legacy function dispatch for exchanges without adapters
+        let market_type = exchange.market_type();
+        match exchange {
+            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
+                binance::fetch_ticksize(market_type).await
+            }
+            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
+                bybit::fetch_ticksize(market_type).await
+            }
+            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
+                hyperliquid::fetch_ticksize(market_type).await
+            }
+            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
+                okex::fetch_ticksize(market_type).await
+            }
         }
     }
 }
@@ -648,20 +665,28 @@ pub async fn fetch_ticker_info(
 pub async fn fetch_ticker_prices(
     exchange: Exchange,
 ) -> Result<HashMap<Ticker, TickerStats>, AdapterError> {
-    let market_type = exchange.market_type();
-
-    match exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_ticker_prices(market_type).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_ticker_prices(market_type).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_ticker_prices(market_type).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_ticker_prices(market_type).await
+    // Use Trait pattern through AdapterRegistry
+    let registry = AdapterRegistry::global();
+    
+    if let Some(adapter) = registry.get(exchange) {
+        // Try to use Trait pattern first
+        adapter.fetch_ticker_prices().await
+    } else {
+        // Fallback to legacy function dispatch for exchanges without adapters
+        let market_type = exchange.market_type();
+        match exchange {
+            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
+                binance::fetch_ticker_prices(market_type).await
+            }
+            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
+                bybit::fetch_ticker_prices(market_type).await
+            }
+            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
+                hyperliquid::fetch_ticker_prices(market_type).await
+            }
+            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
+                okex::fetch_ticker_prices(market_type).await
+            }
         }
     }
 }
@@ -671,18 +696,28 @@ pub async fn fetch_klines(
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
 ) -> Result<Vec<Kline>, AdapterError> {
-    match ticker_info.ticker.exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
-            binance::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
-            bybit::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
-            hyperliquid::fetch_klines(ticker_info, timeframe, range).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
-            okex::fetch_klines(ticker_info, timeframe, range).await
+    // Use Trait pattern through AdapterRegistry
+    let exchange = ticker_info.ticker.exchange;
+    let registry = AdapterRegistry::global();
+    
+    if let Some(adapter) = registry.get(exchange) {
+        // Try to use Trait pattern first
+        adapter.fetch_klines(ticker_info, timeframe, range).await
+    } else {
+        // Fallback to legacy function dispatch for exchanges without adapters
+        match exchange {
+            Exchange::BinanceLinear | Exchange::BinanceInverse | Exchange::BinanceSpot => {
+                binance::fetch_klines(ticker_info, timeframe, range).await
+            }
+            Exchange::BybitLinear | Exchange::BybitInverse | Exchange::BybitSpot => {
+                bybit::fetch_klines(ticker_info, timeframe, range).await
+            }
+            Exchange::HyperliquidLinear | Exchange::HyperliquidSpot => {
+                hyperliquid::fetch_klines(ticker_info, timeframe, range).await
+            }
+            Exchange::OkexLinear | Exchange::OkexInverse | Exchange::OkexSpot => {
+                okex::fetch_klines(ticker_info, timeframe, range).await
+            }
         }
     }
 }
@@ -692,16 +727,153 @@ pub async fn fetch_open_interest(
     timeframe: Timeframe,
     range: Option<(u64, u64)>,
 ) -> Result<Vec<OpenInterest>, AdapterError> {
-    match ticker.exchange {
-        Exchange::BinanceLinear | Exchange::BinanceInverse => {
-            binance::fetch_historical_oi(ticker, range, timeframe).await
+    // Use Trait pattern through AdapterRegistry
+    let exchange = ticker.exchange;
+    let registry = AdapterRegistry::global();
+    
+    if let Some(adapter) = registry.get(exchange) {
+        // Try to use Trait pattern first
+        adapter.fetch_historical_oi(ticker, range, timeframe).await
+    } else {
+        // Fallback to legacy function dispatch for exchanges without adapters
+        match exchange {
+            Exchange::BinanceLinear | Exchange::BinanceInverse => {
+                binance::fetch_historical_oi(ticker, range, timeframe).await
+            }
+            Exchange::BybitLinear | Exchange::BybitInverse => {
+                bybit::fetch_historical_oi(ticker, range, timeframe).await
+            }
+            Exchange::OkexLinear | Exchange::OkexInverse => {
+                okex::fetch_historical_oi(ticker, range, timeframe).await
+            }
+            _ => Err(AdapterError::InvalidRequest("Invalid exchange".to_string())),
         }
-        Exchange::BybitLinear | Exchange::BybitInverse => {
-            bybit::fetch_historical_oi(ticker, range, timeframe).await
-        }
-        Exchange::OkexLinear | Exchange::OkexInverse => {
-            okex::fetch_historical_oi(ticker, range, timeframe).await
-        }
-        _ => Err(AdapterError::InvalidRequest("Invalid exchange".to_string())),
+    }
+}
+
+/// Type of historical data to fetch from exchange data sources.
+#[derive(Debug, Clone)]
+pub enum HistoricalDataType {
+    /// K-line data with specific timeframe.
+    Kline { timeframe: String },
+    /// Tick/trade data.
+    Tick,
+}
+
+/// Historical data result from exchange.
+pub enum HistoricalData {
+    /// K-line data.
+    Klines(Vec<Kline>),
+    /// Tick/trade data.
+    Ticks(Vec<Trade>),
+}
+
+/// Unified exchange adapter interface.
+///
+/// This trait provides a common interface for all exchange adapters,
+/// allowing for easy extension and testing.
+#[async_trait]
+pub trait ExchangeAdapter: Send + Sync {
+    /// Returns the exchange type this adapter handles.
+    fn exchange(&self) -> Exchange;
+    
+    /// Fetches K-line data for a given ticker and timeframe.
+    async fn fetch_klines(
+        &self,
+        ticker_info: TickerInfo,
+        timeframe: Timeframe,
+        range: Option<(u64, u64)>,
+    ) -> Result<Vec<Kline>, AdapterError>;
+    
+    /// Fetches historical data from exchange data sources.
+    ///
+    /// This includes public historical data (e.g., Binance Data Vision) that doesn't
+    /// require API Key authentication.
+    async fn fetch_historical_data(
+        &self,
+        symbol: &str,
+        date: &str,  // Format: "YYYY-MM-DD"
+        data_type: HistoricalDataType,
+    ) -> Result<HistoricalData, AdapterError>;
+    
+    /// Fetches ticker information (tick size, min quantity, etc.) for all symbols.
+    async fn fetch_ticker_info(
+        &self,
+    ) -> Result<HashMap<Ticker, Option<TickerInfo>>, AdapterError>;
+    
+    /// Fetches current ticker prices and statistics.
+    async fn fetch_ticker_prices(
+        &self,
+    ) -> Result<HashMap<Ticker, TickerStats>, AdapterError>;
+    
+    /// Fetches historical open interest data.
+    async fn fetch_historical_oi(
+        &self,
+        ticker: Ticker,
+        range: Option<(u64, u64)>,
+        timeframe: Timeframe,
+    ) -> Result<Vec<OpenInterest>, AdapterError>;
+    
+    /// Returns the rate limiter for this exchange and market type.
+    fn rate_limiter(&self, market_type: MarketKind) -> &dyn limiter::RateLimiter;
+}
+
+/// Registry for exchange adapters.
+///
+/// This allows dynamic lookup of adapters by exchange type.
+pub struct AdapterRegistry {
+    adapters: rustc_hash::FxHashMap<Exchange, Arc<dyn ExchangeAdapter>>,
+}
+
+impl AdapterRegistry {
+    /// Creates a new adapter registry with default adapters.
+    pub fn new() -> Self {
+        let mut adapters = rustc_hash::FxHashMap::default();
+        
+        // Register Binance adapters
+        // Create separate adapters for each exchange type to support different market types
+        let binance_spot_adapter: Arc<dyn ExchangeAdapter> = Arc::new(binance::BinanceAdapter::new_for(Exchange::BinanceSpot));
+        let binance_linear_adapter: Arc<dyn ExchangeAdapter> = Arc::new(binance::BinanceAdapter::new_for(Exchange::BinanceLinear));
+        let binance_inverse_adapter: Arc<dyn ExchangeAdapter> = Arc::new(binance::BinanceAdapter::new_for(Exchange::BinanceInverse));
+        
+        adapters.insert(Exchange::BinanceSpot, binance_spot_adapter);
+        adapters.insert(Exchange::BinanceLinear, binance_linear_adapter);
+        adapters.insert(Exchange::BinanceInverse, binance_inverse_adapter);
+        
+        // TODO: Register other exchanges (Bybit, Hyperliquid, Okex) when their adapters are implemented
+        
+        Self { adapters }
+    }
+    
+    /// Gets a global singleton instance of the adapter registry.
+    /// This is useful for legacy functions that need to access adapters.
+    pub fn global() -> &'static AdapterRegistry {
+        use std::sync::OnceLock;
+        static REGISTRY: OnceLock<AdapterRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(|| AdapterRegistry::new())
+    }
+    
+    /// Gets an adapter for the given exchange.
+    pub fn get(&self, exchange: Exchange) -> Option<&Arc<dyn ExchangeAdapter>> {
+        self.adapters.get(&exchange)
+    }
+    
+    /// Gets an adapter for the given exchange, or returns an error.
+    pub fn get_or_err(&self, exchange: Exchange) -> Result<&Arc<dyn ExchangeAdapter>, AdapterError> {
+        self.adapters.get(&exchange)
+            .ok_or_else(|| AdapterError::InvalidRequest(
+                format!("No adapter found for {:?}", exchange)
+            ))
+    }
+    
+    /// Registers an adapter for the given exchange.
+    pub fn register(&mut self, exchange: Exchange, adapter: Arc<dyn ExchangeAdapter>) {
+        self.adapters.insert(exchange, adapter);
+    }
+}
+
+impl Default for AdapterRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }

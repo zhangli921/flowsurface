@@ -12,20 +12,17 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::io::{Cursor, Read};
 use std::collections::HashSet;
 use tokio::fs::{self, File as TokioFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use reqwest::Client;
 use arrow::array::{Array, ArrayRef, Float64Array, TimestampMicrosecondArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_writer::ArrowWriter;
-use zip::ZipArchive;
-use csv;
 
+use exchange::{AdapterRegistry, ExchangeAdapter, HistoricalData, HistoricalDataType, Exchange};
 use crate::{data_error::DataError, data_path, kline::KLine, compute::vp::TickDataBuffer};
 
 /// Executor for downloading and caching historical data.
@@ -34,7 +31,7 @@ use crate::{data_error::DataError, data_path, kline::KLine, compute::vp::TickDat
 /// by `HistoricalDownloadCoordinator` to execute download tasks.
 #[derive(Clone)]
 pub struct HistoricalDownloadExecutor {
-    client: Client,
+    adapter_registry: Arc<AdapterRegistry>,
     pub(crate) cache_dir: PathBuf,
     // Track ongoing downloads to prevent duplicate concurrent downloads
     downloading: Arc<Mutex<HashSet<String>>>,
@@ -45,7 +42,7 @@ impl HistoricalDownloadExecutor {
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         let cache_dir = cache_dir.unwrap_or_else(|| data_path(Some("cache")));
         Self {
-            client: Client::new(),
+            adapter_registry: Arc::new(AdapterRegistry::new()),
             cache_dir,
             downloading: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -82,13 +79,34 @@ impl HistoricalDownloadExecutor {
         {
             let mut downloading = self.downloading.lock().await;
             if downloading.contains(&download_key) {
-                return Err(DataError::InvalidInput("Download already in progress"));
+                return Err(DataError::InvalidInput("Download already in progress".to_string()));
             }
             downloading.insert(download_key.clone());
         }
 
-        // Download
-        let result = self.download_kline_for_date(symbol, date, timeframe).await;
+        // Download through exchange adapter
+        // TODO: Determine exchange from symbol - for now, assume Binance Spot
+        let exchange = Exchange::BinanceSpot;
+        let adapter = self.adapter_registry
+            .get_or_err(exchange)
+            .map_err(|e| DataError::InvalidInput(format!("No adapter found: {}", e).to_string()))?;
+        
+        let historical_data = adapter
+            .fetch_historical_data(
+                symbol,
+                date,
+                HistoricalDataType::Kline { timeframe: timeframe.to_string() },
+            )
+            .await
+            .map_err(|e| DataError::Adapter(e.to_string().to_string()))?;
+        
+        // Convert to KLine format
+        let result = match historical_data {
+            HistoricalData::Klines(klines) => {
+                Ok(klines.into_iter().map(KLine::from).collect::<Vec<KLine>>())
+            }
+            _ => Err(DataError::InvalidInput("Unexpected data type".to_string())),
+        };
 
         // Save to cache if successful
         if let Ok(ref klines) = result {
@@ -132,13 +150,65 @@ impl HistoricalDownloadExecutor {
         {
             let mut downloading = self.downloading.lock().await;
             if downloading.contains(&download_key) {
-                return Err(DataError::InvalidInput("Download already in progress"));
+                return Err(DataError::InvalidInput("Download already in progress".to_string()));
             }
             downloading.insert(download_key.clone());
         }
 
-        // Download
-        let result = self.download_ticks_for_date(symbol, date).await;
+        // Download through exchange adapter
+        // TODO: Determine exchange from symbol - for now, assume Binance Spot
+        let exchange = Exchange::BinanceSpot;
+        let adapter = self.adapter_registry
+            .get_or_err(exchange)
+            .map_err(|e| DataError::InvalidInput(format!("No adapter found: {}", e).to_string()))?;
+        
+        let historical_data = adapter
+            .fetch_historical_data(
+                symbol,
+                date,
+                HistoricalDataType::Tick,
+            )
+            .await
+            .map_err(|e| DataError::Adapter(e.to_string().to_string()))?;
+        
+        // Convert to TickDataBuffer format
+        let result = match historical_data {
+            HistoricalData::Ticks(trades) => {
+                let mut prices = Vec::new();
+                let mut volumes = Vec::new();
+                let mut min_timestamp: Option<u64> = None;
+                let mut max_timestamp: Option<u64> = None;
+                
+                for trade in trades {
+                    // Convert price to fixed-point u32 (price * 100)
+                    let price_fixed = (trade.price.to_f32() * 100.0) as u32;
+                    prices.push(price_fixed);
+                    volumes.push(trade.qty);
+                    
+                    // Track time range (convert ms to us)
+                    let timestamp_us = trade.time * 1_000;
+                    if min_timestamp.is_none() || timestamp_us < min_timestamp.unwrap() {
+                        min_timestamp = Some(timestamp_us);
+                    }
+                    if max_timestamp.is_none() || timestamp_us > max_timestamp.unwrap() {
+                        max_timestamp = Some(timestamp_us);
+                    }
+                }
+                
+                let time_range = if let (Some(min), Some(max)) = (min_timestamp, max_timestamp) {
+                    Some((min, max))
+                } else {
+                    None
+                };
+                
+                Ok(TickDataBuffer {
+                    prices,
+                    volumes,
+                    time_range,
+                })
+            }
+            _ => Err(DataError::InvalidInput("Unexpected data type".to_string())),
+        };
 
         // Save to cache if successful
         if let Ok(ref ticks) = result {
@@ -158,254 +228,6 @@ impl HistoricalDownloadExecutor {
         result
     }
 
-    /// Downloads K-line data for a specific date from Binance Data Vision.
-    async fn download_kline_for_date(
-        &self,
-        symbol: &str,
-        date: &str,
-        timeframe: &str,
-    ) -> Result<Vec<KLine>, DataError> {
-        // Convert timeframe to Binance interval format
-        let interval = match timeframe {
-            "1m" => "1m",
-            "3m" => "3m",
-            "5m" => "5m",
-            "15m" => "15m",
-            "30m" => "30m",
-            "1h" => "1h",
-            "2h" => "2h",
-            "4h" => "4h",
-            "6h" => "6h",
-            "8h" => "8h",
-            "12h" => "12h",
-            "1d" => "1d",
-            "3d" => "3d",
-            "1w" => "1w",
-            "1M" => "1mo",
-            _ => {
-                log::warn!("Unsupported timeframe {}, defaulting to 1m", timeframe);
-                "1m"
-            }
-        };
-
-        // URL format: https://data.binance.vision/data/spot/daily/klines/{SYMBOL}/{INTERVAL}/{SYMBOL}-{INTERVAL}-{DATE}.zip
-        let url = format!(
-            "https://data.binance.vision/data/spot/daily/klines/{}/{}/{}-{}-{}.zip",
-            symbol, interval, symbol, interval, date
-        );
-
-        // Downloading K-line data from Binance Data Vision
-
-        // Download ZIP file
-        let response = self.client.get(&url).send().await?;
-        if !response.status().is_success() {
-            // Handle 404 gracefully - historical data for today may not be available yet
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                log::warn!(
-                    "Historical K-line data not available for {}/{}/{} (404). This is normal for today's data which may not be published yet (2-6 hour delay).",
-                    symbol,
-                    timeframe,
-                    date
-                );
-                return Ok(Vec::new());
-            }
-            return Err(DataError::Network(
-                reqwest::Error::from(response.error_for_status().unwrap_err())
-            ));
-        }
-
-        let zip_bytes = response.bytes().await?;
-
-        // Extract and parse CSV from ZIP
-        let mut archive = ZipArchive::new(Cursor::new(zip_bytes))?;
-        
-        // Find the CSV file in the ZIP (usually the only file)
-        let mut csv_content = String::new();
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            if file.name().ends_with(".csv") {
-                file.read_to_string(&mut csv_content)?;
-                break;
-            }
-        }
-
-        if csv_content.is_empty() {
-            return Err(DataError::InvalidInput("No CSV file found in ZIP archive"));
-        }
-
-        // Parse CSV
-        // Format: Open time, Open, High, Low, Close, Volume, Close time, Quote asset volume, Number of trades, ...
-        let mut reader = csv::Reader::from_reader(csv_content.as_bytes());
-        let mut klines = Vec::new();
-
-        for result in reader.records() {
-            let record = result?;
-            if record.len() < 9 {
-                continue; // Skip invalid records
-            }
-
-            let open_time_ms: u64 = record.get(0)
-                .ok_or_else(|| DataError::InvalidInput("Missing open_time"))?
-                .parse()
-                .map_err(|_| DataError::InvalidInput("Invalid open_time"))?;
-            
-            let open: f64 = record.get(1)
-                .ok_or_else(|| DataError::InvalidInput("Missing open"))?
-                .parse()
-                .map_err(|_| DataError::InvalidInput("Invalid open"))?;
-            
-            let high: f64 = record.get(2)
-                .ok_or_else(|| DataError::InvalidInput("Missing high"))?
-                .parse()
-                .map_err(|_| DataError::InvalidInput("Invalid high"))?;
-            
-            let low: f64 = record.get(3)
-                .ok_or_else(|| DataError::InvalidInput("Missing low"))?
-                .parse()
-                .map_err(|_| DataError::InvalidInput("Invalid low"))?;
-            
-            let close: f64 = record.get(4)
-                .ok_or_else(|| DataError::InvalidInput("Missing close"))?
-                .parse()
-                .map_err(|_| DataError::InvalidInput("Invalid close"))?;
-            
-            let volume: f64 = record.get(5)
-                .ok_or_else(|| DataError::InvalidInput("Missing volume"))?
-                .parse()
-                .map_err(|_| DataError::InvalidInput("Invalid volume"))?;
-            
-            let num_trades: u32 = record.get(8)
-                .ok_or_else(|| DataError::InvalidInput("Missing num_trades"))?
-                .parse()
-                .map_err(|_| DataError::InvalidInput("Invalid num_trades"))?;
-
-            klines.push(KLine {
-                open_time_us: open_time_ms * 1_000, // Convert ms to us
-                open,
-                high,
-                low,
-                close,
-                volume,
-                num_trades,
-            });
-        }
-
-        Ok(klines)
-    }
-
-    /// Downloads Tick data for a specific date from Binance Data Vision.
-    async fn download_ticks_for_date(
-        &self,
-        symbol: &str,
-        date: &str,
-    ) -> Result<TickDataBuffer, DataError> {
-        // URL format: https://data.binance.vision/data/spot/daily/aggTrades/{SYMBOL}/{SYMBOL}-aggTrades-{DATE}.zip
-        let url = format!(
-            "https://data.binance.vision/data/spot/daily/aggTrades/{}/{}-aggTrades-{}.zip",
-            symbol, symbol, date
-        );
-
-        // Downloading Tick data from Binance Data Vision (logged only on first attempt per date)
-
-        // Download ZIP file
-        let response = self.client.get(&url).send().await?;
-        if !response.status().is_success() {
-            // Handle 404 gracefully - historical data for today may not be available yet
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                log::warn!(
-                    "Historical Tick data not available for {}/{} (404). This is normal for today's data which may not be published yet (2-6 hour delay).",
-                    symbol,
-                    date
-                );
-                return Ok(TickDataBuffer {
-                    prices: Vec::new(),
-                    volumes: Vec::new(),
-                    time_range: None,
-                });
-            }
-            return Err(DataError::Network(
-                reqwest::Error::from(response.error_for_status().unwrap_err())
-            ));
-        }
-
-        let zip_bytes = response.bytes().await?;
-
-        // Extract and parse CSV from ZIP
-        let mut archive = ZipArchive::new(Cursor::new(zip_bytes))?;
-        
-        // Find the CSV file in the ZIP (usually the only file)
-        let mut csv_content = String::new();
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            if file.name().ends_with(".csv") {
-                file.read_to_string(&mut csv_content)?;
-                break;
-            }
-        }
-
-        if csv_content.is_empty() {
-            return Err(DataError::InvalidInput("No CSV file found in ZIP archive"));
-        }
-
-        // Parse CSV
-        // Format: Agg trade ID, Price, Quantity, First trade ID, Last trade ID, Timestamp, Was the buyer the maker
-        let mut reader = csv::Reader::from_reader(csv_content.as_bytes());
-        let mut prices = Vec::new();
-        let mut volumes = Vec::new();
-        let mut min_timestamp: Option<u64> = None;
-        let mut max_timestamp: Option<u64> = None;
-
-        for result in reader.records() {
-            let record = result?;
-            if record.len() < 7 {
-                continue; // Skip invalid records
-            }
-
-            let price_str = record.get(1)
-                .ok_or_else(|| DataError::InvalidInput("Missing price"))?;
-            let quantity_str = record.get(2)
-                .ok_or_else(|| DataError::InvalidInput("Missing quantity"))?;
-            let timestamp_str = record.get(5)
-                .ok_or_else(|| DataError::InvalidInput("Missing timestamp"))?;
-
-            let price: f64 = price_str.parse()
-                .map_err(|_| DataError::InvalidInput("Invalid price"))?;
-            let quantity: f64 = quantity_str.parse()
-                .map_err(|_| DataError::InvalidInput("Invalid quantity"))?;
-            // Timestamp is in milliseconds, convert to microseconds
-            let timestamp_ms: u64 = timestamp_str.parse()
-                .map_err(|_| DataError::InvalidInput("Invalid timestamp"))?;
-            let timestamp_us = timestamp_ms * 1_000;
-
-            // Convert price to fixed-point u32 (price * 100)
-            // Note: This matches the TickDataBuffer format used in VP computation
-            let price_fixed = (price * 100.0) as u32;
-            
-            prices.push(price_fixed);
-            volumes.push(quantity as f32);
-            
-            // Track time range
-            if min_timestamp.is_none() || timestamp_us < min_timestamp.unwrap() {
-                min_timestamp = Some(timestamp_us);
-            }
-            if max_timestamp.is_none() || timestamp_us > max_timestamp.unwrap() {
-                max_timestamp = Some(timestamp_us);
-            }
-        }
-
-        // Calculate time range from timestamps
-        let time_range = if let (Some(min), Some(max)) = (min_timestamp, max_timestamp) {
-            Some((min, max))
-        } else {
-            None
-        };
-        
-        Ok(TickDataBuffer { 
-            prices, 
-            volumes,
-            time_range,
-        })
-    }
 
     /// Saves K-line data to cache.
     pub async fn save_klines_to_cache(
@@ -577,46 +399,46 @@ fn klines_to_record_batch(klines: &[KLine]) -> Result<RecordBatch, DataError> {
 fn record_batch_to_klines(batch: &RecordBatch) -> Result<Vec<KLine>, DataError> {
     let open_time_us_array = batch
         .column_by_name("open_time_us")
-        .ok_or(DataError::InvalidInput("Missing 'open_time_us' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'open_time_us' column".to_string()))?
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
-        .ok_or(DataError::InvalidInput("Invalid 'open_time_us' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'open_time_us' column type".to_string()))?;
     let open_array = batch
         .column_by_name("open")
-        .ok_or(DataError::InvalidInput("Missing 'open' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'open' column".to_string()))?
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'open' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'open' column type".to_string()))?;
     let high_array = batch
         .column_by_name("high")
-        .ok_or(DataError::InvalidInput("Missing 'high' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'high' column".to_string()))?
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'high' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'high' column type".to_string()))?;
     let low_array = batch
         .column_by_name("low")
-        .ok_or(DataError::InvalidInput("Missing 'low' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'low' column".to_string()))?
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'low' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'low' column type".to_string()))?;
     let close_array = batch
         .column_by_name("close")
-        .ok_or(DataError::InvalidInput("Missing 'close' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'close' column".to_string()))?
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'close' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'close' column type".to_string()))?;
     let volume_array = batch
         .column_by_name("volume")
-        .ok_or(DataError::InvalidInput("Missing 'volume' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'volume' column".to_string()))?
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'volume' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'volume' column type".to_string()))?;
     let num_trades_array = batch
         .column_by_name("num_trades")
-        .ok_or(DataError::InvalidInput("Missing 'num_trades' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'num_trades' column".to_string()))?
         .as_any()
         .downcast_ref::<UInt32Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'num_trades' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'num_trades' column type".to_string()))?;
 
     let mut klines = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
@@ -701,16 +523,16 @@ fn record_batch_to_ticks(batch: &RecordBatch) -> Result<TickDataBuffer, DataErro
     use arrow::array::{UInt32Array, Float32Array, UInt64Array};
     let price_array = batch
         .column_by_name("price")
-        .ok_or(DataError::InvalidInput("Missing 'price' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'price' column".to_string()))?
         .as_any()
         .downcast_ref::<UInt32Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'price' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'price' column type".to_string()))?;
     let volume_array = batch
         .column_by_name("volume")
-        .ok_or(DataError::InvalidInput("Missing 'volume' column"))?
+        .ok_or_else(|| DataError::InvalidInput("Missing 'volume' column".to_string()))?
         .as_any()
         .downcast_ref::<Float32Array>()
-        .ok_or(DataError::InvalidInput("Invalid 'volume' column type"))?;
+        .ok_or_else(|| DataError::InvalidInput("Invalid 'volume' column type".to_string()))?;
 
     let mut prices = Vec::with_capacity(batch.num_rows());
     let mut volumes = Vec::with_capacity(batch.num_rows());
@@ -729,11 +551,11 @@ fn record_batch_to_ticks(batch: &RecordBatch) -> Result<TickDataBuffer, DataErro
         let start_array = start_col
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or(DataError::InvalidInput("Invalid 'time_range_start_us' column type"))?;
+            .ok_or_else(|| DataError::InvalidInput("Invalid 'time_range_start_us' column type".to_string()))?;
         let end_array = end_col
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .ok_or(DataError::InvalidInput("Invalid 'time_range_end_us' column type"))?;
+            .ok_or_else(|| DataError::InvalidInput("Invalid 'time_range_end_us' column type".to_string()))?;
         
         // Read from first row (where time_range is stored)
         if start_array.len() > 0 && end_array.len() > 0 && start_array.is_valid(0) && end_array.is_valid(0) {

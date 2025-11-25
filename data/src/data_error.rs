@@ -43,13 +43,16 @@ pub enum DataError {
     Io(#[from] std::io::Error),
 
     #[error("Invalid input or configuration: {0}")]
-    InvalidInput(&'static str),
+    InvalidInput(String),
 
     #[error("ZIP archive error: {0}")]
     Zip(#[from] zip::result::ZipError),
 
     #[error("CSV parsing error: {0}")]
     Csv(#[from] csv::Error),
+
+    #[error("Exchange adapter error: {0}")]
+    Adapter(String),
 }
 
 // Manual implementation of From<tokio::task::JoinError> to convert it into a concrete string.

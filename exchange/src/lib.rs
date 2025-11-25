@@ -6,7 +6,8 @@ mod limiter;
 pub mod util;
 
 pub use adapter::Event;
-use adapter::{Exchange, MarketKind, StreamKind};
+pub use adapter::{AdapterRegistry, ExchangeAdapter, HistoricalData, HistoricalDataType, Exchange};
+use adapter::{MarketKind, StreamKind};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
