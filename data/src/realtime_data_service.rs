@@ -125,13 +125,33 @@ impl RealtimeDataService {
                         std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
                         continue;
                     } else {
-                        log::warn!(
-                            "RealtimeDataService: failed to open MmapStore for {} at {:?} after {} attempts: {}",
-                            symbol,
-                            mmap_path,
-                            MAX_RETRIES + 1,
-                            e
-                        );
+                        // Check if the error is due to file corruption
+                        let error_msg = e.to_string();
+                        let is_corrupted = error_msg.contains("truncated") || error_msg.contains("invalid");
+                        
+                        if is_corrupted && mmap_path.exists() {
+                            // DISABLED: Auto-deletion logic is disabled per user request
+                            // Previously, corrupted files were automatically deleted to allow Ingester to recreate them.
+                            // This has been disabled to prevent unexpected file deletion.
+                            log::warn!(
+                                "RealtimeDataService: MmapStore file for {} appears to be corrupted at {:?}. \
+                                Error: {}. Auto-deletion is disabled. Please manually delete the file if needed.",
+                                symbol,
+                                mmap_path,
+                                e
+                            );
+                            
+                            // Auto-deletion code removed - file will not be deleted automatically
+                            // If you need to fix a corrupted file, manually delete it and let Ingester recreate it
+                        } else {
+                            log::warn!(
+                                "RealtimeDataService: failed to open MmapStore for {} at {:?} after {} attempts: {}",
+                                symbol,
+                                mmap_path,
+                                MAX_RETRIES + 1,
+                                e
+                            );
+                        }
                         return None;
                     }
                 }

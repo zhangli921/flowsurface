@@ -311,9 +311,26 @@ impl Flowsurface {
                         }
                     };
                     
+                    // Try to get timeframe from the chart
+                    let timeframe_opt = {
+                        let dashboard = self.active_dashboard_mut();
+                        dashboard.find_pane_by_symbol(&symbol_clone)
+                            .and_then(|pane| {
+                                if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &pane.content {
+                                    // Use basis() method to get timeframe
+                                    match chart.basis() {
+                                        data::chart::Basis::Time(tf) => Some(tf.to_string()),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            })
+                    };
+                    
                     if !file_ready {
-                        log::info!("Mmap file for {} (normalized: {}) does not exist or is empty, triggering Ingester to create it", symbol_clone, normalized_symbol);
-                        let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone()));
+                        log::info!("Mmap file for {} (normalized: {}) does not exist or is empty, triggering Ingester to create it (timeframe: {:?})", symbol_clone, normalized_symbol, timeframe_opt);
+                        let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone(), timeframe_opt));
                     }
                     
                     return Task::future(async move {
@@ -527,9 +544,9 @@ impl Flowsurface {
                             self.notifications.push(toast);
                             Task::none()
                         }
-                        Some(dashboard::Event::ResolveStreams { pane_id, streams }) => {
-                            log::debug!("ResolveStreams event received with {} streams", streams.len());
-                            // Notify Ingestion Service
+                        Some(dashboard::Event::ResolveStreams { pane_id, streams, timeframe }) => {
+                            log::debug!("ResolveStreams event received with {} streams, timeframe: {:?}", streams.len(), timeframe);
+                            // Notify Ingestion Service and ensure mmap file exists
                             if let Some(stream) = streams.first() {
                                 let symbol = match stream {
                                     exchange::adapter::PersistStreamKind::Kline(pk) => pk.ticker.to_string(),
@@ -537,9 +554,27 @@ impl Flowsurface {
                                 };
                                 log::debug!("Extracted symbol from stream: '{}'", symbol);
                                 if !symbol.is_empty() {
-                                    log::info!("Sending IngestCommand::Subscribe({}) to IngestionService", symbol);
-                                    match self.ingest_tx.try_send(IngestCommand::Subscribe(symbol.clone())) {
-                                        Ok(()) => log::info!("IngestCommand::Subscribe({}) sent successfully", symbol),
+                                    // Check if mmap file exists, if not trigger Ingester
+                                    let normalized_symbol = normalize_binance_symbol(&symbol);
+                                    let data_dir = data::data_path(Some("market_data"));
+                                    let mmap_path = data_dir.join(format!("{}.mmap", normalized_symbol));
+                                    
+                                    let file_ready = mmap_path.exists() && {
+                                        if let Ok(metadata) = std::fs::metadata(&mmap_path) {
+                                            metadata.len() > 1024
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                    
+                                    if !file_ready {
+                                        log::info!("Mmap file for {} (normalized: {}) does not exist or is empty, triggering Ingester to create it", symbol, normalized_symbol);
+                                    }
+                                    
+                                    log::info!("Sending IngestCommand::Subscribe({}, timeframe: {:?}) to IngestionService", symbol, timeframe);
+                                    let timeframe_clone = timeframe.clone();
+                                    match self.ingest_tx.try_send(IngestCommand::Subscribe(symbol.clone(), timeframe)) {
+                                        Ok(()) => log::info!("IngestCommand::Subscribe({}, {:?}) sent successfully", symbol, timeframe_clone),
                                         Err(e) => log::warn!("Failed to send IngestCommand::Subscribe({}): {:?}", symbol, e),
                                     }
                                 } else {

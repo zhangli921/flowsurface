@@ -54,7 +54,11 @@ pub enum Message {
         stream: StreamKind,
         data: FetchedData,
     },
-    ResolveStreams(uuid::Uuid, Vec<PersistStreamKind>),
+    ResolveStreams {
+        pane_id: uuid::Uuid,
+        streams: Vec<PersistStreamKind>,
+        timeframe: Option<String>, // Current chart timeframe, if available
+    },
     ComputeVp(String, data::TimeRange),
 }
 
@@ -116,6 +120,7 @@ pub enum Event {
     ResolveStreams {
         pane_id: uuid::Uuid,
         streams: Vec<PersistStreamKind>,
+        timeframe: Option<String>, // Current chart timeframe, if available
     },
 }
 
@@ -452,10 +457,11 @@ impl Dashboard {
                     }),
                 );
             }
-            Message::ResolveStreams(pane_id, streams) => {
+            Message::ResolveStreams { pane_id, streams, timeframe } => {
+                // Timeframe is already extracted when creating the message
                 return (
                     Task::none(),
-                    Some(Event::ResolveStreams { pane_id, streams }),
+                    Some(Event::ResolveStreams { pane_id, streams, timeframe }),
                 );
             }
             Message::ComputeVp(_symbol, _range) => {
@@ -1109,10 +1115,21 @@ impl Dashboard {
                 },
                 Some(pane::Action::Panel(_action)) => {}
                 Some(pane::Action::ResolveStreams(streams)) => {
-                    tasks.push(Task::done(Message::ResolveStreams(
-                        state.unique_id(),
+                    // Get timeframe from chart if available
+                    let timeframe = if let pane::Content::Kline { chart: Some(chart), .. } = &state.content {
+                        match chart.basis() {
+                            data::chart::Basis::Time(tf) => Some(tf.to_string()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    tasks.push(Task::done(Message::ResolveStreams {
+                        pane_id: state.unique_id(),
                         streams,
-                    )));
+                        timeframe,
+                    }));
                 }
                 Some(pane::Action::ResolveContent) => match state.stream_pair_kind() {
                     Some(StreamPairKind::MultiSource(tickers)) => {
