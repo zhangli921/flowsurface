@@ -1027,7 +1027,6 @@ impl Dashboard {
         if found_match {
             Task::none()
         } else {
-            log::debug!("{stream:?} stream had no matching panes - dropping");
             self.refresh_streams(main_window)
         }
     }
@@ -1077,7 +1076,6 @@ impl Dashboard {
         if found_match {
             Task::none()
         } else {
-            log::debug!("No matching pane found for the stream: {stream:?}");
             self.refresh_streams(main_window)
         }
     }
@@ -1147,25 +1145,15 @@ impl Dashboard {
     }
 
     pub fn find_pane_by_symbol(&mut self, symbol: &str) -> Option<&mut pane::State> {
-        log::info!("find_pane_by_symbol: searching for '{}'", symbol);
-        
         // Search in main window panes
-        let mut pane_count = 0;
         for (_pane_id, pane_state) in self.panes.iter_mut() {
-            pane_count += 1;
             if let pane::Content::Kline { chart: Some(chart), .. } = &pane_state.content {
                 let chart_symbol = chart.ticker_info().ticker.to_string();
-                log::info!("  Checking pane {}: chart symbol = '{}'", pane_count, chart_symbol);
                 if chart_symbol == symbol {
-                    log::info!("  MATCH FOUND!");
                     return Some(pane_state);
                 }
-            } else {
-                log::info!("  Pane {} is not Kline or has no chart", pane_count);
             }
         }
-        
-        log::info!("  Checked {} main window panes, no match", pane_count);
         
         // Search in popout windows
         for (_window_id, (panes, _spec)) in self.popout.iter_mut() {
@@ -1478,27 +1466,11 @@ fn create_kline_fetch_task(
                 },
                 move |result| match result {
                     Ok(klines) => {
-                        log::debug!(
-                            "Dashboard: received {} K-lines from UnifiedDataService",
-                            klines.len()
-                        );
-                        
                         // Convert data::kline::KLine to exchange::Kline
                         let exchange_klines: Vec<Kline> = klines
                             .iter()
                             .map(|k| convert_to_exchange_kline(k, &ticker_info_clone))
                             .collect();
-                        
-                        // Debug: log time range after conversion
-                        if !exchange_klines.is_empty() {
-                            let converted_start = exchange_klines.first().map(|k| k.time).unwrap_or(0);
-                            let converted_end = exchange_klines.last().map(|k| k.time).unwrap_or(0);
-                            log::debug!(
-                                "Dashboard: converted K-lines time range: {} - {} ms",
-                                converted_start,
-                                converted_end
-                            );
-                        }
                         
                         let data = FetchedData::Klines {
                             data: exchange_klines,

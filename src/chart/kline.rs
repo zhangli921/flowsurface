@@ -388,11 +388,6 @@ impl KlineChart {
                 if kline.time != chart.latest_x {
                     let old_latest_x = chart.latest_x;
                     chart.latest_x = kline.time;
-                    log::debug!(
-                        "KlineChart: updated latest_x from {} to {} ms (from update_latest_kline)",
-                        old_latest_x,
-                        kline.time
-                    );
                 }
 
                 // chart.last_price = Some(PriceInfoLabel::new(kline.close, kline.open));
@@ -624,46 +619,10 @@ impl KlineChart {
     }
 
     pub fn insert_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
-        log::info!(
-            "KlineChart: insert_klines called with {} K-lines, req_id: {}",
-            klines_raw.len(),
-            req_id
-        );
-        
-        // Debug: log time range of incoming data
-        if !klines_raw.is_empty() {
-            let data_start = klines_raw.first().map(|k| k.time).unwrap_or(0);
-            let data_end = klines_raw.last().map(|k| k.time).unwrap_or(0);
-            log::debug!(
-                "KlineChart: incoming K-lines time range: {} - {} ms",
-                data_start,
-                data_end
-            );
-        }
         
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
-                let before_count = timeseries.datapoints.len();
                 timeseries.insert_klines(klines_raw);
-                let after_count = timeseries.datapoints.len();
-                
-                // Debug: log time range after insertion
-                if !timeseries.datapoints.is_empty() {
-                    let inserted_start = timeseries.datapoints.keys().next().copied().unwrap_or(0);
-                    let inserted_end = timeseries.datapoints.keys().last().copied().unwrap_or(0);
-                    log::debug!(
-                        "KlineChart: timeseries time range after insertion: {} - {} ms",
-                        inserted_start,
-                        inserted_end
-                    );
-                }
-                
-                log::info!(
-                    "KlineChart: inserted {} K-lines. Data points: {} -> {}",
-                    klines_raw.len(),
-                    before_count,
-                    after_count
-                );
                 
                 timeseries.insert_trades_existing_buckets(&self.raw_trades);
                 
@@ -671,27 +630,14 @@ impl KlineChart {
                 // CRITICAL: Always update latest_x to match the actual data, not system time
                 if let Some(new_latest_x) = timeseries.latest_timestamp() {
                     let chart = self.mut_state();
-                    let old_latest_x = chart.latest_x;
                     // Always update to match data, even if it's less than current latest_x
                     // This ensures latest_x reflects the actual K-line data, not system time
                     chart.latest_x = new_latest_x;
-                    if old_latest_x != new_latest_x {
-                        log::debug!(
-                            "KlineChart: updated latest_x from {} to {} ms (timeseries latest)",
-                            old_latest_x,
-                            new_latest_x
-                        );
-                    }
                 } else {
                     log::warn!("KlineChart: timeseries.latest_timestamp() returned None after inserting {} K-lines", klines_raw.len());
                 }
                 
                 self.rebuild_render_cache();
-                
-                log::info!(
-                    "KlineChart: render_cache_kline now has {} K-lines",
-                    self.render_cache_kline.len()
-                );
 
                 self.indicators
                     .values_mut()
@@ -810,11 +756,6 @@ impl KlineChart {
                     let transform_x = (scale_factor as f32) * chart.scaling;
                     let base_diff = base_time_ms - latest_x;
                     let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
-                    
-                    log::debug!(
-                        "[FitToVisible] Coordinate transform params: base_time_ms={} ms, latest_x={} ms, base_diff={} ms, transform_x={}, transform_y={}, interval_ms={} ms, cell_width={}, scaling={}",
-                        base_time_ms, latest_x, base_diff, transform_x, transform_y, interval_ms, cell_width, chart.scaling
-                    );
                     
                     let candle_width = chart.cell_width;
                     let half_candle_width = candle_width / 2.0;
@@ -1131,12 +1072,6 @@ impl KlineChart {
             
             match self.request_handler.add_request(fetch_range) {
                 Ok(Some(req_id)) => {
-                    log::info!(
-                        "KlineChart: created fetch request {} for range {} - {}",
-                        req_id,
-                        visible_start,
-                        visible_end
-                    );
                     let stream = exchange::adapter::StreamKind::Kline {
                         ticker_info,
                         timeframe,
@@ -1174,13 +1109,6 @@ impl KlineChart {
                 let changed = start_diff > threshold || end_diff > threshold;
                 
                 if changed {
-                    log::debug!(
-                        "KlineChart: visible range changed significantly. Last: {}-{}, Current: {}-{}",
-                        last_start,
-                        last_end,
-                        visible_start,
-                        visible_end
-                    );
                 }
                 
                 changed
@@ -1205,12 +1133,6 @@ impl KlineChart {
             
             match self.request_handler.add_request(fetch_range) {
                 Ok(Some(req_id)) => {
-                    log::info!(
-                        "KlineChart: range changed, created fetch request {} for range {} - {}",
-                        req_id,
-                        visible_start,
-                        visible_end
-                    );
                     let stream = exchange::adapter::StreamKind::Kline {
                         ticker_info,
                         timeframe,
@@ -1271,30 +1193,20 @@ impl KlineChart {
         self.last_vp_request = Instant::now();
 
         let symbol = self.chart.state.ticker_info.ticker.to_string();
-        // log::info!("Checking VP update for {}. visible_time_range_ns() call...", symbol);
         
         // CRITICAL: Use exact visible range (NO padding) for VP computation to ensure accuracy
         // Financial calculations must be based on exact visible range, not padded range
         if let Some(time_range) = self.chart.state.visible_time_range_us_for_computation() {
-            log::debug!(
-                "[check_vp_update_needed] Requesting VP computation for {}: {} - {} us ({} - {} ms), latest_x: {} ms (EXACT RANGE, NO PADDING)",
-                symbol, time_range.start_us, time_range.end_us,
-                time_range.start_us / 1_000, time_range.end_us / 1_000,
-                self.chart.state.latest_x
-            );
             Some(Action::RequestVpComputation(symbol, time_range))
         } else {
-            // log::warn!("VP Update Skipped: visible_time_range_us_for_computation returned None (maybe Basis::Tick?)");
             None
         }
     }
     
     /// Update the stored volume profile data
     pub fn set_volume_profile(&mut self, vp: data::compute::vp::VolumeProfile) {
-        // log::info!("set_volume_profile called with {} bars", vp.bars.len());
         self.chart.state.volume_profile = Some(vp);
         self.chart.state.vp_needs_update = false;
-        // log::info!("Volume Profile updated in KlineChart, vp_needs_update = false");
     }
 
     fn rebuild_render_cache(&mut self) {
@@ -1315,13 +1227,7 @@ impl KlineChart {
                 if let Some(new_latest_x) = timeseries.latest_timestamp() {
                     let chart = self.mut_state();
                     if chart.latest_x != new_latest_x {
-                        let old_latest_x = chart.latest_x;
                         chart.latest_x = new_latest_x;
-                        log::debug!(
-                            "KlineChart: updated latest_x from {} to {} ms (after rebuild_render_cache)",
-                            old_latest_x,
-                            new_latest_x
-                        );
                     }
                 }
             },

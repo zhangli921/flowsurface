@@ -861,10 +861,8 @@ impl MmapWriter {
     }
 
     fn write_header(&mut self) {
-        info!("[MmapWriter::write_header] CALLED, index_count: {}, payload_start_offset: {}", 
-              self.index_entries.len(), self.payload_start_offset);
         match self.file.seek(SeekFrom::Start(0)) {
-            Ok(pos) => info!("[MmapWriter::write_header] Seeked to position: {}", pos),
+            Ok(_) => {},
             Err(e) => {
                 error!("[MmapWriter::write_header] FAILED to seek: {}", e);
                 panic!("Failed to seek: {}", e);
@@ -877,10 +875,8 @@ impl MmapWriter {
             payload_start_offset: self.payload_start_offset,
             reserved: [0; 38],
         };
-        info!("[MmapWriter::write_header] Writing header (magic: {:?}, version: {}, index_count: {})", 
-              header.magic_number, header.data_version, header.index_count);
         match write_as_bytes(&mut self.file, &header) {
-            Ok(_) => info!("[MmapWriter::write_header] Header written successfully"),
+            Ok(_) => {},
             Err(e) => {
                 error!("[MmapWriter::write_header] FAILED to write header: {}", e);
                 panic!("Failed to write header: {}", e);
@@ -889,11 +885,9 @@ impl MmapWriter {
     }
 
     fn write_indices(&mut self) {
-        info!("[MmapWriter::write_indices] CALLED, index_entries count: {}", self.index_entries.len());
         let header_size = mem::size_of::<FileHeader>();
-        info!("[MmapWriter::write_indices] Seeking to header_size offset: {}", header_size);
         match self.file.seek(SeekFrom::Start(header_size as u64)) {
-            Ok(pos) => info!("[MmapWriter::write_indices] Seeked to position: {}", pos),
+            Ok(_) => {},
             Err(e) => {
                 error!("[MmapWriter::write_indices] FAILED to seek: {}", e);
                 panic!("Failed to seek: {}", e);
@@ -901,15 +895,9 @@ impl MmapWriter {
         }
         
         // Write all index entries
-        info!("[MmapWriter::write_indices] Writing {} index entries...", self.index_entries.len());
         for (idx, entry) in self.index_entries.iter().enumerate() {
             match write_as_bytes(&mut self.file, entry) {
-                Ok(_) => {
-                    if idx < 3 || idx == self.index_entries.len() - 1 {
-                        info!("[MmapWriter::write_indices] Wrote index entry {}: key_hash={}, start_offset={}, length={}", 
-                              idx, entry.key_hash, entry.start_offset, entry.length);
-                    }
-                }
+                Ok(_) => {},
                 Err(e) => {
                     error!("[MmapWriter::write_indices] FAILED to write index entry {}: {}", idx, e);
                     panic!("Failed to write index entry: {}", e);
@@ -925,7 +913,6 @@ impl MmapWriter {
             length: 0,
             reserved: 0,
         };
-        info!("[MmapWriter::write_indices] Writing zero-filled entries to fill index capacity...");
         let remaining_entries = INDEX_CAPACITY - self.index_entries.len();
         for _ in 0..remaining_entries {
             write_as_bytes(&mut self.file, &empty_entry).unwrap();

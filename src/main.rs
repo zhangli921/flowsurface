@@ -212,11 +212,11 @@ impl Flowsurface {
                 let dashboard = self.active_dashboard_mut();
 
                 match event {
-                    exchange::Event::Connected(exchange) => {
-                        log::info!("a stream connected to {exchange} WS");
+                    exchange::Event::Connected(_exchange) => {
+                        // Stream connected
                     }
-                    exchange::Event::Disconnected(exchange, reason) => {
-                        log::info!("a stream disconnected from {exchange} WS: {reason:?}");
+                    exchange::Event::Disconnected(_exchange, _reason) => {
+                        // Stream disconnected
                     }
                     exchange::Event::DepthReceived(
                         stream,
@@ -262,9 +262,8 @@ impl Flowsurface {
             }
             Message::KLineDataFetched(result) => {
                 match result {
-                    Ok(klines) => {
-                        log::info!("Successfully fetched {} klines.", klines.len());
-                        // TODO: Store klines in ChartState for rendering
+                    Ok(_klines) => {
+                        // K-lines fetched successfully
                     }
                     Err(e) => {
                         log::error!("Failed to fetch klines: {}", e);
@@ -274,7 +273,6 @@ impl Flowsurface {
             Message::VpServiceInitialized(result) => {
                 match result {
                     Ok(service) => {
-                        log::info!("VpComputeService initialized successfully.");
                         self.vp_service = Some(service);
                     }
                     Err(e) => {
@@ -329,7 +327,6 @@ impl Flowsurface {
                     };
                     
                     if !file_ready {
-                        log::info!("Mmap file for {} (normalized: {}) does not exist or is empty, triggering Ingester to create it (timeframe: {:?})", symbol_clone, normalized_symbol, timeframe_opt);
                         let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone(), timeframe_opt));
                     }
                     
@@ -345,7 +342,6 @@ impl Flowsurface {
                         
                         // Calculate compute parameters
                         let num_ticks = ticks.prices.len() as u32;
-                        log::info!("Received {} ticks for VP computation", num_ticks);
                         if num_ticks == 0 {
                             return Message::VpComputed(symbol_clone.clone(), Err(
                                 data::compute::vp::ComputeError::Other("No ticks found".to_string())
@@ -376,18 +372,12 @@ impl Flowsurface {
             Message::VpComputed(symbol, result) => {
                 match result {
                     Ok(profile) => {
-                        log::info!("Volume Profile computed for {}: POC at {}, {} bars", symbol, profile.point_of_control, profile.bars.len());
-                        
                         // Find the chart for this symbol and update its VP data
                         let dashboard = self.active_dashboard_mut();
-                        log::info!("Searching for chart with symbol: {}", symbol);
                         
                         if let Some(pane) = dashboard.find_pane_by_symbol(&symbol) {
-                            log::info!("Found pane for symbol {}", symbol);
                             if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
-                                log::info!("Found Kline chart, calling set_volume_profile");
                                 chart.set_volume_profile(profile);
-                                log::info!("VP data stored in chart for {}", symbol);
                             } else {
                                 log::warn!("Pane content is not Kline or chart is None");
                             }
@@ -545,14 +535,12 @@ impl Flowsurface {
                             Task::none()
                         }
                         Some(dashboard::Event::ResolveStreams { pane_id, streams, timeframe }) => {
-                            log::debug!("ResolveStreams event received with {} streams, timeframe: {:?}", streams.len(), timeframe);
                             // Notify Ingestion Service and ensure mmap file exists
                             if let Some(stream) = streams.first() {
                                 let symbol = match stream {
                                     exchange::adapter::PersistStreamKind::Kline(pk) => pk.ticker.to_string(),
                                     exchange::adapter::PersistStreamKind::DepthAndTrades(pd) => pd.ticker.to_string(),
                                 };
-                                log::debug!("Extracted symbol from stream: '{}'", symbol);
                                 if !symbol.is_empty() {
                                     // Check if mmap file exists, if not trigger Ingester
                                     let normalized_symbol = normalize_binance_symbol(&symbol);
@@ -568,13 +556,11 @@ impl Flowsurface {
                                     };
                                     
                                     if !file_ready {
-                                        log::info!("Mmap file for {} (normalized: {}) does not exist or is empty, triggering Ingester to create it", symbol, normalized_symbol);
+                                        // Mmap file doesn't exist, trigger Ingester
                                     }
                                     
-                                    log::info!("Sending IngestCommand::Subscribe({}, timeframe: {:?}) to IngestionService", symbol, timeframe);
-                                    let timeframe_clone = timeframe.clone();
                                     match self.ingest_tx.try_send(IngestCommand::Subscribe(symbol.clone(), timeframe)) {
-                                        Ok(()) => log::info!("IngestCommand::Subscribe({}, {:?}) sent successfully", symbol, timeframe_clone),
+                                        Ok(()) => {},
                                         Err(e) => log::warn!("Failed to send IngestCommand::Subscribe({}): {:?}", symbol, e),
                                     }
                                 } else {

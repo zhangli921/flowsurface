@@ -471,11 +471,6 @@ impl ChartState {
                     let start_us = start_ms.checked_mul(1_000).unwrap_or(0);
                     let end_us = end_ms.checked_mul(1_000).unwrap_or(0);
                     
-                    log::debug!(
-                        "[visible_time_range_us] Calculated time range: {} - {} ms ({} - {} us), latest_x: {} ms",
-                        start_ms, end_ms, start_us, end_us, self.latest_x
-                    );
-                    
                     Some(data::TimeRange {
                         start_us,
                         end_us,
@@ -500,11 +495,6 @@ impl ChartState {
                 if let Some((start_ms, end_ms)) = self.visible_time_range_ms_for_render() {
                     let start_us = start_ms.checked_mul(1_000).unwrap_or(0);
                     let end_us = end_ms.checked_mul(1_000).unwrap_or(0);
-                    
-                    log::debug!(
-                        "[visible_time_range_us_for_computation] Calculated exact time range: {} - {} ms ({} - {} us), latest_x: {} ms",
-                        start_ms, end_ms, start_us, end_us, self.latest_x
-                    );
                     
                     Some(data::TimeRange {
                         start_us,
@@ -552,14 +542,7 @@ impl ChartState {
                 
                 // x is already in chart coordinates, so we can directly convert
                 let diff_ms = (x as f64 / cell_width * interval) as i64;
-                let result = (self.latest_x as i64 + diff_ms) as u64;
-                
-                log::debug!(
-                    "[x_to_interval] x={} (chart coord), diff_ms={}, latest_x={} ms, result={} ms",
-                    x, diff_ms, self.latest_x, result
-                );
-                
-                result
+                (self.latest_x as i64 + diff_ms) as u64
             }
             Basis::Tick(_) => {
                 let tick = -(x / self.cell_width);
