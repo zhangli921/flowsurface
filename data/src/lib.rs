@@ -17,6 +17,7 @@ pub mod log;
 pub mod panel;
 pub mod realtime_data_service;
 pub mod realtime_ingester;
+pub mod symbol_resolver;
 pub mod tickers_table;
 pub mod unified_data_service;
 pub mod util;
@@ -45,6 +46,7 @@ pub use kline_cache::KlineCache;
 pub use layout::{Dashboard, Layout, Pane};
 pub use realtime_data_service::{RealtimeDataService, TimeRange};
 pub use realtime_ingester::{RealtimeIngesterService, IngestCommand};
+pub use symbol_resolver::SymbolResolver;
 pub use unified_data_service::UnifiedDataService;
 pub use time_utils::{calculate_date_range, calculate_safe_historical_cutoff, filter_historical_dates};
 

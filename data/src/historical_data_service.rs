@@ -16,7 +16,7 @@ use crate::{
     historical_download_executor::HistoricalDownloadExecutor,
     kline::KLine,
     compute::vp::TickDataBuffer,
-    realtime_ingester::normalize_binance_symbol,
+    symbol_resolver::SymbolResolver,
     time_utils::{calculate_date_range, calculate_safe_historical_cutoff, filter_historical_dates},
     TimeRange,
 };
@@ -28,6 +28,7 @@ pub struct HistoricalDataService {
     cache_dir: PathBuf,
     availability_index: Arc<DataAvailabilityIndex>,
     download_coordinator: Arc<HistoricalDownloadCoordinator>,
+    symbol_resolver: SymbolResolver,
 }
 
 impl HistoricalDataService {
@@ -43,6 +44,7 @@ impl HistoricalDataService {
             cache_dir,
             availability_index,
             download_coordinator,
+            symbol_resolver: SymbolResolver::new(),
         }
     }
 
@@ -56,7 +58,7 @@ impl HistoricalDataService {
         timeframe: &str, // e.g., "1m", "5m", "1h"
     ) -> Result<Vec<KLine>, DataError> {
         // Normalize symbol to ensure consistency with cache file names
-        let normalized_symbol = normalize_binance_symbol(symbol);
+        let normalized_symbol = self.symbol_resolver.normalize(symbol, None);
         
         // 1. Calculate date range for the requested time range
         let safe_cutoff = calculate_safe_historical_cutoff();
@@ -83,7 +85,7 @@ impl HistoricalDataService {
 
         // 3. Load available data (don't wait for downloads to complete)
         for date in dates {
-            let cache_key = format!("{}_{}_{}.parquet", normalized_symbol, date, timeframe);
+            let cache_key = self.symbol_resolver.kline_cache_key(&normalized_symbol, &date, timeframe);
             let cache_path = self.cache_dir.join(cache_key);
 
             let klines = self.load_cached_klines(&cache_path, &normalized_symbol, &date, timeframe).await;
@@ -109,7 +111,7 @@ impl HistoricalDataService {
         range: TimeRange,
     ) -> Result<TickDataBuffer, DataError> {
         // Normalize symbol to ensure consistency with cache file names
-        let normalized_symbol = normalize_binance_symbol(symbol);
+        let normalized_symbol = self.symbol_resolver.normalize(symbol, None);
         
         // 1. Calculate date range for the requested time range
         let safe_cutoff = calculate_safe_historical_cutoff();
@@ -138,7 +140,7 @@ impl HistoricalDataService {
 
         // 3. Load available data (don't wait for downloads to complete)
         for date in &dates {
-            let cache_key = format!("{}_{}_ticks.parquet", normalized_symbol, date);
+            let cache_key = self.symbol_resolver.tick_cache_key(&normalized_symbol, date);
             let cache_path = self.cache_dir.join(cache_key);
 
             let ticks = self.load_cached_ticks(&cache_path, &normalized_symbol, date).await;
@@ -158,7 +160,7 @@ impl HistoricalDataService {
                 });
             } else if tick_count > 0 {
                 // Data exists but no time_range (old format, e.g., 23号)
-                log::debug!("[HistoricalDataService] {}/{} has {} ticks but no time_range (old format)", symbol, date, tick_count);
+                log::debug!("[HistoricalDataService] {}/{} has {} ticks but no time_range (old format)", normalized_symbol, date, tick_count);
             }
         }
         

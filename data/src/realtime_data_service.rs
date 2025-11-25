@@ -5,8 +5,8 @@ use std::sync::Arc;
 use storage::MmapStore;
 use arrow::array; // Required for downcasting Arrow arrays
 
-use crate::{kline::KLine, data_error::DataError, compute::vp::TickDataBuffer, realtime_ingester::normalize_binance_symbol};
-use exchange::{AdapterRegistry, Exchange, Ticker, TickerInfo, Timeframe};
+use crate::{kline::KLine, data_error::DataError, compute::vp::TickDataBuffer, symbol_resolver::SymbolResolver};
+use exchange::{AdapterRegistry, Ticker, TickerInfo, Timeframe};
 
 /// Defines a time range with microsecond precision.
 /// Microsecond precision is sufficient for financial data and allows representing
@@ -68,6 +68,7 @@ fn parse_timeframe(s: &str) -> Option<Timeframe> {
 pub struct RealtimeDataService {
     data_dir: std::path::PathBuf,
     kline_cache: Option<std::sync::Arc<crate::kline_cache::KlineCache>>,
+    symbol_resolver: SymbolResolver,
 }
 
 impl RealtimeDataService {
@@ -80,6 +81,7 @@ impl RealtimeDataService {
         Self {
             data_dir,
             kline_cache: None,
+            symbol_resolver: SymbolResolver::new(),
         }
     }
 
@@ -95,8 +97,7 @@ impl RealtimeDataService {
     /// This method will retry opening the file a few times with short delays,
     /// as the file may be in the process of being created by RealtimeIngesterService.
     fn open_store_for_symbol(&self, symbol: &str) -> Option<Arc<MmapStore>> {
-        use crate::realtime_ingester::normalize_binance_symbol;
-        let normalized_symbol = normalize_binance_symbol(symbol);
+        let normalized_symbol = self.symbol_resolver.normalize(symbol, None);
         // RealtimeIngesterService creates files as {normalized_symbol}.mmap directly in data_dir
         let mmap_path = self.data_dir.join(format!("{}.mmap", normalized_symbol));
         
@@ -187,8 +188,9 @@ impl RealtimeDataService {
     /// * `range` - The time range for which to fetch K-line data
     /// * `timeframe` - The K-line interval (e.g., "1m", "5m", "1h")
     pub fn fetch_klines_blocking(&self, symbol: &str, range: TimeRange, timeframe: &str) -> Result<Vec<KLine>, DataError> {
-        // Normalize symbol to Binance API format
-        let api_symbol = normalize_binance_symbol(symbol);
+        // Normalize symbol and infer exchange
+        let api_symbol = self.symbol_resolver.normalize(symbol, None);
+        let exchange = self.symbol_resolver.infer_exchange(symbol);
 
         // 1. Try to get from cache first
         if let Some(cache) = &self.kline_cache {
@@ -209,9 +211,6 @@ impl RealtimeDataService {
         let tf = parse_timeframe(timeframe)
             .ok_or_else(|| DataError::InvalidInput(format!("Invalid timeframe: {}", timeframe)))?;
 
-        // Determine Exchange type (currently hardcoded to BinanceSpot, can be extended later)
-        let exchange = Exchange::BinanceSpot;
-        
         // Get adapter from registry
         let registry = AdapterRegistry::global();
         let adapter = registry.get(exchange)

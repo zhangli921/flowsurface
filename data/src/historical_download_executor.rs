@@ -22,8 +22,8 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use parquet::arrow::arrow_writer::ArrowWriter;
 
-use exchange::{AdapterRegistry, ExchangeAdapter, HistoricalData, HistoricalDataType, Exchange};
-use crate::{data_error::DataError, data_path, kline::KLine, compute::vp::TickDataBuffer};
+use exchange::{AdapterRegistry, HistoricalData, HistoricalDataType};
+use crate::{data_error::DataError, data_path, kline::KLine, compute::vp::TickDataBuffer, symbol_resolver::SymbolResolver};
 
 /// Executor for downloading and caching historical data.
 ///
@@ -35,6 +35,7 @@ pub struct HistoricalDownloadExecutor {
     pub(crate) cache_dir: PathBuf,
     // Track ongoing downloads to prevent duplicate concurrent downloads
     downloading: Arc<Mutex<HashSet<String>>>,
+    symbol_resolver: SymbolResolver,
 }
 
 impl HistoricalDownloadExecutor {
@@ -45,6 +46,7 @@ impl HistoricalDownloadExecutor {
             adapter_registry: Arc::new(AdapterRegistry::new()),
             cache_dir,
             downloading: Arc::new(Mutex::new(HashSet::new())),
+            symbol_resolver: SymbolResolver::new(),
         }
     }
     
@@ -60,9 +62,10 @@ impl HistoricalDownloadExecutor {
         date: &str, // Format: "YYYY-MM-DD"
         timeframe: &str, // e.g., "1m", "5m", "1h"
     ) -> Result<Vec<KLine>, DataError> {
-        let cache_key = format!("{}_{}_{}.parquet", symbol, date, timeframe);
+        let normalized_symbol = self.symbol_resolver.normalize(symbol, None);
+        let cache_key = self.symbol_resolver.kline_cache_key(&normalized_symbol, date, timeframe);
         let cache_path = self.cache_dir.join(&cache_key);
-        let download_key = format!("kline:{}_{}_{}", symbol, date, timeframe);
+        let download_key = self.symbol_resolver.download_key("kline", &normalized_symbol, date, Some(timeframe));
         
         // Try loading from cache first
         if cache_path.exists() {
@@ -85,15 +88,14 @@ impl HistoricalDownloadExecutor {
         }
 
         // Download through exchange adapter
-        // TODO: Determine exchange from symbol - for now, assume Binance Spot
-        let exchange = Exchange::BinanceSpot;
+        let exchange = self.symbol_resolver.infer_exchange(&normalized_symbol);
         let adapter = self.adapter_registry
             .get_or_err(exchange)
             .map_err(|e| DataError::InvalidInput(format!("No adapter found: {}", e).to_string()))?;
         
         let historical_data = adapter
             .fetch_historical_data(
-                symbol,
+                &normalized_symbol,
                 date,
                 HistoricalDataType::Kline { timeframe: timeframe.to_string() },
             )
@@ -132,9 +134,10 @@ impl HistoricalDownloadExecutor {
         symbol: &str,
         date: &str, // Format: "YYYY-MM-DD"
     ) -> Result<TickDataBuffer, DataError> {
-        let cache_key = format!("{}_{}_ticks.parquet", symbol, date);
+        let normalized_symbol = self.symbol_resolver.normalize(symbol, None);
+        let cache_key = self.symbol_resolver.tick_cache_key(&normalized_symbol, date);
         let cache_path = self.cache_dir.join(&cache_key);
-        let download_key = format!("ticks:{}_{}", symbol, date);
+        let download_key = self.symbol_resolver.download_key("ticks", &normalized_symbol, date, None);
         
         // Try loading from cache first
         if cache_path.exists() {
@@ -156,15 +159,14 @@ impl HistoricalDownloadExecutor {
         }
 
         // Download through exchange adapter
-        // TODO: Determine exchange from symbol - for now, assume Binance Spot
-        let exchange = Exchange::BinanceSpot;
+        let exchange = self.symbol_resolver.infer_exchange(&normalized_symbol);
         let adapter = self.adapter_registry
             .get_or_err(exchange)
             .map_err(|e| DataError::InvalidInput(format!("No adapter found: {}", e).to_string()))?;
         
         let historical_data = adapter
             .fetch_historical_data(
-                symbol,
+                &normalized_symbol,
                 date,
                 HistoricalDataType::Tick,
             )
