@@ -377,8 +377,10 @@ impl RealtimeDataService {
         
         let index = store.index();
         
-        log::debug!("fetch_ticks_blocking: index has {} entries, querying range {} - {} us", 
-            index.len(), range.start_us, range.end_us);
+        log::debug!(
+            "[fetch_ticks_blocking] Index has {} entries, querying range {} - {} us ({} - {} ms)", 
+            index.len(), range.start_us, range.end_us, range.start_us / 1_000, range.end_us / 1_000
+        );
 
         // Find the first data block that *could* contain data for our time range.
         // partition_point returns the index where entry.key_hash() >= range.start_us

@@ -433,10 +433,18 @@ impl ChartState {
         match self.basis {
             Basis::Time(_) => {
                 let region = self.visible_region(self.bounds.size());
-                let (start, end) = self.interval_range(&region);
+                let (start_ms, end_ms) = self.interval_range(&region);
+                let start_us = start_ms.checked_mul(1_000).unwrap_or(0);
+                let end_us = end_ms.checked_mul(1_000).unwrap_or(0);
+                
+                log::debug!(
+                    "[visible_time_range_us] Calculated time range: {} - {} ms ({} - {} us), latest_x: {} ms, region: x={}, width={}",
+                    start_ms, end_ms, start_us, end_us, self.latest_x, region.x, region.width
+                );
+                
                 Some(data::TimeRange {
-                    start_us: start.checked_mul(1_000).unwrap_or(0), // Convert ms to microseconds
-                    end_us: end.checked_mul(1_000).unwrap_or(0),
+                    start_us,
+                    end_us,
                 })
             }
             _ => None,
@@ -461,14 +469,24 @@ impl ChartState {
     pub fn x_to_interval(&self, x: f32) -> u64 {
         match self.basis {
             Basis::Time(timeframe) => {
-                let interval = timeframe.to_milliseconds();
-                if x <= 0.0 {
-                    let diff = (-x / self.cell_width * interval as f32) as u64;
-                    self.latest_x.saturating_sub(diff)
-                } else {
-                    let diff = (x / self.cell_width * interval as f32) as u64;
-                    self.latest_x.saturating_add(diff)
-                }
+                // CRITICAL: x_to_interval must match the inverse of interval_to_x
+                // interval_to_x: x_chart = (t - latest_x) / interval * cell_width
+                // Note: x is already in chart coordinates (from visible_region)
+                // So: t = latest_x + (x_chart / cell_width) * interval
+                
+                let interval = timeframe.to_milliseconds() as f64;
+                let cell_width = self.cell_width as f64;
+                
+                // x is already in chart coordinates, so we can directly convert
+                let diff_ms = (x as f64 / cell_width * interval) as i64;
+                let result = (self.latest_x as i64 + diff_ms) as u64;
+                
+                log::debug!(
+                    "[x_to_interval] x={} (chart coord), diff_ms={}, latest_x={} ms, result={} ms",
+                    x, diff_ms, self.latest_x, result
+                );
+                
+                result
             }
             Basis::Tick(_) => {
                 let tick = -(x / self.cell_width);

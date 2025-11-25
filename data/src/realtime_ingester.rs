@@ -159,6 +159,7 @@ impl RealtimeIngesterService {
         writer.write_indices();
         info!("[ensure_mmap_file] Indices written successfully");
         
+        writer.flush_index(); // Ensure all pending index updates are written
         drop(writer); // Close the file
         info!("[ensure_mmap_file] File writer dropped, file should be closed");
         
@@ -645,7 +646,12 @@ struct MmapWriter {
     index_entries: Vec<IndexEntry>,
     payload_start_offset: usize,
     current_payload_offset: usize,
+    pending_index_updates: usize, // Track number of chunks since last index update
+    last_index_update: std::time::Instant, // Track time since last index update
 }
+
+const INDEX_UPDATE_BATCH_SIZE: usize = 10; // Update index every N chunks
+const INDEX_UPDATE_INTERVAL_SECS: u64 = 1; // Update index at least every N seconds
 
 impl MmapWriter {
     fn open_or_create(path: &str) -> (Self, Option<u64>) {
@@ -784,6 +790,8 @@ impl MmapWriter {
                         index_entries,
                         payload_start_offset: expected_payload_start,
                         current_payload_offset,
+                        pending_index_updates: 0,
+                        last_index_update: std::time::Instant::now(),
                     }, last_timestamp)
                 } else {
                     warn!("Failed to read indices, re-creating file.");
@@ -845,6 +853,8 @@ impl MmapWriter {
             index_entries: Vec::new(),
             payload_start_offset: payload_start,
             current_payload_offset: 0,
+            pending_index_updates: 0,
+            last_index_update: std::time::Instant::now(),
         };
         info!("[MmapWriter::create_new] MmapWriter instance created successfully");
         writer
@@ -1002,11 +1012,33 @@ impl MmapWriter {
 
         self.index_entries.sort_by_key(|e| e.key_hash);
         
-        self.write_indices();
-        self.write_header();
+        // Batch index updates: only update every N chunks or every N seconds
+        self.pending_index_updates += 1;
+        let should_update = self.pending_index_updates >= INDEX_UPDATE_BATCH_SIZE ||
+            self.last_index_update.elapsed().as_secs() >= INDEX_UPDATE_INTERVAL_SECS;
         
-        self.file.sync_all().unwrap();
-        info!("Appended chunk: {} trades.", trades.len());
+        if should_update {
+            self.write_indices();
+            self.write_header();
+            self.file.sync_all().unwrap();
+            self.pending_index_updates = 0;
+            self.last_index_update = std::time::Instant::now();
+        }
+        
+        info!("Appended chunk: {} trades. Pending index updates: {}", trades.len(), self.pending_index_updates);
+    }
+    
+    /// Force flush pending index updates to disk
+    fn flush_index(&mut self) {
+        if self.pending_index_updates > 0 {
+            let pending_count = self.pending_index_updates;
+            self.write_indices();
+            self.write_header();
+            self.file.sync_all().unwrap();
+            self.pending_index_updates = 0;
+            self.last_index_update = std::time::Instant::now();
+            info!("[MmapWriter::flush_index] Flushed {} pending index updates", pending_count);
+        }
     }
 }
 

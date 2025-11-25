@@ -278,6 +278,11 @@ impl KlineRenderer {
             let base_diff = self.base_time_ms - latest_x;
             let transform_y = ((base_diff * scale_factor) as f32 * state.scaling) + (state.translation.x * state.scaling);
             
+            log::debug!(
+                "[KlineRenderer::prepare] Transform params: base_time_ms={} ms, latest_x={} ms, base_diff={} ms, transform_x={}, transform_y={}, interval={} ms, cell_width={}, scaling={}",
+                self.base_time_ms, latest_x, base_diff, transform_x, transform_y, interval_ms, cell_width, state.scaling
+            );
+            
             // Y Transform Logic from chart.rs:
             // y_chart = (base_price - price) / tick * cell
             // y_screen = (y_chart + translation.y) * scaling + H/2
