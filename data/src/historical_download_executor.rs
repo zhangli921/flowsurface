@@ -63,62 +63,49 @@ impl HistoricalDownloadExecutor {
         date: &str, // Format: "YYYY-MM-DD"
         timeframe: &str, // e.g., "1m", "5m", "1h"
     ) -> Result<Vec<KLine>, DataError> {
-        log::info!("[DownloadExecutor] Starting K-line download: {} {} {}", symbol, date, timeframe);
-        // 1. Check if cache already exists
         let cache_key = format!("{}_{}_{}.parquet", symbol, date, timeframe);
         let cache_path = self.cache_dir.join(&cache_key);
+        let download_key = format!("kline:{}_{}_{}", symbol, date, timeframe);
         
+        // Try loading from cache first
         if cache_path.exists() {
-            log::info!("[DownloadExecutor] Cache exists, loading from cache: {}", cache_path.display());
-            // Cache already exists, load from cache
+            log::debug!("[DownloadExecutor] Loading from cache: {}", cache_path.display());
             return self.load_klines_from_cache(&cache_path).await;
         }
-        
-        log::info!("[DownloadExecutor] Cache not found, downloading from Binance Data Vision...");
 
-        // 2. Check if download is already in progress (prevent duplicate downloads)
-        let download_key = format!("kline:{}_{}_{}", symbol, date, timeframe);
+        // Wait for concurrent download or start new one
+        if let Some(klines) = self.wait_for_concurrent_download_klines(&cache_path, &download_key).await {
+            return Ok(klines);
+        }
+
+        // Acquire download lock
         {
             let mut downloading = self.downloading.lock().await;
             if downloading.contains(&download_key) {
-                // Another task is already downloading this file, wait for it to complete
-                drop(downloading);
-                for _ in 0..30 {
-                    // Wait up to 3 seconds (30 * 100ms)
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    if cache_path.exists() {
-                        return self.load_klines_from_cache(&cache_path).await;
-                    }
+                return Err(DataError::InvalidInput("Download already in progress"));
+            }
+            downloading.insert(download_key.clone());
+        }
+
+        // Download
+        let result = self.download_kline_for_date(symbol, date, timeframe).await;
+
+        // Save to cache if successful
+        if let Ok(ref klines) = result {
+            if !klines.is_empty() {
+                if let Err(e) = self.save_klines_to_cache(&cache_path, klines).await {
+                    log::warn!("Failed to save klines to cache: {}", e);
                 }
-                // If still not available after waiting, proceed with download anyway
-            } else {
-                downloading.insert(download_key.clone());
             }
         }
 
-        // 3. Download from Binance Data Vision
-        let result = self.download_kline_for_date(symbol, date, timeframe).await;
-
-        // 4. Write to cache if download succeeded
-        let klines = match result {
-            Ok(klines) => {
-                if !klines.is_empty() {
-                    if let Err(e) = self.save_klines_to_cache(&cache_path, &klines).await {
-                        log::warn!("Failed to save klines to cache: {}", e);
-                    }
-                }
-                Ok(klines)
-            }
-            Err(e) => Err(e),
-        };
-
-        // 5. Remove from downloading set
+        // Release lock
         {
             let mut downloading = self.downloading.lock().await;
             downloading.remove(&download_key);
         }
 
-        klines
+        result
     }
 
     /// Downloads historical Tick data for a specific date and writes it to cache.
@@ -127,61 +114,48 @@ impl HistoricalDownloadExecutor {
         symbol: &str,
         date: &str, // Format: "YYYY-MM-DD"
     ) -> Result<TickDataBuffer, DataError> {
-        log::info!("[DownloadExecutor] Starting tick download: {} {}", symbol, date);
-        // 1. Check if cache already exists
         let cache_key = format!("{}_{}_ticks.parquet", symbol, date);
         let cache_path = self.cache_dir.join(&cache_key);
+        let download_key = format!("ticks:{}_{}", symbol, date);
         
+        // Try loading from cache first
         if cache_path.exists() {
-            // Cache already exists, load from cache
             return self.load_ticks_from_cache(&cache_path).await;
         }
 
-        // 2. Check if download is already in progress (prevent duplicate downloads)
-        let download_key = format!("ticks:{}_{}", symbol, date);
+        // Wait for concurrent download or start new one
+        if let Some(ticks) = self.wait_for_concurrent_download_ticks(&cache_path, &download_key).await {
+            return Ok(ticks);
+        }
+
+        // Acquire download lock
         {
             let mut downloading = self.downloading.lock().await;
             if downloading.contains(&download_key) {
-                // Another task is already downloading this file, wait for it to complete
-                // by checking cache periodically
-                drop(downloading);
-                for _ in 0..30 {
-                    // Wait up to 3 seconds (30 * 100ms)
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    if cache_path.exists() {
-                        return self.load_ticks_from_cache(&cache_path).await;
-                    }
+                return Err(DataError::InvalidInput("Download already in progress"));
+            }
+            downloading.insert(download_key.clone());
+        }
+
+        // Download
+        let result = self.download_ticks_for_date(symbol, date).await;
+
+        // Save to cache if successful
+        if let Ok(ref ticks) = result {
+            if !ticks.prices.is_empty() {
+                if let Err(e) = self.save_ticks_to_cache(&cache_path, ticks).await {
+                    log::warn!("Failed to save ticks to cache: {}", e);
                 }
-                // If still not available after waiting, proceed with download anyway
-                // (the other download might have failed)
-            } else {
-                downloading.insert(download_key.clone());
             }
         }
 
-        // 3. Download from Binance Data Vision
-        let result = self.download_ticks_for_date(symbol, date).await;
-
-        // 4. Write to cache if download succeeded
-        let ticks = match result {
-            Ok(ticks) => {
-                if !ticks.prices.is_empty() {
-                    if let Err(e) = self.save_ticks_to_cache(&cache_path, &ticks).await {
-                        log::warn!("Failed to save ticks to cache: {}", e);
-                    }
-                }
-                Ok(ticks)
-            }
-            Err(e) => Err(e),
-        };
-
-        // 5. Remove from downloading set
+        // Release lock
         {
             let mut downloading = self.downloading.lock().await;
             downloading.remove(&download_key);
         }
 
-        ticks
+        result
     }
 
     /// Downloads K-line data for a specific date from Binance Data Vision.
@@ -788,5 +762,61 @@ fn record_batch_to_ticks(batch: &RecordBatch) -> Result<TickDataBuffer, DataErro
         volumes,
         time_range,
     })
+}
+
+impl HistoricalDownloadExecutor {
+    /// Waits for a concurrent download to complete, or returns None if no concurrent download.
+    async fn wait_for_concurrent_download_klines(
+        &self,
+        cache_path: &Path,
+        download_key: &str,
+    ) -> Option<Vec<KLine>> {
+        let is_downloading = {
+            let downloading = self.downloading.lock().await;
+            downloading.contains(download_key)
+        };
+
+        if !is_downloading {
+            return None;
+        }
+
+        // Wait for concurrent download to complete
+        for _ in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if cache_path.exists() {
+                if let Ok(klines) = self.load_klines_from_cache(cache_path).await {
+                    return Some(klines);
+                }
+            }
+        }
+        None
+    }
+
+    /// Waits for a concurrent download to complete, or returns None if no concurrent download.
+    async fn wait_for_concurrent_download_ticks(
+        &self,
+        cache_path: &Path,
+        download_key: &str,
+    ) -> Option<TickDataBuffer> {
+        let is_downloading = {
+            let downloading = self.downloading.lock().await;
+            downloading.contains(download_key)
+        };
+
+        if !is_downloading {
+            return None;
+        }
+
+        // Wait for concurrent download to complete
+        for _ in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            if cache_path.exists() {
+                if let Ok(ticks) = self.load_ticks_from_cache(cache_path).await {
+                    return Some(ticks);
+                }
+            }
+        }
+        None
+    }
 }
 

@@ -5,7 +5,6 @@
 //! based on the requested time range and the dynamic time boundary (safe_cutoff).
 
 use std::sync::Arc;
-use chrono::Utc;
 
 use crate::{
     data_error::DataError,
@@ -13,6 +12,7 @@ use crate::{
     historical_data_service::HistoricalDataService,
     kline::KLine,
     compute::vp::TickDataBuffer,
+    time_utils::calculate_safe_historical_cutoff,
 };
 
 /// Unified data service that automatically selects data sources.
@@ -212,40 +212,6 @@ impl UnifiedDataService {
                 time_range: merged_time_range,
             })
         }
-    }
-}
-
-/// Calculates the safe historical data cutoff time.
-///
-/// This function considers the Binance Data Vision publication delay (typically 2-6 hours)
-/// and returns a timestamp that represents the boundary between real-time and historical data.
-fn calculate_safe_historical_cutoff() -> u64 {
-    let now = Utc::now();
-    let today = now.date_naive();
-    let midnight = today.and_hms_opt(0, 0, 0).unwrap();
-    let midnight_utc = midnight.and_utc();
-    let cutoff = midnight_utc.timestamp_micros() as u64;
-
-    // Calculate hours since midnight (in microseconds, then convert to hours)
-    // timestamp_micros() returns i64, convert to u64 safely
-    let now_micros = now.timestamp_micros() as u64;
-    let hours_since_midnight = if now_micros >= cutoff {
-        (now_micros - cutoff) / 3_600_000_000
-    } else {
-        // This shouldn't happen (now should always be >= midnight), but handle it gracefully
-        24 // Force use of yesterday's boundary
-    };
-    
-    
-    if hours_since_midnight < 6 {
-        // Use previous day's boundary (historical data may not be published yet)
-        let yesterday = today.pred_opt().unwrap_or(today);
-        let yesterday_midnight = yesterday.and_hms_opt(0, 0, 0).unwrap();
-        let yesterday_cutoff = yesterday_midnight.and_utc().timestamp_micros() as u64;
-        yesterday_cutoff
-    } else {
-        // Use today's boundary (historical data should be published)
-        cutoff
     }
 }
 

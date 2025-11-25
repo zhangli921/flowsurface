@@ -131,7 +131,7 @@ impl HistoricalDownloadCoordinator {
             availability_index,
             executor,
             event_bus,
-            max_concurrent_downloads: 5,
+            max_concurrent_downloads: 1,
             current_downloads: Arc::new(Mutex::new(HashSet::new())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         }

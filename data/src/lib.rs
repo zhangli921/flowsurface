@@ -20,6 +20,7 @@ pub mod realtime_ingester;
 pub mod tickers_table;
 pub mod unified_data_service;
 pub mod util;
+pub mod time_utils;
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -45,6 +46,7 @@ pub use layout::{Dashboard, Layout, Pane};
 pub use realtime_data_service::{RealtimeDataService, TimeRange};
 pub use realtime_ingester::{RealtimeIngesterService, IngestCommand};
 pub use unified_data_service::UnifiedDataService;
+pub use time_utils::{calculate_date_range, calculate_safe_historical_cutoff, filter_historical_dates};
 
 pub const SAVED_STATE_PATH: &str = "saved-state.json";
 
