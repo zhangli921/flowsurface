@@ -20,6 +20,8 @@ pub struct ComputeParams {
 pub struct TickDataBuffer {
     pub prices: Vec<u32>,  // Fixed-point price * 100, using u32 instead of u64 for WGSL compatibility
     pub volumes: Vec<f32>,
+    // Time range covered by the data (for validation)
+    pub time_range: Option<(u64, u64)>, // (start_us, end_us) - None if timestamps not tracked
 }
 
 #[derive(Debug, Clone, Copy)]

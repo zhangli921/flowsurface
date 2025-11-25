@@ -340,6 +340,48 @@ impl Flowsurface {
                             },
                         };
                         
+                        // CRITICAL: Verify data completeness before computing VP
+                        // Check if the tick data covers the requested time range
+                        let data_complete = if let Some((actual_start, actual_end)) = ticks.time_range {
+                            // Calculate the overlap between requested and actual ranges
+                            let overlap_start = actual_start.max(range.start_us);
+                            let overlap_end = actual_end.min(range.end_us);
+                            
+                            // Check if there's meaningful overlap
+                            if overlap_start >= overlap_end {
+                                // No overlap at all
+                                false
+                            } else {
+                                let requested_span = range.end_us.saturating_sub(range.start_us);
+                                let overlap_span = overlap_end.saturating_sub(overlap_start);
+                                
+                                // Require at least 50% overlap with requested range
+                                // This allows VP computation even if historical data is missing
+                                if requested_span > 0 {
+                                    let overlap_ratio = overlap_span as f64 / requested_span as f64;
+                                    overlap_ratio >= 0.5 // At least 50% overlap
+                                } else {
+                                    true
+                                }
+                            }
+                        } else {
+                            // If time_range is None (old cache files or data without timestamps), we can't verify completeness
+                            // Proceed with computation (old data format is still valid)
+                            true
+                        };
+                        
+                        if !data_complete {
+                            log::warn!(
+                                "VP computation skipped for {}: Data incomplete. Requested: {} - {} us, Actual: {:?}",
+                                symbol_clone, range.start_us, range.end_us, ticks.time_range
+                            );
+                            return Message::VpComputed(symbol_clone.clone(), Err(
+                                data::compute::vp::ComputeError::Other(
+                                    format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us)
+                                )
+                            ));
+                        }
+                        
                         // Calculate compute parameters
                         let num_ticks = ticks.prices.len() as u32;
                         if num_ticks == 0 {
@@ -379,18 +421,30 @@ impl Flowsurface {
                             if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
                                 chart.set_volume_profile(profile);
                             } else {
-                                log::warn!("Pane content is not Kline or chart is None");
+                                // Chart not found or not a Kline chart
                             }
                         } else {
-                            log::warn!("No chart found for symbol {} to store VP data", symbol);
+                            // Pane not found
                         }
                     }
                     Err(e) => {
-                        log::error!("Volume Profile computation failed for {}: {}", symbol, e);
-                        self.notifications.push(Toast::error(format!(
-                            "VP Compute Failed for {}: {}",
-                            symbol, e
-                        )));
+                        // VP computation failed - check if it's due to incomplete data
+                        let error_msg = e.to_string();
+                        let is_data_incomplete = error_msg.contains("incomplete") || error_msg.contains("No ticks found");
+                        
+                        if is_data_incomplete {
+                            // Mark VP as needing update so it will retry when data is available
+                            let dashboard = self.active_dashboard_mut();
+                            if let Some(pane) = dashboard.find_pane_by_symbol(&symbol) {
+                                if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
+                                    // Re-enable VP update flag so it will retry
+                                    chart.mark_vp_needs_update();
+                                }
+                            }
+                        } else {
+                            // Other errors (GPU, computation, etc.) - log but don't retry
+                            log::warn!("VP computation failed for {}: {}", symbol, e);
+                        }
                     }
                 }
             }
@@ -600,8 +654,8 @@ impl Flowsurface {
                                             .map(move |msg| Message::Dashboard(None, msg))
                                     }
                                 }
-                                Err(err) => {
-                                    log::warn!("{err}",);
+                                Err(_err) => {
+                                    // Failed to resolve persisted stream (e.g., TickerInfo not found) - silently ignore
                                     Task::none()
                                 }
                             }

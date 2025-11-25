@@ -8,10 +8,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::io::{Cursor, Read};
+use std::collections::HashSet;
 use tokio::fs::{self, File as TokioFile};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use reqwest::Client;
-use arrow::array::{ArrayRef, Float64Array, TimestampMicrosecondArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, Float64Array, TimestampMicrosecondArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -26,6 +28,8 @@ use crate::{data_error::DataError, data_path, kline::KLine, compute::vp::TickDat
 pub struct HistoricalIngesterService {
     client: Client,
     pub(crate) cache_dir: PathBuf,
+    // Track ongoing downloads to prevent duplicate concurrent downloads
+    downloading: Arc<Mutex<HashSet<String>>>,
 }
 
 impl HistoricalIngesterService {
@@ -35,6 +39,7 @@ impl HistoricalIngesterService {
         Self {
             client: Client::new(),
             cache_dir,
+            downloading: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -47,22 +52,56 @@ impl HistoricalIngesterService {
     ) -> Result<Vec<KLine>, DataError> {
         // 1. Check if cache already exists
         let cache_key = format!("{}_{}_{}.parquet", symbol, date, timeframe);
-        let cache_path = self.cache_dir.join(cache_key);
+        let cache_path = self.cache_dir.join(&cache_key);
         
         if cache_path.exists() {
             // Cache already exists, load from cache
             return self.load_klines_from_cache(&cache_path).await;
         }
 
-        // 2. Download from Binance Data Vision
-        let klines = self.download_kline_for_date(symbol, date, timeframe).await?;
-
-        // 3. Write to cache
-        if !klines.is_empty() {
-            self.save_klines_to_cache(&cache_path, &klines).await?;
+        // 2. Check if download is already in progress (prevent duplicate downloads)
+        let download_key = format!("kline:{}_{}_{}", symbol, date, timeframe);
+        {
+            let mut downloading = self.downloading.lock().await;
+            if downloading.contains(&download_key) {
+                // Another task is already downloading this file, wait for it to complete
+                drop(downloading);
+                for _ in 0..30 {
+                    // Wait up to 3 seconds (30 * 100ms)
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if cache_path.exists() {
+                        return self.load_klines_from_cache(&cache_path).await;
+                    }
+                }
+                // If still not available after waiting, proceed with download anyway
+            } else {
+                downloading.insert(download_key.clone());
+            }
         }
 
-        Ok(klines)
+        // 3. Download from Binance Data Vision
+        let result = self.download_kline_for_date(symbol, date, timeframe).await;
+
+        // 4. Write to cache if download succeeded
+        let klines = match result {
+            Ok(klines) => {
+                if !klines.is_empty() {
+                    if let Err(e) = self.save_klines_to_cache(&cache_path, &klines).await {
+                        log::warn!("Failed to save klines to cache: {}", e);
+                    }
+                }
+                Ok(klines)
+            }
+            Err(e) => Err(e),
+        };
+
+        // 5. Remove from downloading set
+        {
+            let mut downloading = self.downloading.lock().await;
+            downloading.remove(&download_key);
+        }
+
+        klines
     }
 
     /// Downloads historical Tick data for a specific date and writes it to cache.
@@ -73,22 +112,58 @@ impl HistoricalIngesterService {
     ) -> Result<TickDataBuffer, DataError> {
         // 1. Check if cache already exists
         let cache_key = format!("{}_{}_ticks.parquet", symbol, date);
-        let cache_path = self.cache_dir.join(cache_key);
+        let cache_path = self.cache_dir.join(&cache_key);
         
         if cache_path.exists() {
             // Cache already exists, load from cache
             return self.load_ticks_from_cache(&cache_path).await;
         }
 
-        // 2. Download from Binance Data Vision
-        let ticks = self.download_ticks_for_date(symbol, date).await?;
-
-        // 3. Write to cache
-        if !ticks.prices.is_empty() {
-            self.save_ticks_to_cache(&cache_path, &ticks).await?;
+        // 2. Check if download is already in progress (prevent duplicate downloads)
+        let download_key = format!("ticks:{}_{}", symbol, date);
+        {
+            let mut downloading = self.downloading.lock().await;
+            if downloading.contains(&download_key) {
+                // Another task is already downloading this file, wait for it to complete
+                // by checking cache periodically
+                drop(downloading);
+                for _ in 0..30 {
+                    // Wait up to 3 seconds (30 * 100ms)
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if cache_path.exists() {
+                        return self.load_ticks_from_cache(&cache_path).await;
+                    }
+                }
+                // If still not available after waiting, proceed with download anyway
+                // (the other download might have failed)
+            } else {
+                downloading.insert(download_key.clone());
+            }
         }
 
-        Ok(ticks)
+        // 3. Download from Binance Data Vision
+        let result = self.download_ticks_for_date(symbol, date).await;
+
+        // 4. Write to cache if download succeeded
+        let ticks = match result {
+            Ok(ticks) => {
+                if !ticks.prices.is_empty() {
+                    if let Err(e) = self.save_ticks_to_cache(&cache_path, &ticks).await {
+                        log::warn!("Failed to save ticks to cache: {}", e);
+                    }
+                }
+                Ok(ticks)
+            }
+            Err(e) => Err(e),
+        };
+
+        // 5. Remove from downloading set
+        {
+            let mut downloading = self.downloading.lock().await;
+            downloading.remove(&download_key);
+        }
+
+        ticks
     }
 
     /// Downloads K-line data for a specific date from Binance Data Vision.
@@ -127,7 +202,7 @@ impl HistoricalIngesterService {
             symbol, interval, symbol, interval, date
         );
 
-        log::info!("Downloading K-line data from Binance Data Vision: {}", url);
+        // Downloading K-line data from Binance Data Vision
 
         // Download ZIP file
         let response = self.client.get(&url).send().await?;
@@ -223,7 +298,6 @@ impl HistoricalIngesterService {
             });
         }
 
-        log::info!("Downloaded {} K-lines for {}/{}/{}", klines.len(), symbol, timeframe, date);
         Ok(klines)
     }
 
@@ -239,7 +313,7 @@ impl HistoricalIngesterService {
             symbol, symbol, date
         );
 
-        log::info!("Downloading Tick data from Binance Data Vision: {}", url);
+        // Downloading Tick data from Binance Data Vision (logged only on first attempt per date)
 
         // Download ZIP file
         let response = self.client.get(&url).send().await?;
@@ -254,6 +328,7 @@ impl HistoricalIngesterService {
                 return Ok(TickDataBuffer {
                     prices: Vec::new(),
                     volumes: Vec::new(),
+                    time_range: None,
                 });
             }
             return Err(DataError::Network(
@@ -285,6 +360,8 @@ impl HistoricalIngesterService {
         let mut reader = csv::Reader::from_reader(csv_content.as_bytes());
         let mut prices = Vec::new();
         let mut volumes = Vec::new();
+        let mut min_timestamp: Option<u64> = None;
+        let mut max_timestamp: Option<u64> = None;
 
         for result in reader.records() {
             let record = result?;
@@ -296,11 +373,17 @@ impl HistoricalIngesterService {
                 .ok_or_else(|| DataError::InvalidInput("Missing price"))?;
             let quantity_str = record.get(2)
                 .ok_or_else(|| DataError::InvalidInput("Missing quantity"))?;
+            let timestamp_str = record.get(5)
+                .ok_or_else(|| DataError::InvalidInput("Missing timestamp"))?;
 
             let price: f64 = price_str.parse()
                 .map_err(|_| DataError::InvalidInput("Invalid price"))?;
             let quantity: f64 = quantity_str.parse()
                 .map_err(|_| DataError::InvalidInput("Invalid quantity"))?;
+            // Timestamp is in milliseconds, convert to microseconds
+            let timestamp_ms: u64 = timestamp_str.parse()
+                .map_err(|_| DataError::InvalidInput("Invalid timestamp"))?;
+            let timestamp_us = timestamp_ms * 1_000;
 
             // Convert price to fixed-point u32 (price * 100)
             // Note: This matches the TickDataBuffer format used in VP computation
@@ -308,10 +391,28 @@ impl HistoricalIngesterService {
             
             prices.push(price_fixed);
             volumes.push(quantity as f32);
+            
+            // Track time range
+            if min_timestamp.is_none() || timestamp_us < min_timestamp.unwrap() {
+                min_timestamp = Some(timestamp_us);
+            }
+            if max_timestamp.is_none() || timestamp_us > max_timestamp.unwrap() {
+                max_timestamp = Some(timestamp_us);
+            }
         }
 
-        log::info!("Downloaded {} ticks for {}/{}", prices.len(), symbol, date);
-        Ok(TickDataBuffer { prices, volumes })
+        // Calculate time range from timestamps
+        let time_range = if let (Some(min), Some(max)) = (min_timestamp, max_timestamp) {
+            Some((min, max))
+        } else {
+            None
+        };
+        
+        Ok(TickDataBuffer { 
+            prices, 
+            volumes,
+            time_range,
+        })
     }
 
     /// Saves K-line data to cache.
@@ -405,6 +506,7 @@ impl HistoricalIngesterService {
         let mut all_ticks = TickDataBuffer {
             prices: Vec::new(),
             volumes: Vec::new(),
+            time_range: None,
         };
         if let Some(batch_result) = reader.next() {
             let batch = batch_result?;
@@ -531,12 +633,22 @@ fn record_batch_to_klines(batch: &RecordBatch) -> Result<Vec<KLine>, DataError> 
 
 /// Converts TickDataBuffer to Arrow RecordBatch.
 fn ticks_to_record_batch(ticks: &TickDataBuffer) -> Result<RecordBatch, DataError> {
-    let schema = Arc::new(Schema::new(vec![
+    // Include time_range metadata in the schema (only if data is not empty)
+    let mut schema_fields = vec![
         Field::new("price", DataType::UInt32, false), // TickDataBuffer uses u32 for prices
         Field::new("volume", DataType::Float32, false), // TickDataBuffer uses f32 for volumes
-    ]));
+    ];
+    
+    // Add time_range metadata fields if available and data is not empty
+    let has_time_range = ticks.time_range.is_some() && !ticks.prices.is_empty();
+    if has_time_range {
+        schema_fields.push(Field::new("time_range_start_us", DataType::UInt64, true)); // Nullable
+        schema_fields.push(Field::new("time_range_end_us", DataType::UInt64, true)); // Nullable
+    }
+    
+    let schema = Arc::new(Schema::new(schema_fields));
 
-    use arrow::array::{UInt32Array, Float32Array};
+    use arrow::array::{UInt32Array, Float32Array, UInt64Array};
     let mut price_builder = UInt32Array::builder(ticks.prices.len());
     let mut volume_builder = Float32Array::builder(ticks.volumes.len());
 
@@ -545,17 +657,36 @@ fn ticks_to_record_batch(ticks: &TickDataBuffer) -> Result<RecordBatch, DataErro
         volume_builder.append_value(*volume);
     }
 
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = vec![
         Arc::new(price_builder.finish()),
         Arc::new(volume_builder.finish()),
     ];
+    
+    // Add time_range metadata if available (store only in first row, rest are null)
+    if has_time_range {
+        let (start, end) = ticks.time_range.unwrap();
+        let num_rows = ticks.prices.len();
+        let mut start_builder = UInt64Array::builder(num_rows);
+        let mut end_builder = UInt64Array::builder(num_rows);
+        
+        // Store time_range only in first row, rest are null
+        start_builder.append_value(start);
+        end_builder.append_value(end);
+        for _ in 1..num_rows {
+            start_builder.append_null();
+            end_builder.append_null();
+        }
+        
+        columns.push(Arc::new(start_builder.finish()));
+        columns.push(Arc::new(end_builder.finish()));
+    }
 
     Ok(RecordBatch::try_new(schema, columns)?)
 }
 
 /// Converts Arrow RecordBatch to TickDataBuffer.
 fn record_batch_to_ticks(batch: &RecordBatch) -> Result<TickDataBuffer, DataError> {
-    use arrow::array::{UInt32Array, Float32Array};
+    use arrow::array::{UInt32Array, Float32Array, UInt64Array};
     let price_array = batch
         .column_by_name("price")
         .ok_or(DataError::InvalidInput("Missing 'price' column"))?
@@ -577,6 +708,35 @@ fn record_batch_to_ticks(batch: &RecordBatch) -> Result<TickDataBuffer, DataErro
         volumes.push(volume_array.value(i));
     }
     
-    Ok(TickDataBuffer { prices, volumes })
+    // Try to restore time_range from metadata columns (if present)
+    // Time range is stored in the first row, rest are null
+    let time_range = if let (Some(start_col), Some(end_col)) = (
+        batch.column_by_name("time_range_start_us"),
+        batch.column_by_name("time_range_end_us"),
+    ) {
+        let start_array = start_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or(DataError::InvalidInput("Invalid 'time_range_start_us' column type"))?;
+        let end_array = end_col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or(DataError::InvalidInput("Invalid 'time_range_end_us' column type"))?;
+        
+        // Read from first row (where time_range is stored)
+        if start_array.len() > 0 && end_array.len() > 0 && start_array.is_valid(0) && end_array.is_valid(0) {
+            Some((start_array.value(0), end_array.value(0)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    Ok(TickDataBuffer { 
+        prices, 
+        volumes,
+        time_range,
+    })
 }
 

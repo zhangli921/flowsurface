@@ -117,25 +117,14 @@ impl RealtimeIngesterService {
     pub fn ensure_mmap_file(symbol: &str, data_dir: &PathBuf) {
         let normalized_symbol = normalize_binance_symbol(symbol);
         let mmap_path = data_dir.join(format!("{}.mmap", normalized_symbol));
-        info!("[ensure_mmap_file] CALLED for symbol '{}' (normalized: '{}') at {:?}", symbol, normalized_symbol, mmap_path);
-        
-        // Check if file already exists
-        let file_exists_before = mmap_path.exists();
-        if file_exists_before {
-            info!("[ensure_mmap_file] File already exists at {:?}, will verify/update it", mmap_path);
-        } else {
-            info!("[ensure_mmap_file] File does NOT exist, will create new file at {:?}", mmap_path);
-        }
         
         // Ensure parent directory exists
         if let Some(parent) = mmap_path.parent() {
             if !parent.exists() {
-                info!("[ensure_mmap_file] Creating parent directory: {:?}", parent);
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     error!("[ensure_mmap_file] FAILED to create parent directory {:?}: {}", parent, e);
                     return;
                 }
-                info!("[ensure_mmap_file] Successfully created parent directory: {:?}", parent);
             }
         }
         
@@ -147,31 +136,14 @@ impl RealtimeIngesterService {
             }
         };
         
-        info!("[ensure_mmap_file] Calling MmapWriter::open_or_create for: {}", mmap_path_str);
-        let (mut writer, last_timestamp) = MmapWriter::open_or_create(mmap_path_str);
-        info!("[ensure_mmap_file] MmapWriter::open_or_create completed. Last timestamp: {:?}", last_timestamp);
-        
-        info!("[ensure_mmap_file] Writing header...");
+        let (mut writer, _last_timestamp) = MmapWriter::open_or_create(mmap_path_str);
         writer.write_header();
-        info!("[ensure_mmap_file] Header written successfully");
-        
-        info!("[ensure_mmap_file] Writing indices...");
         writer.write_indices();
-        info!("[ensure_mmap_file] Indices written successfully");
-        
         writer.flush_index(); // Ensure all pending index updates are written
         drop(writer); // Close the file
-        info!("[ensure_mmap_file] File writer dropped, file should be closed");
         
         // Verify file exists after creation
-        let file_exists_after = mmap_path.exists();
-        if file_exists_after {
-            if let Ok(metadata) = std::fs::metadata(&mmap_path) {
-                info!("[ensure_mmap_file] SUCCESS: File created/verified at {:?}, size: {} bytes", mmap_path, metadata.len());
-            } else {
-                warn!("[ensure_mmap_file] File exists but cannot read metadata: {:?}", mmap_path);
-            }
-        } else {
+        if !mmap_path.exists() {
             error!("[ensure_mmap_file] FAILED: File does NOT exist after creation attempt: {:?}", mmap_path);
         }
     }
@@ -187,7 +159,6 @@ impl RealtimeIngesterService {
         while let Some(cmd) = self.command_rx.recv().await {
             match cmd {
                 IngestCommand::Subscribe(symbol, timeframe) => {
-                    info!("IngestCommand::Subscribe: {} (timeframe: {:?})", symbol, timeframe);
                     self.switch_symbol(&symbol, timeframe.as_deref()).await;
                 }
                 IngestCommand::Unsubscribe(symbol) => {
@@ -213,23 +184,15 @@ impl RealtimeIngesterService {
     }
 
     async fn switch_symbol(&mut self, symbol: &str, timeframe: Option<&str>) {
-        info!("[switch_symbol] CALLED for symbol: '{}', timeframe: {:?}", symbol, timeframe);
-        info!("[switch_symbol] Current active_symbol: {:?}", self.active_symbol);
-        info!("[switch_symbol] Data directory: {:?}", self.data_dir);
-        
         if self.active_symbol.as_deref() == Some(symbol) {
-            info!("[switch_symbol] Symbol '{}' is already active, skipping", symbol);
             return; // Already active
         }
         
-        info!("[switch_symbol] Stopping current task...");
         self.stop_current_task();
         
         // Pre-create the Mmap file synchronously before starting the async task
         // This ensures the file exists immediately when VP computation tries to read it
-        info!("[switch_symbol] Calling ensure_mmap_file for symbol: '{}'", symbol);
         Self::ensure_mmap_file(symbol, &self.data_dir);
-        info!("[switch_symbol] ensure_mmap_file completed for symbol: '{}'", symbol);
         
         let symbol_clone = symbol.to_string();
         let data_dir = self.data_dir.clone();
@@ -247,11 +210,8 @@ impl RealtimeIngesterService {
 }
 
 async fn run_ingest_task(symbol: String, data_dir: PathBuf, kline_cache: Option<Arc<KlineCache>>, timeframe: Option<String>) {
-    info!("Starting ingestion task for {}", symbol);
-    
     // Normalize symbol for Binance API (e.g., "ETH-USDT-SWAP" -> "ETHUSDT", "BTC" -> "BTCUSDT")
     let api_symbol = normalize_binance_symbol(&symbol);
-    info!("Normalized symbol: {} -> {}", symbol, api_symbol);
     
     // Use normalized symbol for filename to ensure consistency
     // This ensures VP computation can find the file using the same normalization
@@ -274,19 +234,13 @@ async fn run_ingest_task(symbol: String, data_dir: PathBuf, kline_cache: Option<
     }
 
     // 1. Initialize Mmap Writer
-    info!("[run_ingest_task] Calling MmapWriter::open_or_create for: {}", mmap_path_str);
     let (mut writer, last_timestamp) = MmapWriter::open_or_create(mmap_path_str);
-    info!("[run_ingest_task] MmapWriter::open_or_create completed, last_timestamp: {:?}", last_timestamp);
     
     // If file was newly created or recreated (last_timestamp is None), we need to write header and indices
     // This ensures the file has a valid structure even if it was empty or corrupted
     if last_timestamp.is_none() {
-        info!("[run_ingest_task] File is new or was recreated, writing header and indices...");
         writer.write_header();
         writer.write_indices();
-        info!("[run_ingest_task] Header and indices written successfully");
-    } else {
-        info!("[run_ingest_task] File exists with valid data, skipping header/indices write");
     }
     
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -477,7 +431,6 @@ async fn update_kline_cache_periodically(api_symbol: String, cache: Arc<KlineCac
                                 
                                 if !klines.is_empty() {
                                     cache.insert_many(&api_symbol, timeframe, &klines);
-                                    info!("[{}] Updated K-line cache: {} K-lines for timeframe {}", api_symbol, klines.len(), timeframe);
                                 }
                             }
                             Err(e) => {
@@ -655,44 +608,26 @@ const INDEX_UPDATE_INTERVAL_SECS: u64 = 1; // Update index at least every N seco
 
 impl MmapWriter {
     fn open_or_create(path: &str) -> (Self, Option<u64>) {
-        info!("[MmapWriter::open_or_create] CALLED for path: {}", path);
         let header_size = mem::size_of::<FileHeader>();
         let index_size = INDEX_CAPACITY * mem::size_of::<IndexEntry>();
         let expected_payload_start = header_size + index_size;
-        info!("[MmapWriter::open_or_create] Header size: {}, Index size: {}, Expected payload start: {}", header_size, index_size, expected_payload_start);
 
         // Ensure directory exists
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.exists() {
-                info!("[MmapWriter::open_or_create] Creating parent directory: {:?}", parent);
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     error!("[MmapWriter::open_or_create] FAILED to create parent directory {:?}: {}", parent, e);
                     panic!("Failed to create parent directory: {}", e);
                 }
-                info!("[MmapWriter::open_or_create] Parent directory created/verified: {:?}", parent);
-            } else {
-                info!("[MmapWriter::open_or_create] Parent directory exists: {:?}", parent);
             }
         }
 
-        // Check if file exists before opening
-        let file_exists_before = std::path::Path::new(path).exists();
-        if file_exists_before {
-            info!("[MmapWriter::open_or_create] File already exists: {}", path);
-        } else {
-            info!("[MmapWriter::open_or_create] File does NOT exist, will create: {}", path);
-        }
-
-        info!("[MmapWriter::open_or_create] Opening file with read+write+create flags...");
         let mut file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(path) {
-            Ok(f) => {
-                info!("[MmapWriter::open_or_create] File opened successfully: {}", path);
-                f
-            }
+            Ok(f) => f,
             Err(e) => {
                 error!("[MmapWriter::open_or_create] FAILED to open file {}: {}", path, e);
                 panic!("Failed to open file: {}", e);
@@ -700,11 +635,7 @@ impl MmapWriter {
         };
 
         let file_len = match file.metadata() {
-            Ok(meta) => {
-                let len = meta.len();
-                info!("[MmapWriter::open_or_create] File metadata retrieved, size: {} bytes", len);
-                len
-            }
+            Ok(meta) => meta.len(),
             Err(e) => {
                 error!("[MmapWriter::open_or_create] FAILED to get file metadata: {}", e);
                 panic!("Failed to get file metadata: {}", e);
@@ -714,7 +645,6 @@ impl MmapWriter {
 
         let (writer, last_timestamp_from_file) = if file_len >= header_size as u64 {
             // Try to read existing file
-            info!("[MmapWriter::open_or_create] File size ({}) >= header size ({}), reading existing file...", file_len, header_size);
             let mut header_buf = vec![0u8; header_size];
             file.read_exact(&mut header_buf).unwrap();
             
@@ -775,15 +705,11 @@ impl MmapWriter {
                             .expect("Failed to re-create file");
                         let mut writer = Self::create_new(new_file, expected_payload_start);
                         // Write header and indices for the recreated file
-                        info!("[MmapWriter::open_or_create] Writing header and indices for recreated file...");
                         writer.write_header();
                         writer.write_indices();
-                        info!("[MmapWriter::open_or_create] Header and indices written for recreated file");
                         return (writer, None);
                     }
                     
-                    info!("Resuming from existing file. Entries: {}, Last Time: {:?}, Payload offset: {}", 
-                        index_count, last_timestamp, current_payload_offset);
 
                     (Self {
                         file,
@@ -796,58 +722,45 @@ impl MmapWriter {
                 } else {
                     warn!("Failed to read indices, re-creating file.");
                     let mut writer = Self::create_new(file, expected_payload_start);
-                    info!("[MmapWriter::open_or_create] Writing header and indices after failed index read...");
                     writer.write_header();
                     writer.write_indices();
-                    info!("[MmapWriter::open_or_create] Header and indices written after failed index read");
                     (writer, None)
                 }
             } else {
                 warn!("Invalid magic/version, re-creating file.");
                 let mut writer = Self::create_new(file, expected_payload_start);
-                info!("[MmapWriter::open_or_create] Writing header and indices after invalid magic/version...");
                 writer.write_header();
                 writer.write_indices();
-                info!("[MmapWriter::open_or_create] Header and indices written after invalid magic/version");
                 (writer, None)
             }
         } else {
-            info!("[MmapWriter::open_or_create] File size ({}) < header size ({}), creating NEW file...", file_len, header_size);
             let mut writer = Self::create_new(file, expected_payload_start);
             // For newly created files, we need to write header and indices immediately
             // to ensure the file has a valid structure
-            info!("[MmapWriter::open_or_create] Writing header and indices for new file...");
             writer.write_header();
             writer.write_indices();
-            info!("[MmapWriter::open_or_create] Header and indices written for new file");
             (writer, None)
         };
         
-        info!("[MmapWriter::open_or_create] Returning writer, last_timestamp: {:?}", last_timestamp_from_file);
         (writer, last_timestamp_from_file)
     }
     
     fn create_new(mut file: File, payload_start: usize) -> Self {
-        info!("[MmapWriter::create_new] CALLED, payload_start: {}", payload_start);
-        info!("[MmapWriter::create_new] Truncating file to 0 length...");
         match file.set_len(0) {
-            Ok(_) => info!("[MmapWriter::create_new] File truncated successfully"),
+            Ok(_) => {},
             Err(e) => {
                 error!("[MmapWriter::create_new] FAILED to truncate file: {}", e);
                 panic!("Failed to truncate file: {}", e);
             }
         }
         
-        info!("[MmapWriter::create_new] Seeking to start of file...");
         match file.seek(SeekFrom::Start(0)) {
-            Ok(pos) => info!("[MmapWriter::create_new] Seeked to position: {}", pos),
+            Ok(_) => {},
             Err(e) => {
                 error!("[MmapWriter::create_new] FAILED to seek: {}", e);
                 panic!("Failed to seek: {}", e);
             }
         }
-        
-        info!("[MmapWriter::create_new] Creating new MmapWriter instance with empty index_entries");
         let writer = Self {
             file,
             index_entries: Vec::new(),
@@ -856,7 +769,6 @@ impl MmapWriter {
             pending_index_updates: 0,
             last_index_update: std::time::Instant::now(),
         };
-        info!("[MmapWriter::create_new] MmapWriter instance created successfully");
         writer
     }
 
@@ -1024,8 +936,8 @@ impl MmapWriter {
             self.file.sync_all().unwrap();
             self.pending_index_updates = 0;
             self.last_index_update = std::time::Instant::now();
-            info!("[MmapWriter::flush_index] Flushed {} pending index updates", pending_count);
         }
     }
 }
+
 

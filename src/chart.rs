@@ -403,8 +403,10 @@ impl ChartState {
     #[inline]
     fn price_unit() -> i64 { 10i64.pow(Price::PRICE_SCALE as u32) }
     pub fn visible_region(&self, size: Size) -> Rectangle {
-        let width = size.width / self.scaling;
-        let height = size.height / self.scaling;
+        // Guard against zero or invalid scaling
+        let scaling = self.scaling.max(f32::EPSILON);
+        let width = size.width / scaling;
+        let height = size.height / scaling;
         Rectangle {
             x: -self.translation.x - width / 2.0,
             y: -self.translation.y - height / 2.0,
@@ -440,8 +442,12 @@ impl ChartState {
     pub fn visible_time_range_ms(&self, padding_intervals: u32) -> Option<(u64, u64)> {
         match self.basis {
             Basis::Time(timeframe) => {
+                // Guard against invalid bounds or scaling
+                if self.bounds.width <= 0.0 || self.bounds.height <= 0.0 || self.scaling <= f32::EPSILON {
+                    return None;
+                }
                 let region = self.visible_region(self.bounds.size());
-                if region.width == 0.0 {
+                if region.width <= 0.0 {
                     return None;
                 }
                 

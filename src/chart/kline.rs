@@ -726,6 +726,9 @@ impl KlineChart {
                     };
 
                     chart.translation.y = self.data_source.latest_y_midpoint(calculate_target_y);
+                    
+                    // Clear Y-axis cache when auto scale updates translation.y
+                    self.yaxis_cache.clear();
                 }
                 super::Autoscale::FitToVisible => {
                     // Use unified time range calculation (no padding for rendering)
@@ -880,6 +883,10 @@ impl KlineChart {
                             // translation.y = -height/(2*scaling) = -(height/scaling)/2 = -chart_coord_height/2
                             // Calculate translation.y so that y=0 maps to screen top
                             chart.translation.y = -chart_coord_height / 2.0;
+                            
+                            // Clear Y-axis cache when auto scale updates translation.y and cell_height
+                            // This ensures Y-axis labels are recalculated with the new scale
+                            self.yaxis_cache.clear();
                         }
                     }
                 }
@@ -1088,8 +1095,7 @@ impl KlineChart {
                     return None;
                 }
                 Err(e) => {
-                    log::warn!("KlineChart: request handler error: {:?}", e);
-                    // Request error (overlap, etc.)
+                    // Request error (overlap, etc.) - silently ignore
                     return None;
                 }
             }
@@ -1147,7 +1153,6 @@ impl KlineChart {
                 }
                 Ok(None) => None,
                 Err(_) => {
-                    log::warn!("KlineChart: request handler error on range change");
                     None
                 }
             }
@@ -1207,6 +1212,11 @@ impl KlineChart {
     pub fn set_volume_profile(&mut self, vp: data::compute::vp::VolumeProfile) {
         self.chart.state.volume_profile = Some(vp);
         self.chart.state.vp_needs_update = false;
+    }
+    
+    /// Mark VP as needing update (e.g., when data becomes available)
+    pub fn mark_vp_needs_update(&mut self) {
+        self.chart.state.vp_needs_update = true;
     }
 
     fn rebuild_render_cache(&mut self) {

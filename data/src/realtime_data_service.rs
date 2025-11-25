@@ -91,21 +91,9 @@ impl RealtimeDataService {
                     let index_len = store.index().len();
                     if index_len > 0 || attempt == MAX_RETRIES {
                         // File exists and has data, or we've exhausted retries
-                        log::debug!(
-                            "RealtimeDataService: opened MmapStore for {} at {:?} (index entries: {})",
-                            symbol,
-                            mmap_path,
-                            index_len
-                        );
                         return Some(Arc::new(store));
                     } else {
                         // File exists but index is empty, wait a bit and retry
-                        log::debug!(
-                            "RealtimeDataService: MmapStore for {} exists but index is empty (attempt {}/{})",
-                            symbol,
-                            attempt + 1,
-                            MAX_RETRIES + 1
-                        );
                         if attempt < MAX_RETRIES {
                             std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
                             continue;
@@ -114,14 +102,6 @@ impl RealtimeDataService {
                 }
                 Err(e) => {
                     if attempt < MAX_RETRIES {
-                        log::debug!(
-                            "RealtimeDataService: failed to open MmapStore for {} at {:?} (attempt {}/{}): {}. Retrying...",
-                            symbol,
-                            mmap_path,
-                            attempt + 1,
-                            MAX_RETRIES + 1,
-                            e
-                        );
                         std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
                         continue;
                     } else {
@@ -190,14 +170,6 @@ impl RealtimeDataService {
     pub fn fetch_klines_blocking(&self, symbol: &str, range: TimeRange, timeframe: &str) -> Result<Vec<KLine>, DataError> {
         // Normalize symbol to Binance API format
         let api_symbol = normalize_binance_symbol(symbol);
-        
-        log::info!(
-            "RealtimeDataService: fetching K-lines for {} (timeframe: {}, range: {} - {} us)",
-            api_symbol,
-            timeframe,
-            range.start_us,
-            range.end_us
-        );
 
         // 1. Try to get from cache first
         if let Some(cache) = &self.kline_cache {
@@ -207,34 +179,13 @@ impl RealtimeDataService {
                 if let Some((cache_min, cache_max)) = cache.time_range(&api_symbol, timeframe) {
                     let cache_coverage = cache_min <= range.start_us && cache_max >= range.end_us;
                     if cache_coverage {
-                        log::info!(
-                            "RealtimeDataService: retrieved {} K-lines from cache for {}",
-                            cached_klines.len(),
-                            api_symbol
-                        );
                         return Ok(cached_klines);
-                    } else {
-                        log::debug!(
-                            "RealtimeDataService: cache partial coverage (cache: {} - {} us, requested: {} - {} us), will fetch from API",
-                            cache_min,
-                            cache_max,
-                            range.start_us,
-                            range.end_us
-                        );
                     }
                 }
             }
         }
 
         // 2. Cache miss or insufficient coverage: fetch from API
-        log::info!(
-            "RealtimeDataService: fetching K-lines from Binance API for {} (timeframe: {}, range: {} - {} us)",
-            api_symbol,
-            timeframe,
-            range.start_us,
-            range.end_us
-        );
-
         // Binance K-line API endpoint
         let url = format!(
             "https://api.binance.com/api/v3/klines?symbol={}&interval={}&startTime={}&endTime={}&limit=1000",
@@ -333,18 +284,7 @@ impl RealtimeDataService {
         // 3. Update cache with fetched data
         if let Some(cache) = &self.kline_cache {
             cache.insert_many(&api_symbol, timeframe, &klines);
-            log::debug!(
-                "RealtimeDataService: updated cache with {} K-lines for {}",
-                klines.len(),
-                api_symbol
-            );
         }
-
-        log::info!(
-            "RealtimeDataService: fetched {} K-lines from Binance API for {}",
-            klines.len(),
-            api_symbol
-        );
 
         Ok(klines)
     }
@@ -371,16 +311,16 @@ impl RealtimeDataService {
             Some(store) => store,
             None => {
                 log::warn!("RealtimeDataService: MmapStore not available for {}, returning empty result", symbol);
-                return Ok(TickDataBuffer { prices: Vec::new(), volumes: Vec::new() });
+                return Ok(TickDataBuffer { 
+                    prices: Vec::new(), 
+                    volumes: Vec::new(),
+                    time_range: None,
+                });
             }
         };
         
         let index = store.index();
         
-        log::debug!(
-            "[fetch_ticks_blocking] Index has {} entries, querying range {} - {} us ({} - {} ms)", 
-            index.len(), range.start_us, range.end_us, range.start_us / 1_000, range.end_us / 1_000
-        );
 
         // Find the first data block that *could* contain data for our time range.
         // partition_point returns the index where entry.key_hash() >= range.start_us
@@ -401,8 +341,11 @@ impl RealtimeDataService {
         };
         
         if index.is_empty() {
-            log::warn!("fetch_ticks_blocking: MmapStore index is empty, no data available");
-            return Ok(TickDataBuffer { prices: Vec::new(), volumes: Vec::new() });
+            return Ok(TickDataBuffer { 
+                prices: Vec::new(), 
+                volumes: Vec::new(),
+                time_range: None,
+            });
         }
         
         if scan_start_idx < index.len() {
@@ -412,8 +355,6 @@ impl RealtimeDataService {
                 log::warn!("fetch_ticks_blocking: Detected timestamp unit issue in chunk at index {}: raw={}, normalized={} us", 
                     scan_start_idx, raw_key, normalized_key);
             }
-            log::debug!("fetch_ticks_blocking: scanning from index {} (chunk start: {} us) to end",
-                scan_start_idx, normalized_key);
         }
 
         let mut prices: Vec<u32> = Vec::new();
@@ -421,6 +362,8 @@ impl RealtimeDataService {
         let mut chunks_checked = 0;
         let mut chunks_with_data = 0;
         let mut ticks_before_filter = 0;
+        let mut actual_start: Option<u64> = None;
+        let mut actual_end: Option<u64> = None;
 
         // Iterate through index entries that overlap with the requested time range.
         for entry in &index[scan_start_idx..] {
@@ -429,8 +372,6 @@ impl RealtimeDataService {
             
             // If the block's start time is already after our range ends, we can stop.
             if chunk_start_us >= range.end_us {
-                log::debug!("fetch_ticks_blocking: chunk start {} >= range end {}, stopping", 
-                    chunk_start_us, range.end_us);
                 break;
             }
             
@@ -439,7 +380,6 @@ impl RealtimeDataService {
             // Load and deserialize payload
             let payload = store.get_payload(entry);
             if payload.is_empty() {
-                log::debug!("fetch_ticks_blocking: chunk at {} us has empty payload, skipping", chunk_start_us);
                 // Skip entries with empty payload (e.g., file truncated or data not yet written)
                 continue;
             }
@@ -496,14 +436,31 @@ impl RealtimeDataService {
                         let price_fixed = (price_array.value(i) * 100.0) as u32;
                         prices.push(price_fixed);
                         volumes.push(volume_array.value(i) as f32);
+                        
+                        // Track actual time range covered by the data
+                        if actual_start.is_none() || ts < actual_start.unwrap() {
+                            actual_start = Some(ts);
+                        }
+                        if actual_end.is_none() || ts > actual_end.unwrap() {
+                            actual_end = Some(ts);
+                        }
                     }
                 }
             }
         }
         
-        log::info!("fetch_ticks_blocking: checked {} chunks, {} had data, {} total ticks, {} ticks in range", 
-            chunks_checked, chunks_with_data, ticks_before_filter, prices.len());
 
-        Ok(TickDataBuffer { prices, volumes })
+        // Record the actual time range covered by the data
+        let time_range = if let (Some(start), Some(end)) = (actual_start, actual_end) {
+            Some((start, end))
+        } else {
+            None
+        };
+
+        Ok(TickDataBuffer { 
+            prices, 
+            volumes,
+            time_range,
+        })
     }
 }

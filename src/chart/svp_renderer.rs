@@ -234,7 +234,6 @@ impl SvpRenderer {
             
             self.last_data_id = Some(current_id);
             self.last_data_len = svp_data.len();
-            log::info!("SVP Buffer Updated: {} instances. BaseUnits: {}", self.instance_count, self.base_price_units);
         }
 
         if self.instance_count > 0 {
