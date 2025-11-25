@@ -46,11 +46,13 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     env,
+    hash::Hash,
     path::PathBuf,
     sync::Arc,
     vec,
 };
 use tokio::sync::broadcast;
+use iced_futures::futures::{self, Stream, StreamExt};
 
 fn main() {
     logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
@@ -95,8 +97,12 @@ struct Flowsurface {
     historical_data_status_window: Option<(window::Id, screen::historical_data_status::HistoricalDataStatusWindow)>,
     // VP overlap threshold tracking
     vp_overlap_threshold: Option<(String, f64)>, // (symbol, overlap_ratio)
-    // EventBus receiver for polling events (wrapped in Arc<Mutex> to be Send + Sync)
-    event_bus_receiver: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<data::DataEvent>>>,
+    // EventBus bridge receiver (lock-free mpsc channel)
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<data::DataEvent>,
+    // Pending VP computation requests (queued while service is initializing)
+    pending_vp_requests: Vec<(String, TimeRange)>,
+    // Track if we've already warned about VP service not being ready
+    vp_service_warned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +220,34 @@ impl Flowsurface {
             Message::VpServiceInitialized,
         );
 
+        // Create mpsc channel for EventBus bridge (lock-free, high-performance)
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<data::DataEvent>();
+        
+        // Start background task to bridge EventBus (broadcast) -> mpsc channel
+        // This provides lock-free, immediate event delivery
+        let event_bus_clone = event_bus.clone();
+        tokio::spawn(async move {
+            let mut receiver = event_bus_clone.subscribe();
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        // If channel is closed (UI dropped), stop bridging
+                        if event_tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        log::debug!("EventBus closed, stopping bridge task");
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("EventBus subscription lagged, skipped {} events", skipped);
+                        // Continue receiving - lag is handled by broadcast channel
+                    }
+                }
+            }
+        });
+
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
             unified_data_service: unified_data_service.clone(),
@@ -234,7 +268,9 @@ impl Flowsurface {
             notifications: vec![],
             ingest_tx,
             vp_overlap_threshold: None,
-            event_bus_receiver: Arc::new(tokio::sync::Mutex::new(event_bus.subscribe())),
+            event_rx,
+            pending_vp_requests: Vec::new(),
+            vp_service_warned: false,
         };
         
         // Update all dashboards with the unified_data_service
@@ -323,7 +359,26 @@ impl Flowsurface {
             Message::VpServiceInitialized(result) => {
                 match result {
                     Ok(service) => {
+                        log::info!("VpComputeService initialized successfully");
                         self.vp_service = Some(service);
+                        
+                        // Process all pending VP computation requests
+                        if !self.pending_vp_requests.is_empty() {
+                            log::debug!("Processing {} pending VP computation requests", self.pending_vp_requests.len());
+                            let pending_requests = std::mem::take(&mut self.pending_vp_requests);
+                            let mut tasks = Vec::new();
+                            
+                            for (symbol, range) in pending_requests {
+                                // Create ComputeVp task directly (avoid recursive update call)
+                                if let Some(service) = &self.vp_service {
+                                    tasks.push(self.create_vp_compute_task(&symbol, range, service.clone()));
+                                }
+                            }
+                            
+                            if !tasks.is_empty() {
+                                return Task::batch(tasks);
+                            }
+                        }
                     }
                     Err(e) => {
                         log::error!("Failed to initialize VpComputeService: {}", e);
@@ -331,217 +386,28 @@ impl Flowsurface {
                             "GPU Compute Init Failed: {}",
                             e
                         )));
+                        // Clear pending requests since service failed to initialize
+                        self.pending_vp_requests.clear();
                     }
                 }
             }
             Message::ComputeVp(symbol, range) => {
-                if let Some(service) = &self.vp_service {
-                    let service = service.clone();
-                    let unified_service = self.unified_data_service.clone();
-                    let symbol_clone = symbol.clone();
-                    let event_bus = self.event_bus.clone();
-                    
-                    // Trigger ingestion if needed (for real-time data)
-                    let normalized_symbol = normalize_binance_symbol(&symbol_clone);
-                    let data_dir = data::data_path(Some("market_data"));
-                    let mmap_path = {
-                        let mut path = data_dir.clone();
-                        std::fs::create_dir_all(&path).ok();
-                        path.push(format!("{}.mmap", normalized_symbol));
-                        path
-                    };
-                    
-                    // Check if real-time data file exists, if not, trigger Ingester
-                    let file_ready = mmap_path.exists() && {
-                        if let Ok(metadata) = std::fs::metadata(&mmap_path) {
-                            metadata.len() > 1024
-                        } else {
-                            false
-                        }
-                    };
-                    
-                    // Try to get timeframe from the chart
-                    let timeframe_opt = {
-                        let dashboard = self.active_dashboard_mut();
-                        dashboard.find_pane_by_symbol(&symbol_clone)
-                            .and_then(|pane| {
-                                if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &pane.content {
-                                    // Use basis() method to get timeframe
-                                    match chart.basis() {
-                                        data::chart::Basis::Time(tf) => Some(tf.to_string()),
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                    };
-                    
-                    if !file_ready {
-                        let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone(), timeframe_opt));
+                // Check if VP service is ready
+                if self.vp_service.is_none() {
+                    // Service not ready yet - queue the request
+                    // Only warn once to avoid log spam
+                    if !self.vp_service_warned {
+                        log::debug!("VP service not ready, queuing request for {} (will process when service is initialized)", symbol);
+                        self.vp_service_warned = true;
                     }
-                    
-                    // Publish VP computation started event
-                    let _ = event_bus.publish(data::DataEvent::VpComputeStarted {
-                        symbol: symbol_clone.clone(),
-                        range_start_us: range.start_us,
-                        range_end_us: range.end_us,
-                    });
-                    
-                    return Task::future(async move {
-                        // Use UnifiedDataService to fetch ticks (automatically handles real-time and historical)
-                        let ticks = match unified_service.fetch_ticks(symbol_clone.clone(), range).await {
-                            Ok(ticks) => ticks,
-                            Err(e) => {
-                                let compute_err: data::compute::vp::ComputeError = e.into();
-                                // Publish failure event
-                                let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
-                                    symbol: symbol_clone.clone(),
-                                    range_start_us: range.start_us,
-                                    range_end_us: range.end_us,
-                                    error: compute_err.to_string(),
-                                });
-                                return Message::VpComputed(symbol_clone.clone(), Err(compute_err));
-                            },
-                        };
-                        
-                        // Calculate overlap ratio and publish event
-                        let overlap_ratio = if let Some((actual_start, actual_end)) = ticks.time_range {
-                            let overlap_start = actual_start.max(range.start_us);
-                            let overlap_end = actual_end.min(range.end_us);
-                            
-                            if overlap_start >= overlap_end {
-                                0.0
-                            } else {
-                                let requested_span = range.end_us.saturating_sub(range.start_us);
-                                let overlap_span = overlap_end.saturating_sub(overlap_start);
-                                
-                                if requested_span > 0 {
-                                    overlap_span as f64 / requested_span as f64
-                                } else {
-                                    1.0
-                                }
-                            }
-                        } else {
-                            1.0 // Old format
-                        };
-                        
-                        // Publish overlap threshold updated event
-                        let _ = event_bus.publish(data::DataEvent::VpOverlapThresholdUpdated {
-                            symbol: symbol_clone.clone(),
-                            overlap_ratio,
-                        });
-                        
-                        // CRITICAL: Verify data completeness before computing VP
-                        // Check if the tick data covers the requested time range
-                        let data_complete = if let Some((actual_start, actual_end)) = ticks.time_range {
-                            // Calculate the overlap between requested and actual ranges
-                            let overlap_start = actual_start.max(range.start_us);
-                            let overlap_end = actual_end.min(range.end_us);
-                            
-                            // Check if there's meaningful overlap
-                            if overlap_start >= overlap_end {
-                                // No overlap at all
-                                false
-                            } else {
-                                let requested_span = range.end_us.saturating_sub(range.start_us);
-                                let overlap_span = overlap_end.saturating_sub(overlap_start);
-                                
-                                // For historical data, we're more lenient:
-                                // - If overlap covers at least 50% of requested range, proceed
-                                // - OR if the actual data range is large enough (>= 12 hours), proceed
-                                //   (this handles cases where some dates are missing but we have substantial data)
-                                let overlap_ratio = if requested_span > 0 {
-                                    overlap_span as f64 / requested_span as f64
-                                } else {
-                                    1.0
-                                };
-                                
-                                let actual_span = actual_end.saturating_sub(actual_start);
-                                let has_substantial_data = actual_span >= 12 * 3_600_000_000; // 12 hours in microseconds
-                                
-                                overlap_ratio >= 0.5 || has_substantial_data
-                            }
-                        } else {
-                            // If time_range is None (old cache files or data without timestamps), we can't verify completeness
-                            // Proceed with computation (old data format is still valid)
-                            true
-                        };
-                        
-                        if !data_complete {
-                            log::warn!(
-                                "VP computation skipped for {}: Data incomplete. Requested: {} - {} us, Actual: {:?}",
-                                symbol_clone, range.start_us, range.end_us, ticks.time_range
-                            );
-                            // Publish failure event
-                            let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
-                                symbol: symbol_clone.clone(),
-                                range_start_us: range.start_us,
-                                range_end_us: range.end_us,
-                                error: format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us),
-                            });
-                            return Message::VpComputed(symbol_clone.clone(), Err(
-                                data::compute::vp::ComputeError::Other(
-                                    format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us)
-                                )
-                            ));
-                        }
-                        
-                        // Calculate compute parameters
-                        let num_ticks = ticks.prices.len() as u32;
-                        if num_ticks == 0 {
-                            // Publish failure event
-                            let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
-                                symbol: symbol_clone.clone(),
-                                range_start_us: range.start_us,
-                                range_end_us: range.end_us,
-                                error: "No ticks found".to_string(),
-                            });
-                            return Message::VpComputed(symbol_clone.clone(), Err(
-                                data::compute::vp::ComputeError::Other("No ticks found".to_string())
-                            ));
-                        }
-                        
-                        let min_price = *ticks.prices.iter().min().unwrap_or(&0) as u32;
-                        let max_price = *ticks.prices.iter().max().unwrap_or(&0) as u32;
-                        let price_range = max_price.saturating_sub(min_price);
-                        let price_resolution = 1; // 1 cent resolution
-                        let histogram_buckets = (price_range / price_resolution).max(1) as u64;
-                        
-                        let params = data::compute::vp::ComputeParams {
-                            num_ticks,
-                            price_resolution,
-                            min_price,
-                            volume_scaling_factor: 10000, // Scale by 10000 to preserve 4 decimal places
-                            tick_offset: 0, // Start from beginning
-                        };
-                        
-                        // Run compute on GPU
-                        let result = service.compute_vp(&ticks, &params, histogram_buckets).await;
-                        
-                        // Publish completion event
-                        match &result {
-                            Ok(profile) => {
-                                let _ = event_bus.publish(data::DataEvent::VpComputeCompleted {
-                                    symbol: symbol_clone.clone(),
-                                    range_start_us: range.start_us,
-                                    range_end_us: range.end_us,
-                                    bar_count: profile.bars.len(),
-                                });
-                            }
-                            Err(e) => {
-                                let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
-                                    symbol: symbol_clone.clone(),
-                                    range_start_us: range.start_us,
-                                    range_end_us: range.end_us,
-                                    error: e.to_string(),
-                                });
-                            }
-                        }
-                        
-                        Message::VpComputed(symbol_clone, result)
-                    });
+                    self.pending_vp_requests.push((symbol, range));
+                    return Task::none();
+                }
+                
+                if let Some(service) = &self.vp_service {
+                    return self.create_vp_compute_task(&symbol, range, service.clone());
                 } else {
+                    // This should not happen as we check above, but keep as safety
                     log::warn!("ComputeVp requested but VpComputeService is not ready.");
                 }
             }
@@ -592,43 +458,34 @@ impl Flowsurface {
             }
             Message::Tick(now) => {
                 let main_window_id = self.main_window.id;
+
+                // Poll EventBus events from mpsc channel (lock-free, non-blocking)
+                // try_recv is non-blocking and has no Mutex overhead
+                let mut events = Vec::new();
+                loop {
+                    match self.event_rx.try_recv() {
+                        Ok(event) => events.push(event),
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            log::warn!("EventBus bridge channel disconnected");
+                            break;
+                        }
+                    }
+                }
                 
-                // Poll EventBus for new events (non-blocking)
-                let receiver = self.event_bus_receiver.clone();
-                let poll_task = Task::perform(
-                    async move {
-                        let mut receiver = receiver.lock().await;
-                        let mut events = Vec::new();
-                        // Collect up to 10 events per tick to avoid blocking
-                        for _ in 0..10 {
-                            match receiver.try_recv() {
-                                Ok(event) => events.push(event),
-                                Err(broadcast::error::TryRecvError::Empty) => break,
-                                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                                    log::warn!("EventBus subscription lagged, skipped {} events", skipped);
-                                    break; // Stop after lag to avoid infinite loop
-                                }
-                                Err(broadcast::error::TryRecvError::Closed) => break,
-                            }
-                        }
-                        events
-                    },
-                    move |events| {
-                        if events.is_empty() {
-                            Message::Tick(now)
-                        } else {
-                            // Process all events by returning the first one
-                            // Remaining events will be processed in subsequent ticks
-                            // This is acceptable since events are not time-critical
-                            Message::DataEvent(events.into_iter().next().unwrap())
-                        }
-                    },
-                );
+                // Process events if any
+                let event_tasks: Vec<Task<Message>> = events.into_iter()
+                    .map(|event| Task::done(Message::DataEvent(event)))
+                    .collect();
                 
                 let dashboard_tick = self.active_dashboard_mut().tick(now, main_window_id)
                     .map(move |msg| Message::Dashboard(None, msg));
                 
-                return poll_task.chain(dashboard_tick);
+                if !event_tasks.is_empty() {
+                    return Task::batch(event_tasks).chain(dashboard_tick);
+                }
+                
+                return dashboard_tick;
             }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
@@ -1220,7 +1077,9 @@ impl Flowsurface {
             _ => None,
         });
 
-        // EventBus events are polled in the Tick handler, no separate subscription needed
+        // EventBus events are handled via direct channel polling in Tick handler
+        // The mpsc channel provides lock-free, non-blocking event delivery
+        // No separate subscription needed - events are polled in Message::Tick handler
 
         let mut subscriptions = vec![
             exchange_streams,
@@ -1248,6 +1107,201 @@ impl Flowsurface {
         self.layout_manager
             .active_dashboard_mut()
             .expect("No active dashboard")
+    }
+    
+    /// Creates a VP computation task for the given symbol and range.
+    /// This is a helper method to avoid code duplication.
+    fn create_vp_compute_task(
+        &mut self,
+        symbol: &str,
+        range: TimeRange,
+        service: Arc<VpComputeService>,
+    ) -> Task<Message> {
+        let unified_service = self.unified_data_service.clone();
+        let symbol_clone = symbol.to_string();
+        let event_bus = self.event_bus.clone();
+        
+        // Trigger ingestion if needed (for real-time data)
+        let normalized_symbol = normalize_binance_symbol(&symbol_clone);
+        let data_dir = data::data_path(Some("market_data"));
+        let mmap_path = {
+            let mut path = data_dir.clone();
+            std::fs::create_dir_all(&path).ok();
+            path.push(format!("{}.mmap", normalized_symbol));
+            path
+        };
+        
+        // Check if real-time data file exists, if not, trigger Ingester
+        let file_ready = mmap_path.exists() && {
+            if let Ok(metadata) = std::fs::metadata(&mmap_path) {
+                metadata.len() > 1024
+            } else {
+                false
+            }
+        };
+        
+        // Try to get timeframe from the chart
+        let timeframe_opt = {
+            let dashboard = self.active_dashboard_mut();
+            dashboard.find_pane_by_symbol(&symbol_clone)
+                .and_then(|pane| {
+                    if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &pane.content {
+                        match chart.basis() {
+                            data::chart::Basis::Time(tf) => Some(tf.to_string()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+        };
+        
+        if !file_ready {
+            let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone(), timeframe_opt));
+        }
+        
+        // Publish VP computation started event
+        let _ = event_bus.publish(data::DataEvent::VpComputeStarted {
+            symbol: symbol_clone.clone(),
+            range_start_us: range.start_us,
+            range_end_us: range.end_us,
+        });
+        
+        Task::future(async move {
+            // Use UnifiedDataService to fetch ticks (automatically handles real-time and historical)
+            let ticks = match unified_service.fetch_ticks(symbol_clone.clone(), range).await {
+                Ok(ticks) => ticks,
+                Err(e) => {
+                    let compute_err: data::compute::vp::ComputeError = e.into();
+                    let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                        symbol: symbol_clone.clone(),
+                        range_start_us: range.start_us,
+                        range_end_us: range.end_us,
+                        error: compute_err.to_string(),
+                    });
+                    return Message::VpComputed(symbol_clone.clone(), Err(compute_err));
+                },
+            };
+            
+            // Calculate overlap ratio and publish event
+            let overlap_ratio = if let Some((actual_start, actual_end)) = ticks.time_range {
+                let overlap_start = actual_start.max(range.start_us);
+                let overlap_end = actual_end.min(range.end_us);
+                
+                if overlap_start >= overlap_end {
+                    0.0
+                } else {
+                    let requested_span = range.end_us.saturating_sub(range.start_us);
+                    let overlap_span = overlap_end.saturating_sub(overlap_start);
+                    
+                    if requested_span > 0 {
+                        overlap_span as f64 / requested_span as f64
+                    } else {
+                        1.0
+                    }
+                }
+            } else {
+                1.0 // Old format
+            };
+            
+            let _ = event_bus.publish(data::DataEvent::VpOverlapThresholdUpdated {
+                symbol: symbol_clone.clone(),
+                overlap_ratio,
+            });
+            
+            // Verify data completeness
+            let data_complete = if let Some((actual_start, actual_end)) = ticks.time_range {
+                let overlap_start = actual_start.max(range.start_us);
+                let overlap_end = actual_end.min(range.end_us);
+                
+                if overlap_start >= overlap_end {
+                    false
+                } else {
+                    let requested_span = range.end_us.saturating_sub(range.start_us);
+                    let overlap_span = overlap_end.saturating_sub(overlap_start);
+                    let overlap_ratio = if requested_span > 0 {
+                        overlap_span as f64 / requested_span as f64
+                    } else {
+                        1.0
+                    };
+                    
+                    let actual_span = actual_end.saturating_sub(actual_start);
+                    let has_substantial_data = actual_span >= 12 * 3_600_000_000;
+                    
+                    overlap_ratio >= 0.5 || has_substantial_data
+                }
+            } else {
+                true
+            };
+            
+            if !data_complete {
+                log::warn!(
+                    "VP computation skipped for {}: Data incomplete. Requested: {} - {} us, Actual: {:?}",
+                    symbol_clone, range.start_us, range.end_us, ticks.time_range
+                );
+                let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                    symbol: symbol_clone.clone(),
+                    range_start_us: range.start_us,
+                    range_end_us: range.end_us,
+                    error: format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us),
+                });
+                return Message::VpComputed(symbol_clone.clone(), Err(
+                    data::compute::vp::ComputeError::Other(
+                        format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us)
+                    )
+                ));
+            }
+            
+            let num_ticks = ticks.prices.len() as u32;
+            if num_ticks == 0 {
+                let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                    symbol: symbol_clone.clone(),
+                    range_start_us: range.start_us,
+                    range_end_us: range.end_us,
+                    error: "No ticks found".to_string(),
+                });
+                return Message::VpComputed(symbol_clone.clone(), Err(
+                    data::compute::vp::ComputeError::Other("No ticks found".to_string())
+                ));
+            }
+            
+            let min_price = *ticks.prices.iter().min().unwrap_or(&0) as u32;
+            let max_price = *ticks.prices.iter().max().unwrap_or(&0) as u32;
+            let price_range = max_price.saturating_sub(min_price);
+            let price_resolution = 1;
+            let histogram_buckets = (price_range / price_resolution).max(1) as u64;
+            
+            let params = data::compute::vp::ComputeParams {
+                num_ticks,
+                price_resolution,
+                min_price,
+                volume_scaling_factor: 10000,
+                tick_offset: 0,
+            };
+            
+            let result = service.compute_vp(&ticks, &params, histogram_buckets).await;
+            
+            match &result {
+                Ok(profile) => {
+                    let _ = event_bus.publish(data::DataEvent::VpComputeCompleted {
+                        symbol: symbol_clone.clone(),
+                        range_start_us: range.start_us,
+                        range_end_us: range.end_us,
+                        bar_count: profile.bars.len(),
+                    });
+                }
+                Err(e) => {
+                    let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                        symbol: symbol_clone.clone(),
+                        range_start_us: range.start_us,
+                        range_end_us: range.end_us,
+                        error: e.to_string(),
+                    });
+                }
+            }
+            
+            Message::VpComputed(symbol_clone, result)
+        })
     }
 
     fn load_layout(&mut self, layout: layout::Layout, main_window: window::Id) -> Task<Message> {
