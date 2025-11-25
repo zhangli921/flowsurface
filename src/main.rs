@@ -9,6 +9,8 @@ mod style;
 mod widget;
 mod window;
 
+use crate::chart::Chart;
+
 use data::{
     self,
     unified_data_service::UnifiedDataService,
@@ -311,21 +313,32 @@ impl Flowsurface {
                         }
                     };
                     
-                    // Try to get timeframe from the chart
-                    let timeframe_opt = {
+                    // Try to get timeframe and visible price range from the chart
+                    let (timeframe_opt, visible_price_range_opt) = {
                         let dashboard = self.active_dashboard_mut();
-                        dashboard.find_pane_by_symbol(&symbol_clone)
-                            .and_then(|pane| {
+                        let result = dashboard.find_pane_by_symbol(&symbol_clone)
+                            .map(|pane| {
                                 if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &pane.content {
-                                    // Use basis() method to get timeframe
-                                    match chart.basis() {
+                                    let timeframe = match chart.basis() {
                                         data::chart::Basis::Time(tf) => Some(tf.to_string()),
                                         _ => None,
-                                    }
+                                    };
+                                    let price_range = chart.state().debug_visible_range.map(|(_, _, lowest, highest)| (lowest, highest));
+                                    log::info!(
+                                        "[ComputeVp] Found chart for {}, debug_visible_range: {:?}, price_range: {:?}",
+                                        symbol_clone, chart.state().debug_visible_range, price_range
+                                    );
+                                    (timeframe, price_range)
                                 } else {
-                                    None
+                                    log::warn!("[ComputeVp] Pane content is not Kline for {}", symbol_clone);
+                                    (None, None)
                                 }
                             })
+                            .unwrap_or_else(|| {
+                                log::warn!("[ComputeVp] No pane found for symbol {}", symbol_clone);
+                                (None, None)
+                            });
+                        result
                     };
                     
                     if !file_ready {
@@ -345,18 +358,54 @@ impl Flowsurface {
                         
                         // Calculate compute parameters
                         let num_ticks = ticks.prices.len() as u32;
-                        log::info!("Received {} ticks for VP computation", num_ticks);
+                        // log::info!("Received {} ticks for VP computation", num_ticks);
                         if num_ticks == 0 {
                             return Message::VpComputed(symbol_clone.clone(), Err(
                                 data::compute::vp::ComputeError::Other("No ticks found".to_string())
                             ));
                         }
                         
-                        let min_price = *ticks.prices.iter().min().unwrap_or(&0) as u32;
-                        let max_price = *ticks.prices.iter().max().unwrap_or(&0) as u32;
+                        let tick_min_price = *ticks.prices.iter().min().unwrap_or(&0) as u32;
+                        let tick_max_price = *ticks.prices.iter().max().unwrap_or(&0) as u32;
+                        
+                        // Extend price range to include visible K-line prices if available
+                        // This ensures VP covers all visible K-lines even if tick data is incomplete
+                        log::info!(
+                            "[VP Computation] visible_price_range_opt: {:?}, tick range: {}-{} ({}-{})",
+                            visible_price_range_opt, tick_min_price, tick_max_price,
+                            tick_min_price as f64 / 100.0, tick_max_price as f64 / 100.0
+                        );
+                        let (min_price, max_price) = if let Some((kline_lowest, kline_highest)) = visible_price_range_opt {
+                            let kline_min_scaled = (kline_lowest * 100.0) as u32;
+                            let kline_max_scaled = (kline_highest * 100.0) as u32;
+                            let extended_min = tick_min_price.min(kline_min_scaled);
+                            let extended_max = tick_max_price.max(kline_max_scaled);
+                            log::info!(
+                                "[VP Computation] Extended price range: tick={}-{} ({}-{}), kline={}-{} ({}-{}), final={}-{} ({}-{})",
+                                tick_min_price, tick_max_price, tick_min_price as f64 / 100.0, tick_max_price as f64 / 100.0,
+                                kline_min_scaled, kline_max_scaled, kline_lowest, kline_highest,
+                                extended_min, extended_max, extended_min as f64 / 100.0, extended_max as f64 / 100.0
+                            );
+                            (extended_min, extended_max)
+                        } else {
+                            log::debug!(
+                                "[VP Computation] Price range: {} - {} (scaled), {} - {} (actual)",
+                                tick_min_price, tick_max_price,
+                                tick_min_price as f64 / 100.0, tick_max_price as f64 / 100.0
+                            );
+                            (tick_min_price, tick_max_price)
+                        };
+                        
                         let price_range = max_price.saturating_sub(min_price);
                         let price_resolution = 1; // 1 cent resolution
                         let histogram_buckets = (price_range / price_resolution).max(1) as u64;
+                        
+                        log::info!(
+                            "[VP Computation] Histogram params: min_price={} ({:.2}), max_price={} ({:.2}), price_range={}, histogram_buckets={}",
+                            min_price, min_price as f64 / 100.0,
+                            max_price, max_price as f64 / 100.0,
+                            price_range, histogram_buckets
+                        );
                         
                         let params = data::compute::vp::ComputeParams {
                             num_ticks,
@@ -376,18 +425,25 @@ impl Flowsurface {
             Message::VpComputed(symbol, result) => {
                 match result {
                     Ok(profile) => {
-                        log::info!("Volume Profile computed for {}: POC at {}, {} bars", symbol, profile.point_of_control, profile.bars.len());
+                        let price_range_str = if !profile.bars.is_empty() {
+                            let min_price = profile.bars.iter().map(|b| b.price_level).min().unwrap_or(0) as f64 / 100.0;
+                            let max_price = profile.bars.iter().map(|b| b.price_level).max().unwrap_or(0) as f64 / 100.0;
+                            format!("{:.2}-{:.2}", min_price, max_price)
+                        } else {
+                            "N/A".to_string()
+                        };
+                        log::info!(
+                            "[VpComputed] Volume Profile computed for {}: POC at {}, {} bars, price range: {}",
+                            symbol, profile.point_of_control, profile.bars.len(), price_range_str
+                        );
                         
                         // Find the chart for this symbol and update its VP data
                         let dashboard = self.active_dashboard_mut();
-                        log::info!("Searching for chart with symbol: {}", symbol);
                         
                         if let Some(pane) = dashboard.find_pane_by_symbol(&symbol) {
-                            log::info!("Found pane for symbol {}", symbol);
                             if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
-                                log::info!("Found Kline chart, calling set_volume_profile");
                                 chart.set_volume_profile(profile);
-                                log::info!("VP data stored in chart for {}", symbol);
+                                log::info!("[VpComputed] VP data stored in chart for {}", symbol);
                             } else {
                                 log::warn!("Pane content is not Kline or chart is None");
                             }

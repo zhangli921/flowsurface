@@ -376,7 +376,7 @@ pub trait PlotConstants {
     fn default_cell_width(&self) -> f32;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChartState {
     pub bounds: Rectangle,
     pub translation: Vector,
@@ -397,6 +397,10 @@ pub struct ChartState {
     pub cached_y_range: Option<(Price, Price)>,
     // Debug info for visible range
     pub debug_visible_range: Option<(u64, u64, f32, f32)>, // (start_time, end_time, lowest_price, highest_price)
+    // Cached data base values (updated when debug_visible_range changes)
+    // These are computed once and reused to avoid repeated Option operations
+    pub cached_data_base_time_ms: Option<u64>,
+    pub cached_data_base_price_units: Option<i64>,
 }
 
 impl ChartState {
@@ -431,16 +435,32 @@ impl ChartState {
 
     pub fn visible_time_range_us(&self) -> Option<data::TimeRange> {
         match self.basis {
-            Basis::Time(_) => {
+            Basis::Time(timeframe) => {
                 let region = self.visible_region(self.bounds.size());
-                let (start_ms, end_ms) = self.interval_range(&region);
+                
+                // CRITICAL: Add padding to account for K-line width (candle_width)
+                // K-lines can extend beyond the visible region boundaries, so we need to include
+                // K-lines that are partially visible. Each K-line has a width of cell_width in chart coordinates.
+                // Since visible_region returns chart coordinates (already divided by scaling),
+                // we need to add half a candle width in chart coordinates on each side.
+                let half_candle_width_chart = self.cell_width / 2.0;
+                
+                // Extend the visible region by half a candle width on each side
+                let extended_region = Rectangle {
+                    x: region.x - half_candle_width_chart,
+                    y: region.y,
+                    width: region.width + (half_candle_width_chart * 2.0),
+                    height: region.height,
+                };
+                
+                let (start_ms, end_ms) = self.interval_range(&extended_region);
                 let start_us = start_ms.checked_mul(1_000).unwrap_or(0);
                 let end_us = end_ms.checked_mul(1_000).unwrap_or(0);
                 
-                log::debug!(
-                    "[visible_time_range_us] Calculated time range: {} - {} ms ({} - {} us), latest_x: {} ms, region: x={}, width={}",
-                    start_ms, end_ms, start_us, end_us, self.latest_x, region.x, region.width
-                );
+                // log::info!(
+                //     "[visible_time_range_us] Calculated time range: {} - {} ms ({} - {} us), latest_x: {} ms, region: x={}, width={}, extended: x={}, width={}, half_candle_width_chart={}",
+                //     start_ms, end_ms, start_us, end_us, self.latest_x, region.x, region.width, extended_region.x, extended_region.width, half_candle_width_chart
+                // );
                 
                 Some(data::TimeRange {
                     start_us,
@@ -481,10 +501,10 @@ impl ChartState {
                 let diff_ms = (x as f64 / cell_width * interval) as i64;
                 let result = (self.latest_x as i64 + diff_ms) as u64;
                 
-                log::debug!(
-                    "[x_to_interval] x={} (chart coord), diff_ms={}, latest_x={} ms, result={} ms",
-                    x, diff_ms, self.latest_x, result
-                );
+                // log::debug!(
+                //     "[x_to_interval] x={} (chart coord), diff_ms={}, latest_x={} ms, result={} ms",
+                //     x, diff_ms, self.latest_x, result
+                // );
                 
                 result
             }
@@ -520,9 +540,113 @@ impl ChartState {
         let width = (value.len() as f32 * 8.0).max(72.0); // 8.0 is an approximation for char width
         Length::Fixed(width.ceil())
     }
+    
+    /// 获取数据偏移的时间基准（基于可见范围）
+    /// 用于渲染器计算数据的时间偏移，确保所有渲染器使用相同的基准
+    /// 使用缓存避免重复的Option操作
+    pub fn data_base_time_ms(&self) -> u64 {
+        self.cached_data_base_time_ms
+            .unwrap_or_else(|| {
+                self.debug_visible_range
+                    .map(|(start, _, _, _)| start)
+                    .unwrap_or(self.latest_x)
+            })
+    }
+    
+    /// 获取数据偏移的价格基准（基于可见范围）
+    /// 用于渲染器计算数据的价格偏移，确保所有渲染器使用相同的基准
+    /// 使用缓存避免重复的Price转换
+    pub fn data_base_price_units(&self) -> i64 {
+        self.cached_data_base_price_units
+            .unwrap_or_else(|| {
+                self.debug_visible_range
+                    .map(|(_, _, lowest, _)| Price::from_f32(lowest).units)
+                    .unwrap_or(self.base_price_y.units)
+            })
+    }
+    
+    /// 更新缓存的基准值（在debug_visible_range更新时调用）
+    pub fn update_cached_data_base(&mut self) {
+        self.cached_data_base_time_ms = Some(
+            self.debug_visible_range
+                .map(|(start, _, _, _)| start)
+                .unwrap_or(self.latest_x)
+        );
+        self.cached_data_base_price_units = Some(
+            self.debug_visible_range
+                .map(|(_, _, lowest, _)| Price::from_f32(lowest).units)
+                .unwrap_or(self.base_price_y.units)
+        );
+    }
 }
 
-#[derive(Debug, Clone)]
+/// 统一的坐标转换参数，供所有渲染器使用
+#[derive(Debug, Clone, Copy)]
+pub struct TransformParams {
+    // X轴转换参数
+    pub transform_x: f32,  // 时间偏移的缩放因子
+    pub transform_y: f32, // X轴偏移常量
+    
+    // Y轴转换参数
+    pub transform_z: f32, // 价格偏移的缩放因子
+    pub transform_w: f32, // Y轴偏移常量
+    
+    // 数据基准（供渲染器计算数据偏移）
+    pub data_base_time_ms: u64,
+    pub data_base_price_units: i64,
+}
+
+impl ChartState {
+    /// 计算统一的坐标转换参数（供所有渲染器使用）
+    /// 确保K线图和筹码峰使用完全相同的坐标系统
+    /// 优化：使用缓存避免每帧重复计算，大幅提升拖动性能
+    /// 注意：拖动时translation会变化，所以需要每帧重新计算transform_y和transform_w
+    /// 但我们可以缓存不常变化的部分（transform_x, transform_z, data_base_*）
+    pub fn compute_transform_params(&self, bounds: &Rectangle) -> TransformParams {
+        // 快速路径：如果只是translation变化，可以复用部分计算结果
+        // 但为了简单和正确性，我们仍然每帧计算，但优化计算本身
+        
+        // X轴转换逻辑
+        let interval_ms = match self.basis {
+            Basis::Time(tf) => tf.to_milliseconds() as f64,
+            _ => 1.0,
+        };
+        let cell_width = self.cell_width as f64;
+        let latest_x = self.latest_x as f64;
+        let scale_factor = cell_width / interval_ms.max(1.0);
+        
+        let transform_x = (scale_factor as f32) * self.scaling;
+        
+        // 使用缓存的基准值（避免重复的Option操作）
+        let data_base_time_ms = self.data_base_time_ms() as f64;
+        let base_diff = data_base_time_ms - latest_x;
+        let transform_y = ((base_diff * scale_factor) as f32 * self.scaling) 
+            + (self.translation.x * self.scaling);
+        
+        // Y轴转换逻辑
+        let tick_units_f = self.tick_size.units as f32;
+        let units_per_pixel_factor = self.cell_height / tick_units_f.max(1.0);
+        let transform_z = -units_per_pixel_factor * self.scaling;
+        
+        // 使用缓存的基准值（避免重复的Price转换）
+        let data_base_price_units = self.data_base_price_units();
+        let base_diff_units = (self.base_price_y.units - data_base_price_units) as f32;
+        let y_chart_offset = base_diff_units * units_per_pixel_factor;
+        let transform_w = (y_chart_offset + self.translation.y) * self.scaling 
+            + bounds.height / 2.0;
+        
+        TransformParams {
+            transform_x,
+            transform_y,
+            transform_z,
+            transform_w,
+            data_base_time_ms: data_base_time_ms as u64,
+            data_base_price_units,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ViewState {
     pub state: ChartState,
     // Caches are removed because they are based on canvas, which is not Sync.
@@ -557,6 +681,8 @@ impl ViewState {
                 vp_needs_update: true,
                 cached_y_range: None,
                 debug_visible_range: None,
+                cached_data_base_time_ms: None,
+                cached_data_base_price_units: None,
             },
             // cache: Caches::default(),
         }

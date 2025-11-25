@@ -36,6 +36,16 @@ pub struct VolumeProfile {
     pub value_area_end: u32,
 }
 
+impl PartialEq for VolumeProfile {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare Arc pointers for bars (fast comparison)
+        Arc::ptr_eq(&self.bars, &other.bars)
+        && self.point_of_control == other.point_of_control
+        && self.value_area_start == other.value_area_start
+        && self.value_area_end == other.value_area_end
+    }
+}
+
 #[derive(Error, Debug, Clone)]
 pub enum ComputeError {
     #[error("Failed to map GPU buffer")]

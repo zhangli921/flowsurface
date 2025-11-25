@@ -43,13 +43,13 @@ impl HistoricalDataService {
         range: TimeRange,
         timeframe: &str, // e.g., "1m", "5m", "1h"
     ) -> Result<Vec<KLine>, DataError> {
-        log::info!(
-            "HistoricalDataService: fetch_kline for {} timeframe {}, range: {} - {} us",
-            symbol,
-            timeframe,
-            range.start_us,
-            range.end_us
-        );
+        // log::info!(
+        //     "HistoricalDataService: fetch_kline for {} timeframe {}, range: {} - {} us",
+        //     symbol,
+        //     timeframe,
+        //     range.start_us,
+        //     range.end_us
+        // );
         
         // 1. Calculate date range for the requested time range
         // Note: This should only include dates BEFORE safe_cutoff (today's midnight)
@@ -77,11 +77,11 @@ impl HistoricalDataService {
             }
         });
         
-        log::info!(
-            "HistoricalDataService: calculated date range: {:?} (filtered to dates before {})",
-            dates,
-            cutoff_date
-        );
+        // log::info!(
+        //     "HistoricalDataService: calculated date range: {:?} (filtered to dates before {})",
+        //     dates,
+        //     cutoff_date
+        // );
 
         let mut all_klines = Vec::new();
 
@@ -98,10 +98,10 @@ impl HistoricalDataService {
 
             let klines = if cache_path.exists() {
                 // 3. Cache hit: load from cache
-                log::info!("HistoricalDataService: cache hit for {}", cache_path.display());
+                // log::info!("HistoricalDataService: cache hit for {}", cache_path.display());
                 match self.ingester.load_klines_from_cache(&cache_path).await {
                     Ok(cached_klines) => {
-                        log::info!("HistoricalDataService: loaded {} K-lines from cache", cached_klines.len());
+                        // log::info!("HistoricalDataService: loaded {} K-lines from cache", cached_klines.len());
                         cached_klines
                     },
                     Err(e) => {
@@ -120,7 +120,7 @@ impl HistoricalDataService {
                 }
             } else {
                 // 4. Cache miss: trigger download
-                log::info!("HistoricalDataService: cache miss, downloading and caching for {}", date);
+                // log::info!("HistoricalDataService: cache miss, downloading and caching for {}", date);
                 // If download fails (e.g., 404 for today's data), continue with empty data
                 match self.ingester.download_and_cache_kline(symbol, &date, timeframe).await {
                     Ok(downloaded_klines) => downloaded_klines,
@@ -153,20 +153,20 @@ impl HistoricalDataService {
                 .filter(|k| k.open_time_us >= effective_range.start_us && k.open_time_us < effective_range.end_us)
                 .collect();
             
-            log::info!(
-                "HistoricalDataService: filtered {} K-lines for date {} (from {} total)",
-                filtered.len(),
-                date,
-                klines_count
-            );
+            // log::info!(
+            //     "HistoricalDataService: filtered {} K-lines for date {} (from {} total)",
+            //     filtered.len(),
+            //     date,
+            //     klines_count
+            // );
 
             all_klines.extend(filtered);
         }
         
-        log::info!(
-            "HistoricalDataService: returning {} total K-lines",
-            all_klines.len()
-        );
+        // log::info!(
+        //     "HistoricalDataService: returning {} total K-lines",
+        //     all_klines.len()
+        // );
 
         Ok(all_klines)
     }
@@ -205,11 +205,11 @@ impl HistoricalDataService {
             }
         });
         
-        log::info!(
-            "HistoricalDataService: calculated date range for ticks: {:?} (filtered to dates before {})",
-            dates,
-            cutoff_date
-        );
+        // log::info!(
+        //     "HistoricalDataService: calculated date range for ticks: {:?} (filtered to dates before {})",
+        //     dates,
+        //     cutoff_date
+        // );
 
         let mut all_prices = Vec::new();
         let mut all_volumes = Vec::new();
@@ -317,34 +317,34 @@ fn calculate_safe_historical_cutoff() -> u64 {
         24 // Force use of yesterday's boundary
     };
     
-    log::info!(
-        "HistoricalDataService: calculate_safe_historical_cutoff: now={:?} ({} us), today={:?}, midnight={:?} ({} us), hours_since_midnight={}",
-        now,
-        now_micros,
-        today,
-        midnight_utc,
-        cutoff,
-        hours_since_midnight
-    );
+    // log::info!(
+    //     "HistoricalDataService: calculate_safe_historical_cutoff: now={:?} ({} us), today={:?}, midnight={:?} ({} us), hours_since_midnight={}",
+    //     now,
+    //     now_micros,
+    //     today,
+    //     midnight_utc,
+    //     cutoff,
+    //     hours_since_midnight
+    // );
     
     if hours_since_midnight < 6 {
         // Use previous day's boundary (historical data may not be published yet)
         let yesterday = today.pred_opt().unwrap_or(today);
         let yesterday_midnight = yesterday.and_hms_opt(0, 0, 0).unwrap();
         let yesterday_cutoff = yesterday_midnight.and_utc().timestamp_micros() as u64;
-        log::info!(
-            "HistoricalDataService: calculate_safe_historical_cutoff: using yesterday's boundary: {} us ({:?})",
-            yesterday_cutoff,
-            yesterday_midnight.and_utc()
-        );
+        // log::info!(
+        //     "HistoricalDataService: calculate_safe_historical_cutoff: using yesterday's boundary: {} us ({:?})",
+        //     yesterday_cutoff,
+        //     yesterday_midnight.and_utc()
+        // );
         yesterday_cutoff
     } else {
         // Use today's boundary (historical data should be published)
-        log::info!(
-            "HistoricalDataService: calculate_safe_historical_cutoff: using today's boundary: {} us ({:?})",
-            cutoff,
-            midnight_utc
-        );
+        // log::info!(
+        //     "HistoricalDataService: calculate_safe_historical_cutoff: using today's boundary: {} us ({:?})",
+        //     cutoff,
+        //     midnight_utc
+        // );
         cutoff
     }
 }

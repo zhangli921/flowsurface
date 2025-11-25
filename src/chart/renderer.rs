@@ -1,5 +1,4 @@
 use iced::advanced::layout::{Layout};
-use iced::advanced::renderer;
 use iced::mouse::{self, Cursor};
 use std::sync::Arc;
 use iced::{event, Rectangle, Vector, Point};
@@ -39,6 +38,22 @@ pub struct ChartData {
     pub svp_data: Arc<Vec<SparseBar>>,
     pub view_state: ViewState,
 }
+
+// Manual PartialEq implementation to compare key fields for change detection
+// This allows iced to detect when view_state changes and trigger redraws
+impl PartialEq for ChartData {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare Arc pointers for data (fast comparison)
+        // For view_state, we compare the actual state to detect translation/scaling changes
+        // This is critical: when translation changes, this will return false, triggering a redraw
+        Arc::ptr_eq(&self.kline_data, &other.kline_data)
+        && Arc::ptr_eq(&self.svp_data, &other.svp_data)
+        && self.view_state == other.view_state
+    }
+}
+
+// Implement Eq for completeness (required by some iced internals)
+impl Eq for ChartData {}
 
 impl<M> shader::Program<M> for UnifiedChartProgram
 where
@@ -182,7 +197,8 @@ impl shader::Primitive for ChartRenderer {
         if !self.svp_data.is_empty() {
             if let Some(svp_renderer) = &mut renderer.svp_renderer {
                 // Delegate preparation to SvpRenderer
-                svp_renderer.prepare(device, queue, &self.svp_data, &self.view_state, ());
+                // Pass kline_data so SvpRenderer can use the same base_price_units as KlineRenderer
+                svp_renderer.prepare(device, queue, &self.svp_data, &self.kline_data, &self.view_state, bounds);
             }
         }
     }

@@ -47,6 +47,7 @@ impl<D: DataPoint> PlotData<D> {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[derive(PartialEq)]
 pub struct ViewConfig {
     pub splits: Vec<f32>,
     pub autoscale: Option<Autoscale>,

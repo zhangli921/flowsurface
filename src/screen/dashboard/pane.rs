@@ -343,7 +343,7 @@ impl State {
         ticker_info: TickerInfo,
         klines: &[Kline],
     ) -> Option<Effect> {
-        log::info!("Pane: insert_klines called. Klines count: {}", klines.len());
+        // log::info!("Pane: insert_klines called. Klines count: {}", klines.len());
         match &mut self.content {
             Content::Kline {
                 chart, indicators, ..
@@ -354,14 +354,14 @@ impl State {
 
                 if let Some(id) = req_id {
                     chart.insert_klines(id, klines);
-                    log::info!("Pane: Calling check_vp_update_needed after insert_klines");
+                    // log::info!("Pane: Calling check_vp_update_needed after insert_klines");
                     if let Some(action) = chart.check_vp_update_needed() {
                         if let chart::Action::RequestVpComputation(symbol, range) = action {
                             log::info!("Pane: insert_klines requesting VP for {}", symbol);
                             return Some(Effect::RequestVpComputation(symbol, range));
                         }
                     } else {
-                        log::warn!("Pane: check_vp_update_needed returned None");
+                        // log::warn!("Pane: check_vp_update_needed returned None");
                     }
                 } else {
                     let (raw_trades, tick_size) = (chart.raw_trades(), chart.tick_size());
@@ -377,14 +377,14 @@ impl State {
                         ticker_info,
                         chart.kind(),
                     );
-                    log::info!("Pane: New KlineChart created. Checking VP...");
+                    // log::info!("Pane: New KlineChart created. Checking VP...");
                     if let Some(action) = chart.check_vp_update_needed() {
                         if let chart::Action::RequestVpComputation(symbol, range) = action {
                             log::info!("Pane: New chart requesting VP for {}", symbol);
                             return Some(Effect::RequestVpComputation(symbol, range));
                         }
                     } else {
-                        log::warn!("Pane: New chart check_vp_update_needed returned None");
+                        // log::warn!("Pane: New chart check_vp_update_needed returned None");
                     }
                 }
             }
@@ -942,9 +942,9 @@ impl State {
                 Content::Kline { chart: Some(c), .. } => {
                     super::chart::update(c, &msg);
                     if let Some(action) = c.check_vp_update_needed() {
-                        log::info!("Pane: check_vp_update_needed returned action");
+                        // log::info!("Pane: check_vp_update_needed returned action");
                         if let chart::Action::RequestVpComputation(symbol, range) = action {
-                            log::info!("Pane: Requesting VP computation for {} in range {}-{}", symbol, range.start_us, range.end_us);
+                            // log::info!("Pane: Requesting VP computation for {} in range {}-{}", symbol, range.start_us, range.end_us);
                             return Some(Effect::RequestVpComputation(symbol, range));
                         }
                     }

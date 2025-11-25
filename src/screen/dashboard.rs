@@ -1147,7 +1147,7 @@ impl Dashboard {
     }
 
     pub fn find_pane_by_symbol(&mut self, symbol: &str) -> Option<&mut pane::State> {
-        log::info!("find_pane_by_symbol: searching for '{}'", symbol);
+        // log::info!("find_pane_by_symbol: searching for '{}'", symbol);
         
         // Search in main window panes
         let mut pane_count = 0;
@@ -1155,17 +1155,17 @@ impl Dashboard {
             pane_count += 1;
             if let pane::Content::Kline { chart: Some(chart), .. } = &pane_state.content {
                 let chart_symbol = chart.ticker_info().ticker.to_string();
-                log::info!("  Checking pane {}: chart symbol = '{}'", pane_count, chart_symbol);
+                // log::info!("  Checking pane {}: chart symbol = '{}'", pane_count, chart_symbol);
                 if chart_symbol == symbol {
-                    log::info!("  MATCH FOUND!");
+                    // log::info!("  MATCH FOUND!");
                     return Some(pane_state);
                 }
             } else {
-                log::info!("  Pane {} is not Kline or has no chart", pane_count);
+                // log::info!("  Pane {} is not Kline or has no chart", pane_count);
             }
         }
         
-        log::info!("  Checked {} main window panes, no match", pane_count);
+        // log::info!("  Checked {} main window panes, no match", pane_count);
         
         // Search in popout windows
         for (_window_id, (panes, _spec)) in self.popout.iter_mut() {
@@ -1478,10 +1478,10 @@ fn create_kline_fetch_task(
                 },
                 move |result| match result {
                     Ok(klines) => {
-                        log::debug!(
-                            "Dashboard: received {} K-lines from UnifiedDataService",
-                            klines.len()
-                        );
+                        // log::debug!(
+                        //     "Dashboard: received {} K-lines from UnifiedDataService",
+                        //     klines.len()
+                        // );
                         
                         // Convert data::kline::KLine to exchange::Kline
                         let exchange_klines: Vec<Kline> = klines

@@ -640,11 +640,11 @@ impl KlineChart {
     }
 
     pub fn insert_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
-        log::info!(
-            "KlineChart: insert_klines called with {} K-lines, req_id: {}",
-            klines_raw.len(),
-            req_id
-        );
+        // log::info!(
+        //     "KlineChart: insert_klines called with {} K-lines, req_id: {}",
+        //     klines_raw.len(),
+        //     req_id
+        // );
         
         // Debug: log time range of incoming data
         if !klines_raw.is_empty() {
@@ -674,12 +674,12 @@ impl KlineChart {
                     );
                 }
                 
-                log::info!(
-                    "KlineChart: inserted {} K-lines. Data points: {} -> {}",
-                    klines_raw.len(),
-                    before_count,
-                    after_count
-                );
+                // log::info!(
+                //     "KlineChart: inserted {} K-lines. Data points: {} -> {}",
+                //     klines_raw.len(),
+                //     before_count,
+                //     after_count
+                // );
                 
                 timeseries.insert_trades_existing_buckets(&self.raw_trades);
                 
@@ -704,10 +704,10 @@ impl KlineChart {
                 
                 self.rebuild_render_cache();
                 
-                log::info!(
-                    "KlineChart: render_cache_kline now has {} K-lines",
-                    self.render_cache_kline.len()
-                );
+                // log::info!(
+                //     "KlineChart: render_cache_kline now has {} K-lines",
+                //     self.render_cache_kline.len()
+                // );
 
                 self.indicators
                     .values_mut()
@@ -726,8 +726,10 @@ impl KlineChart {
                 // This ensures that if the visible range is still not covered, we'll fetch more
                 self.last_visible_range = None;
                 
-                self.invalidate(None);
+                // Set vp_needs_update BEFORE calling invalidate, so that check_vp_update_needed
+                // in invalidate() can detect it
                 self.chart.state.vp_needs_update = true;
+                self.invalidate(None);
             }
             PlotData::TickBased(_) => {
                 log::warn!("KlineChart: insert_klines called but data_source is TickBased");
@@ -822,10 +824,10 @@ impl KlineChart {
                     let base_diff = base_time_ms - latest_x;
                     let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
                     
-                    log::debug!(
-                        "[FitToVisible] Coordinate transform params: base_time_ms={} ms, latest_x={} ms, base_diff={} ms, transform_x={}, transform_y={}, interval_ms={} ms, cell_width={}, scaling={}",
-                        base_time_ms, latest_x, base_diff, transform_x, transform_y, interval_ms, cell_width, chart.scaling
-                    );
+                    // log::debug!(
+                    //     "[FitToVisible] Coordinate transform params: base_time_ms={} ms, latest_x={} ms, base_diff={} ms, transform_x={}, transform_y={}, interval_ms={} ms, cell_width={}, scaling={}",
+                    //     base_time_ms, latest_x, base_diff, transform_x, transform_y, interval_ms, cell_width, chart.scaling
+                    // );
                     
                     let candle_width = chart.cell_width;
                     let half_candle_width = candle_width / 2.0;
@@ -861,6 +863,11 @@ impl KlineChart {
                             .map(|k| k.high)
                             .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
                         
+                        // log::debug!(
+                        //     "[FitToVisible] Visible K-line price range: {:.8} - {:.8}, count: {}",
+                        //     lowest, highest, visible_klines_refs.len()
+                        // );
+                        
                         (lowest, highest)
                     } else {
                         // Fallback to time-based filtering
@@ -890,6 +897,9 @@ impl KlineChart {
                     
                     // Save debug info to state
                     chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
+                    
+                    // Update cached data base values for performance optimization
+                    chart.update_cached_data_base();
                     
                     // No padding - use exact price range from visible K-lines
                     let padded_lowest = lowest;
@@ -1000,6 +1010,11 @@ impl KlineChart {
                 .map(|k| k.high)
                 .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
             chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
+            
+            // log::debug!(
+            //     "[invalidate] Visible K-lines: count={}, price_range={:.8}-{:.8}, time_range={}-{} ms",
+            //     visible_klines.len(), lowest, highest, start_interval, end_interval
+            // );
         } else {
             // Fallback to time-based filtering if no K-lines found by X coordinate
             let start_interval_us = start_interval * 1000;
@@ -1040,6 +1055,9 @@ impl KlineChart {
             // Check for visible range changes and data coverage
             self.check_data_update_needed()
         } else {
+            // Don't call check_vp_update_needed() here because it would reset vp_needs_update flag
+            // The flag should be checked by the caller (e.g., pane.rs) after insert_klines
+            // This ensures VP computation is only triggered when data is actually inserted
             None
         }
     }
@@ -1154,12 +1172,12 @@ impl KlineChart {
             
             match self.request_handler.add_request(fetch_range) {
                 Ok(Some(req_id)) => {
-                    log::info!(
-                        "KlineChart: created fetch request {} for range {} - {}",
-                        req_id,
-                        visible_start,
-                        visible_end
-                    );
+                    // log::info!(
+                    //     "KlineChart: created fetch request {} for range {} - {}",
+                    //     req_id,
+                    //     visible_start,
+                    //     visible_end
+                    // );
                     let stream = exchange::adapter::StreamKind::Kline {
                         ticker_info,
                         timeframe,
@@ -1228,12 +1246,12 @@ impl KlineChart {
             
             match self.request_handler.add_request(fetch_range) {
                 Ok(Some(req_id)) => {
-                    log::info!(
-                        "KlineChart: range changed, created fetch request {} for range {} - {}",
-                        req_id,
-                        visible_start,
-                        visible_end
-                    );
+                    // log::info!(
+                    //     "KlineChart: range changed, created fetch request {} for range {} - {}",
+                    //     req_id,
+                    //     visible_start,
+                    //     visible_end
+                    // );
                     let stream = exchange::adapter::StreamKind::Kline {
                         ticker_info,
                         timeframe,
@@ -1297,12 +1315,39 @@ impl KlineChart {
         // log::info!("Checking VP update for {}. visible_time_range_ns() call...", symbol);
         
         if let Some(time_range) = self.chart.state.visible_time_range_us() {
-            log::debug!(
-                "[check_vp_update_needed] Requesting VP computation for {}: {} - {} us ({} - {} ms), latest_x: {} ms",
-                symbol, time_range.start_us, time_range.end_us,
-                time_range.start_us / 1_000, time_range.end_us / 1_000,
-                self.chart.state.latest_x
-            );
+            // Calculate actual visible K-line time range and price range for comparison
+            let (visible_kline_range, visible_kline_price_range) = if !self.render_cache_kline.is_empty() {
+                let visible_klines: Vec<_> = self.render_cache_kline.iter()
+                    .filter(|k| {
+                        let kline_time_ms = (k.open_time_us / 1_000) as u64;
+                        let vp_start_ms = time_range.start_us / 1_000;
+                        let vp_end_ms = time_range.end_us / 1_000;
+                        kline_time_ms >= vp_start_ms && kline_time_ms <= vp_end_ms
+                    })
+                    .collect();
+                
+                if !visible_klines.is_empty() {
+                    let kline_start = (visible_klines.first().unwrap().open_time_us / 1_000) as u64;
+                    let kline_end = (visible_klines.last().unwrap().open_time_us / 1_000) as u64;
+                    let kline_lowest = visible_klines.iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
+                    let kline_highest = visible_klines.iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
+                    (Some((kline_start, kline_end)), Some((kline_lowest, kline_highest)))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            
+            // Note: visible_kline_price_range is already stored in debug_visible_range by invalidate()
+            // VP computation will use debug_visible_range to extend the price range
+            
+            // log::info!(
+            //     "[check_vp_update_needed] Requesting VP computation for {}: {} - {} us ({} - {} ms), latest_x: {} ms, visible K-lines: {:?}, visible price range: {:?}",
+            //     symbol, time_range.start_us, time_range.end_us,
+            //     time_range.start_us / 1_000, time_range.end_us / 1_000,
+            //     self.chart.state.latest_x, visible_kline_range, visible_kline_price_range
+            // );
             Some(Action::RequestVpComputation(symbol, time_range))
         } else {
             // log::warn!("VP Update Skipped: visible_time_range_ns returned None (maybe Basis::Tick?)");

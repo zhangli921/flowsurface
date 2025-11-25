@@ -47,6 +47,9 @@ pub struct KlineRenderer {
     last_data_len: usize,
     base_time_ms: f64,
     base_price_units: i64,
+    
+    // Cache last uniform values to avoid unnecessary buffer writes
+    last_uniforms: Option<KlineUniforms>,
 }
 
 impl KlineRenderer {
@@ -173,6 +176,7 @@ impl KlineRenderer {
             last_data_len: 0,
             base_time_ms: 0.0,
             base_price_units: 0,
+            last_uniforms: None,
         }
     }
 
@@ -195,11 +199,15 @@ impl KlineRenderer {
         if data_changed {
             // 1. Update Instance Data (CPU Heavy, but only on data change)
             
-            // Update base time to first element to keep offsets small
-            self.base_time_ms = (klines[0].open_time_us / 1_000) as f64;
+            // Use unified coordinate system from ChartState
+            // This ensures K-lines and Volume Profile use the same base for alignment
+            let state = &view_state.state;
+            let data_base_time_ms = state.data_base_time_ms();
+            let data_base_price_units = state.data_base_price_units();
             
-            // Update base price to first element
-            self.base_price_units = Price::from_f32(klines[0].close as f32).units;
+            // Store unified base for data offset calculation
+            self.base_time_ms = data_base_time_ms as f64;
+            self.base_price_units = data_base_price_units;
             
             let instances: Vec<KlineInstance> = klines
                 .iter()
@@ -256,53 +264,20 @@ impl KlineRenderer {
         if self.instance_count > 0 {
             // 2. Update Uniforms (Every frame, very cheap)
             
+            // Use unified coordinate transformation from ChartState
+            // This ensures K-lines and Volume Profile use identical transform parameters
             let state = &view_state.state;
+            let transform_params = state.compute_transform_params(bounds);
             
-            // X Transform Logic from chart.rs:
-            // x_chart = (t - latest_x) / interval * cell_width
-            // x_screen = (x_chart + translation.x) * scaling
-            // My Shader: x_screen = (time_offset * transform.x) + transform.y
-            // time_offset = t - base_time
+            // Update stored base values to match unified system
+            self.base_time_ms = transform_params.data_base_time_ms as f64;
+            self.base_price_units = transform_params.data_base_price_units;
             
-            let interval_ms = match state.basis {
-                data::chart::Basis::Time(tf) => tf.to_milliseconds() as f64,
-                _ => 1.0, 
-            };
-            let cell_width = state.cell_width as f64;
-            let latest_x = state.latest_x as f64;
-            let scale_factor = cell_width / interval_ms.max(1.0);
-            
-            let transform_x = (scale_factor as f32) * state.scaling;
-            
-            // offset_x = (base_time - latest_x) * scale_factor * scaling + translation.x * scaling
-            let base_diff = self.base_time_ms - latest_x;
-            let transform_y = ((base_diff * scale_factor) as f32 * state.scaling) + (state.translation.x * state.scaling);
-            
-            log::debug!(
-                "[KlineRenderer::prepare] Transform params: base_time_ms={} ms, latest_x={} ms, base_diff={} ms, transform_x={}, transform_y={}, interval={} ms, cell_width={}, scaling={}",
-                self.base_time_ms, latest_x, base_diff, transform_x, transform_y, interval_ms, cell_width, state.scaling
-            );
-            
-            // Y Transform Logic from chart.rs:
-            // y_chart = (base_price - price) / tick * cell
-            // y_screen = (y_chart + translation.y) * scaling + H/2
-            // My Shader: y_screen = price_offset * transform.z + transform.w
-            // price_offset = price_units - base_price_units
-            
-            // y_chart = (state.base_price.units - (base_price_units + price_offset)) / tick * cell
-            // y_chart = (state.base - my_base - offset) / tick * cell
-            // y_chart = (state.base - my_base)/tick*cell - offset/tick*cell
-            
-            let tick_units_f = state.tick_size.units as f32;
-            let units_per_pixel_factor = state.cell_height / tick_units_f.max(1.0);
-            
-            // coeff of offset is -1/tick*cell
-            let transform_z = -units_per_pixel_factor * state.scaling;
-            
-            let base_diff_units = (state.base_price_y.units - self.base_price_units) as f32;
-            let y_chart_offset = base_diff_units * units_per_pixel_factor;
-            
-            let transform_w = (y_chart_offset + state.translation.y) * state.scaling + bounds.height / 2.0;
+            // Use unified transform parameters
+            let transform_x = transform_params.transform_x;
+            let transform_y = transform_params.transform_y;
+            let transform_z = transform_params.transform_z;
+            let transform_w = transform_params.transform_w;
 
             let uniforms = KlineUniforms {
                 transform: [transform_x, transform_y, transform_z, transform_w],
@@ -333,8 +308,20 @@ impl KlineRenderer {
                 });
                 self.bind_group = Some(bind_group);
             } else {
-                // Update uniform buffer
-                queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&[uniforms]));
+                // Only update if uniforms actually changed
+                // This avoids unnecessary GPU buffer writes during dragging
+                let needs_update = self.last_uniforms.as_ref()
+                    .map(|last| {
+                        last.transform != uniforms.transform
+                        || last.screen_size != uniforms.screen_size
+                        || last.candle_width != uniforms.candle_width
+                    })
+                    .unwrap_or(true);
+                
+                if needs_update {
+                    queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&[uniforms]));
+                    self.last_uniforms = Some(uniforms);
+                }
             }
         }
     }

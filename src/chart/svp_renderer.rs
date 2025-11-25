@@ -3,7 +3,9 @@
 use iced::wgpu::{self, util::DeviceExt};
 use bytemuck::{Pod, Zeroable};
 use data::compute::vp::SparseBar;
+use data::kline::KLine;
 use crate::chart::ViewState;
+use exchange::util::Price;
 use std::sync::Arc;
 
 #[repr(C)]
@@ -45,6 +47,9 @@ pub struct SvpRenderer {
     last_data_len: usize,
     cached_max_volume: f32,
     base_price_units: i64,
+    
+    // Cache last uniform values to avoid unnecessary buffer writes
+    last_uniforms: Option<SvpUniforms>,
 }
 
 impl SvpRenderer {
@@ -171,6 +176,7 @@ impl SvpRenderer {
             last_data_len: 0,
             cached_max_volume: 1.0,
             base_price_units: 0,
+            last_uniforms: None,
         }
     }
 
@@ -179,8 +185,9 @@ impl SvpRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         svp_data: &Arc<Vec<SparseBar>>,
+        kline_data: &Arc<Vec<KLine>>,
         view_state: &ViewState,
-        _old_uniforms: (), // Ignored, we calculate new ones
+        bounds: &iced::Rectangle,
     ) {
         if svp_data.is_empty() {
             self.instance_count = 0;
@@ -191,18 +198,20 @@ impl SvpRenderer {
         let data_changed = self.last_data_id != Some(current_id) || self.last_data_len != svp_data.len();
 
         if data_changed {
-            let state = &view_state.state; // Access view state for hack
+            let state = &view_state.state;
 
             self.cached_max_volume = svp_data.iter().map(|b| b.volume).max().unwrap_or(1) as f32;
             
-            // Find base price (min price level in profile)
-            let min_price_level = svp_data.iter().map(|b| b.price_level).min().unwrap_or(0);
+            // Use unified coordinate system from ChartState
+            // This ensures K-lines and Volume Profile use the same base for alignment
+            let data_base_price_units = state.data_base_price_units();
             
-            // Convert base price level (scaled *100) to Price units (*10^8).
-            // Factor: 1,000,000.
-            self.base_price_units = (min_price_level as i64) * 1_000_000;
+            // Store unified base for data offset calculation
+            self.base_price_units = data_base_price_units;
             
             let instances: Vec<SvpInstance> = svp_data.iter().map(|bar| {
+                // Convert bar.price_level (scaled *100) to Price units (*10^8)
+                // Factor: 1,000,000
                 let bar_price_units = (bar.price_level as i64) * 1_000_000;
                 let price_offset_units = bar_price_units - self.base_price_units;
                 
@@ -234,31 +243,47 @@ impl SvpRenderer {
             
             self.last_data_id = Some(current_id);
             self.last_data_len = svp_data.len();
-            log::info!("SVP Buffer Updated: {} instances. BaseUnits: {}", self.instance_count, self.base_price_units);
+            // log::info!("SVP Buffer Updated: {} instances. BaseUnits: {}", self.instance_count, self.base_price_units);
         }
 
         if self.instance_count > 0 {
+            // Use unified coordinate transformation from ChartState
+            // This ensures K-lines and Volume Profile use identical transform parameters
             let state = &view_state.state;
+            let transform_params = state.compute_transform_params(bounds);
             
-            // Calculate Uniforms
-            // Y Transform (Price -> Screen Y)
-            // Using the same logic as KlineRenderer but adapted for SvpInstance format.
-            // SvpInstance.price = (price_units - base_price_units) as f32
-            // y_screen = price_offset * Z + W
+            // Update stored base value to match unified system
+            self.base_price_units = transform_params.data_base_price_units;
             
-            let tick_units_f = state.tick_size.units as f32;
-            let units_per_pixel_factor = state.cell_height / tick_units_f.max(1.0);
+            // Use unified transform parameters (same as KlineRenderer)
+            let transform_z = transform_params.transform_z;
+            let transform_w = transform_params.transform_w;
             
-            // Z: Scale factor for instance price offset
-            // y_chart = -offset * (1/tick * cell) ... (inherited from Kline derivation)
-            let transform_z = -units_per_pixel_factor * state.scaling;
-            
-            // W: Offset constant
-            // Needs to map base_price_units to screen Y
-            let base_diff_units = (state.base_price_y.units - self.base_price_units) as f32;
-            let y_chart_offset = base_diff_units * units_per_pixel_factor;
-            
-            let transform_w = (y_chart_offset + state.translation.y) * state.scaling + state.bounds.height / 2.0;
+            // Calculate VP price range for debugging (only log when data changes to reduce noise)
+            if data_changed {
+                // Calculate VP price range from actual VP data, not from base_price_units
+                // base_price_units is now aligned with K-line's base_price_y for rendering alignment,
+                // but for logging we should show the actual VP data price range
+                let (vp_min_price, vp_max_price) = if svp_data.is_empty() {
+                    (0.0, 0.0)
+                } else {
+                    let min_price_level = svp_data.iter().map(|b| b.price_level).min().unwrap_or(0);
+                    let max_price_level = svp_data.iter().map(|b| b.price_level).max().unwrap_or(0);
+                    ((min_price_level as f64) / 100.0, (max_price_level as f64) / 100.0)
+                };
+                
+                // Calculate visible K-line price range for comparison
+                let visible_kline_price_range = if let Some((_, _, lowest, highest)) = state.debug_visible_range {
+                    Some((lowest, highest))
+                } else {
+                    None
+                };
+                
+                log::info!(
+                    "[SvpRenderer::prepare] VP data updated: {} bars, vp_price_range={:.8}-{:.8}, state.base_price_y={:.8}, visible_kline_price_range={:?}",
+                    svp_data.len(), vp_min_price, vp_max_price, state.base_price_y.to_f32(), visible_kline_price_range
+                );
+            }
 
             // X Parameters
             // Use screen width for max width calculation to keep it proportional to screen
@@ -296,7 +321,21 @@ impl SvpRenderer {
                 });
                 self.bind_group = Some(bind_group);
             } else {
-                queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&[uniforms]));
+                // Only update if uniforms actually changed
+                // This avoids unnecessary GPU buffer writes during dragging
+                let needs_update = self.last_uniforms.as_ref()
+                    .map(|last| {
+                        last.transform != uniforms.transform
+                        || last.screen_size != uniforms.screen_size
+                        || last.svp_params != uniforms.svp_params
+                        || last.bar_height != uniforms.bar_height
+                    })
+                    .unwrap_or(true);
+                
+                if needs_update {
+                    queue.write_buffer(self.uniform_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&[uniforms]));
+                    self.last_uniforms = Some(uniforms);
+                }
             }
         }
     }

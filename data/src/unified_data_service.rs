@@ -54,18 +54,18 @@ impl UnifiedDataService {
     ) -> Result<Vec<KLine>, DataError> {
         let safe_cutoff = calculate_safe_historical_cutoff();
         
-        log::info!(
-            "UnifiedDataService: fetch_klines for {} timeframe {}, range: {} - {} us, safe_cutoff: {} us",
-            symbol,
-            timeframe,
-            range.start_us,
-            range.end_us,
-            safe_cutoff
-        );
+        // log::info!(
+        //     "UnifiedDataService: fetch_klines for {} timeframe {}, range: {} - {} us, safe_cutoff: {} us",
+        //     symbol,
+        //     timeframe,
+        //     range.start_us,
+        //     range.end_us,
+        //     safe_cutoff
+        // );
 
         if range.start_us >= safe_cutoff {
             // Pure real-time data: read from Mmap and aggregate to K-lines
-            log::info!("UnifiedDataService: attempting real-time data source (Mmap)");
+            // log::info!("UnifiedDataService: attempting real-time data source (Mmap)");
             let symbol_clone = symbol.clone();
             let timeframe_clone = timeframe.to_string();
             let result = tokio::task::spawn_blocking({
@@ -90,16 +90,16 @@ impl UnifiedDataService {
                     range.end_us
                 );
             } else {
-                log::info!("UnifiedDataService: real-time data returned {} K-lines", result.len());
+                // log::info!("UnifiedDataService: real-time data returned {} K-lines", result.len());
             }
             
             Ok(result)
         } else if range.end_us < safe_cutoff {
             // Pure historical data: download or read from cache
-            log::info!("UnifiedDataService: using historical data source (cache/download)");
+            // log::info!("UnifiedDataService: using historical data source (cache/download)");
             let result = self.batch_layer.fetch_klines(&symbol, range, timeframe).await;
             match &result {
-                Ok(klines) => log::info!("UnifiedDataService: historical data returned {} K-lines", klines.len()),
+                Ok(_klines) => {}, // log::info!("UnifiedDataService: historical data returned {} K-lines", klines.len()),
                 Err(e) => log::warn!("UnifiedDataService: historical data fetch failed: {:?}", e),
             }
             result
@@ -124,7 +124,7 @@ impl UnifiedDataService {
             });
 
             // Await both futures concurrently
-            log::info!("UnifiedDataService: cross-boundary query, fetching from both sources");
+            // log::info!("UnifiedDataService: cross-boundary query, fetching from both sources");
             let (historical_result, realtime_join_result) = tokio::join!(
                 historical_future,
                 realtime_future
@@ -134,11 +134,11 @@ impl UnifiedDataService {
             let mut historical = historical_result?;
             let realtime = realtime_join_result??;
             
-            log::info!(
-                "UnifiedDataService: cross-boundary merge - historical: {} K-lines, real-time: {} K-lines",
-                historical.len(),
-                realtime.len()
-            );
+            // log::info!(
+            //     "UnifiedDataService: cross-boundary merge - historical: {} K-lines, real-time: {} K-lines",
+            //     historical.len(),
+            //     realtime.len()
+            // );
 
             // If real-time data is empty, we still have historical data
             // If both are empty, we'll return an empty vector (which is correct)
@@ -146,10 +146,10 @@ impl UnifiedDataService {
             historical.sort_by_key(|k| k.open_time_us);
             historical.dedup_by_key(|k| k.open_time_us);
             
-            log::info!(
-                "UnifiedDataService: merged result: {} K-lines",
-                historical.len()
-            );
+            // log::info!(
+            //     "UnifiedDataService: merged result: {} K-lines",
+            //     historical.len()
+            // );
 
             Ok(historical)
         }
@@ -250,34 +250,34 @@ fn calculate_safe_historical_cutoff() -> u64 {
         24 // Force use of yesterday's boundary
     };
     
-    log::info!(
-        "calculate_safe_historical_cutoff: now={:?} ({} us), today={:?}, midnight={:?} ({} us), hours_since_midnight={}",
-        now,
-        now_micros,
-        today,
-        midnight_utc,
-        cutoff,
-        hours_since_midnight
-    );
+    // log::info!(
+    //     "calculate_safe_historical_cutoff: now={:?} ({} us), today={:?}, midnight={:?} ({} us), hours_since_midnight={}",
+    //     now,
+    //     now_micros,
+    //     today,
+    //     midnight_utc,
+    //     cutoff,
+    //     hours_since_midnight
+    // );
     
     if hours_since_midnight < 6 {
         // Use previous day's boundary (historical data may not be published yet)
         let yesterday = today.pred_opt().unwrap_or(today);
         let yesterday_midnight = yesterday.and_hms_opt(0, 0, 0).unwrap();
         let yesterday_cutoff = yesterday_midnight.and_utc().timestamp_micros() as u64;
-        log::info!(
-            "calculate_safe_historical_cutoff: using yesterday's boundary: {} us ({:?})",
-            yesterday_cutoff,
-            yesterday_midnight.and_utc()
-        );
+        // log::info!(
+        //     "calculate_safe_historical_cutoff: using yesterday's boundary: {} us ({:?})",
+        //     yesterday_cutoff,
+        //     yesterday_midnight.and_utc()
+        // );
         yesterday_cutoff
     } else {
         // Use today's boundary (historical data should be published)
-        log::info!(
-            "calculate_safe_historical_cutoff: using today's boundary: {} us ({:?})",
-            cutoff,
-            midnight_utc
-        );
+        // log::info!(
+        //     "calculate_safe_historical_cutoff: using today's boundary: {} us ({:?})",
+        //     cutoff,
+        //     midnight_utc
+        // );
         cutoff
     }
 }
