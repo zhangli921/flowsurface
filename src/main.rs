@@ -50,6 +50,7 @@ use std::{
     sync::Arc,
     vec,
 };
+use tokio::sync::broadcast;
 
 fn main() {
     logger::setup(cfg!(debug_assertions)).expect("Failed to initialize logger");
@@ -92,6 +93,10 @@ struct Flowsurface {
     availability_index: Arc<DataAvailabilityIndex>,
     download_coordinator: Arc<HistoricalDownloadCoordinator>,
     historical_data_status_window: Option<(window::Id, screen::historical_data_status::HistoricalDataStatusWindow)>,
+    // VP overlap threshold tracking
+    vp_overlap_threshold: Option<(String, f64)>, // (symbol, overlap_ratio)
+    // EventBus receiver for polling events (wrapped in Arc<Mutex> to be Send + Sync)
+    event_bus_receiver: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<data::DataEvent>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +233,8 @@ impl Flowsurface {
             theme: saved_state.theme,
             notifications: vec![],
             ingest_tx,
+            vp_overlap_threshold: None,
+            event_bus_receiver: Arc::new(tokio::sync::Mutex::new(event_bus.subscribe())),
         };
         
         // Update all dashboards with the unified_data_service
@@ -332,6 +339,7 @@ impl Flowsurface {
                     let service = service.clone();
                     let unified_service = self.unified_data_service.clone();
                     let symbol_clone = symbol.clone();
+                    let event_bus = self.event_bus.clone();
                     
                     // Trigger ingestion if needed (for real-time data)
                     let normalized_symbol = normalize_binance_symbol(&symbol_clone);
@@ -373,15 +381,56 @@ impl Flowsurface {
                         let _ = self.ingest_tx.try_send(IngestCommand::Subscribe(symbol_clone.clone(), timeframe_opt));
                     }
                     
+                    // Publish VP computation started event
+                    let _ = event_bus.publish(data::DataEvent::VpComputeStarted {
+                        symbol: symbol_clone.clone(),
+                        range_start_us: range.start_us,
+                        range_end_us: range.end_us,
+                    });
+                    
                     return Task::future(async move {
                         // Use UnifiedDataService to fetch ticks (automatically handles real-time and historical)
                         let ticks = match unified_service.fetch_ticks(symbol_clone.clone(), range).await {
                             Ok(ticks) => ticks,
                             Err(e) => {
                                 let compute_err: data::compute::vp::ComputeError = e.into();
+                                // Publish failure event
+                                let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                                    symbol: symbol_clone.clone(),
+                                    range_start_us: range.start_us,
+                                    range_end_us: range.end_us,
+                                    error: compute_err.to_string(),
+                                });
                                 return Message::VpComputed(symbol_clone.clone(), Err(compute_err));
                             },
                         };
+                        
+                        // Calculate overlap ratio and publish event
+                        let overlap_ratio = if let Some((actual_start, actual_end)) = ticks.time_range {
+                            let overlap_start = actual_start.max(range.start_us);
+                            let overlap_end = actual_end.min(range.end_us);
+                            
+                            if overlap_start >= overlap_end {
+                                0.0
+                            } else {
+                                let requested_span = range.end_us.saturating_sub(range.start_us);
+                                let overlap_span = overlap_end.saturating_sub(overlap_start);
+                                
+                                if requested_span > 0 {
+                                    overlap_span as f64 / requested_span as f64
+                                } else {
+                                    1.0
+                                }
+                            }
+                        } else {
+                            1.0 // Old format
+                        };
+                        
+                        // Publish overlap threshold updated event
+                        let _ = event_bus.publish(data::DataEvent::VpOverlapThresholdUpdated {
+                            symbol: symbol_clone.clone(),
+                            overlap_ratio,
+                        });
                         
                         // CRITICAL: Verify data completeness before computing VP
                         // Check if the tick data covers the requested time range
@@ -424,6 +473,13 @@ impl Flowsurface {
                                 "VP computation skipped for {}: Data incomplete. Requested: {} - {} us, Actual: {:?}",
                                 symbol_clone, range.start_us, range.end_us, ticks.time_range
                             );
+                            // Publish failure event
+                            let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                                symbol: symbol_clone.clone(),
+                                range_start_us: range.start_us,
+                                range_end_us: range.end_us,
+                                error: format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us),
+                            });
                             return Message::VpComputed(symbol_clone.clone(), Err(
                                 data::compute::vp::ComputeError::Other(
                                     format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us)
@@ -434,6 +490,13 @@ impl Flowsurface {
                         // Calculate compute parameters
                         let num_ticks = ticks.prices.len() as u32;
                         if num_ticks == 0 {
+                            // Publish failure event
+                            let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                                symbol: symbol_clone.clone(),
+                                range_start_us: range.start_us,
+                                range_end_us: range.end_us,
+                                error: "No ticks found".to_string(),
+                            });
                             return Message::VpComputed(symbol_clone.clone(), Err(
                                 data::compute::vp::ComputeError::Other("No ticks found".to_string())
                             ));
@@ -455,6 +518,27 @@ impl Flowsurface {
                         
                         // Run compute on GPU
                         let result = service.compute_vp(&ticks, &params, histogram_buckets).await;
+                        
+                        // Publish completion event
+                        match &result {
+                            Ok(profile) => {
+                                let _ = event_bus.publish(data::DataEvent::VpComputeCompleted {
+                                    symbol: symbol_clone.clone(),
+                                    range_start_us: range.start_us,
+                                    range_end_us: range.end_us,
+                                    bar_count: profile.bars.len(),
+                                });
+                            }
+                            Err(e) => {
+                                let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                                    symbol: symbol_clone.clone(),
+                                    range_start_us: range.start_us,
+                                    range_end_us: range.end_us,
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                        
                         Message::VpComputed(symbol_clone, result)
                     });
                 } else {
@@ -508,11 +592,43 @@ impl Flowsurface {
             }
             Message::Tick(now) => {
                 let main_window_id = self.main_window.id;
-
-                return self
-                    .active_dashboard_mut()
-                    .tick(now, main_window_id)
+                
+                // Poll EventBus for new events (non-blocking)
+                let receiver = self.event_bus_receiver.clone();
+                let poll_task = Task::perform(
+                    async move {
+                        let mut receiver = receiver.lock().await;
+                        let mut events = Vec::new();
+                        // Collect up to 10 events per tick to avoid blocking
+                        for _ in 0..10 {
+                            match receiver.try_recv() {
+                                Ok(event) => events.push(event),
+                                Err(broadcast::error::TryRecvError::Empty) => break,
+                                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                                    log::warn!("EventBus subscription lagged, skipped {} events", skipped);
+                                    break; // Stop after lag to avoid infinite loop
+                                }
+                                Err(broadcast::error::TryRecvError::Closed) => break,
+                            }
+                        }
+                        events
+                    },
+                    move |events| {
+                        if events.is_empty() {
+                            Message::Tick(now)
+                        } else {
+                            // Process all events by returning the first one
+                            // Remaining events will be processed in subsequent ticks
+                            // This is acceptable since events are not time-critical
+                            Message::DataEvent(events.into_iter().next().unwrap())
+                        }
+                    },
+                );
+                
+                let dashboard_tick = self.active_dashboard_mut().tick(now, main_window_id)
                     .map(move |msg| Message::Dashboard(None, msg));
+                
+                return poll_task.chain(dashboard_tick);
             }
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
@@ -841,13 +957,31 @@ impl Flowsurface {
             }
             Message::AudioStream(message) => self.audio_stream.update(message),
             Message::DataEvent(event) => {
+                // Handle VP-related events
+                match &event {
+                    data::DataEvent::VpOverlapThresholdUpdated { symbol, overlap_ratio } => {
+                        // Update overlap threshold for display
+                        self.vp_overlap_threshold = Some((symbol.clone(), *overlap_ratio));
+                    }
+                    data::DataEvent::VpComputeStarted { symbol, .. } => {
+                        log::debug!("VP computation started for {}", symbol);
+                    }
+                    data::DataEvent::VpComputeCompleted { symbol, bar_count, .. } => {
+                        log::debug!("VP computation completed for {}: {} bars", symbol, bar_count);
+                    }
+                    data::DataEvent::VpComputeFailed { symbol, error, .. } => {
+                        log::warn!("VP computation failed for {}: {}", symbol, error);
+                    }
+                    _ => {}
+                }
+                
                 // Forward events to historical data status window if open
                 if let Some((_, ref mut window)) = self.historical_data_status_window {
                     return window.update(screen::historical_data_status::Message::DataEvent(event))
                         .map(Message::HistoricalDataStatus);
                 }
                 
-                // Log events if window is not open
+                // Log other events if window is not open
                 match event {
                     data::DataEvent::DownloadStarted { symbol, date, .. } => {
                         log::debug!("Download started: {} {}", symbol, date);
@@ -971,22 +1105,45 @@ impl Flowsurface {
             let header_title = {
                 #[cfg(target_os = "macos")]
                 {
+                    let overlap_info = if let Some((symbol, ratio)) = &self.vp_overlap_threshold {
+                        row![
+                            text(format!("VP重叠阈值: {} ({:.1}%)", symbol, ratio * 100.0))
+                                .size(12)
+                                .style(style::title_text),
+                        ]
+                        .spacing(8)
+                    } else {
+                        row![]
+                    };
+                    
                     iced::widget::center(
-                        text("FLOWSURFACE")
-                            .font(iced::Font {
-                                weight: iced::font::Weight::Bold,
-                                ..Default::default()
-                            })
-                            .size(16)
-                            .style(style::title_text),
+                        column![
+                            text("FLOWSURFACE")
+                                .font(iced::Font {
+                                    weight: iced::font::Weight::Bold,
+                                    ..Default::default()
+                                })
+                                .size(16)
+                                .style(style::title_text),
+                            overlap_info,
+                        ]
+                        .spacing(4)
                     )
-                    .height(20)
+                    .height(if self.vp_overlap_threshold.is_some() { 40 } else { 20 })
                     .align_y(Alignment::Center)
                     .padding(padding::top(4))
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    column![]
+                    if let Some((symbol, ratio)) = &self.vp_overlap_threshold {
+                        row![
+                            text(format!("VP重叠阈值: {} ({:.1}%)", symbol, ratio * 100.0))
+                                .size(12),
+                        ]
+                        .spacing(8)
+                    } else {
+                        row![]
+                    }
                 }
             };
 
@@ -1062,6 +1219,8 @@ impl Flowsurface {
             keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::GoBack),
             _ => None,
         });
+
+        // EventBus events are polled in the Tick handler, no separate subscription needed
 
         let mut subscriptions = vec![
             exchange_streams,

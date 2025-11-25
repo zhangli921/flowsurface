@@ -95,6 +95,38 @@ pub enum DataEvent {
         date: String,
         data_type: DataType,
     },
+    
+    // ========== VP Computation Events ==========
+    
+    /// VP overlap threshold has been calculated.
+    /// This indicates the data completeness ratio for VP computation.
+    VpOverlapThresholdUpdated {
+        symbol: String,
+        overlap_ratio: f64, // 0.0 to 1.0, indicating how much of requested range is covered
+    },
+    
+    /// VP computation has started.
+    VpComputeStarted {
+        symbol: String,
+        range_start_us: u64,
+        range_end_us: u64,
+    },
+    
+    /// VP computation has completed successfully.
+    VpComputeCompleted {
+        symbol: String,
+        range_start_us: u64,
+        range_end_us: u64,
+        bar_count: usize,
+    },
+    
+    /// VP computation has failed.
+    VpComputeFailed {
+        symbol: String,
+        range_start_us: u64,
+        range_end_us: u64,
+        error: String,
+    },
 }
 
 /// Type of data being downloaded or updated.

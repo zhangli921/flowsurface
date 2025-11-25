@@ -116,16 +116,20 @@ impl UnifiedDataService {
             );
 
             // Merge historical and real-time data
-            let mut historical = historical_result?;
+            let historical = historical_result?;
             let realtime = realtime_join_result??;
 
             // If real-time data is empty, we still have historical data
             // If both are empty, we'll return an empty vector (which is correct)
-            historical.extend(realtime);
-            historical.sort_by_key(|k| k.open_time_us);
-            historical.dedup_by_key(|k| k.open_time_us);
+            // Merge: put real-time data first, then historical, so dedup keeps real-time (more accurate)
+            let mut merged = realtime;
+            merged.extend(historical);
+            merged.sort_by_key(|k| k.open_time_us);
+            // Dedup: keep the first occurrence (real-time data) when duplicates exist
+            // This ensures real-time data (more accurate) takes precedence over historical data
+            merged.dedup_by_key(|k| k.open_time_us);
 
-            Ok(historical)
+            Ok(merged)
         }
     }
 
