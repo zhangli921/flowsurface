@@ -16,6 +16,7 @@ use crate::{
     historical_download_executor::HistoricalDownloadExecutor,
     kline::KLine,
     compute::vp::TickDataBuffer,
+    realtime_ingester::normalize_binance_symbol,
     time_utils::{calculate_date_range, calculate_safe_historical_cutoff, filter_historical_dates},
     TimeRange,
 };
@@ -54,6 +55,9 @@ impl HistoricalDataService {
         range: TimeRange,
         timeframe: &str, // e.g., "1m", "5m", "1h"
     ) -> Result<Vec<KLine>, DataError> {
+        // Normalize symbol to ensure consistency with cache file names
+        let normalized_symbol = normalize_binance_symbol(symbol);
+        
         // 1. Calculate date range for the requested time range
         let safe_cutoff = calculate_safe_historical_cutoff();
         let effective_end = range.end_us.min(safe_cutoff);
@@ -65,9 +69,9 @@ impl HistoricalDataService {
         filter_historical_dates(&mut dates, safe_cutoff);
         
         // 2. Check data availability and submit download tasks for missing data
-        self.submit_missing_download_tasks(symbol, &dates, |date| {
+        self.submit_missing_download_tasks(&normalized_symbol, &dates, |date| {
             DownloadTask::new(
-                symbol.to_string(),
+                normalized_symbol.clone(),
                 date.clone(),
                 DataType::Kline { timeframe: Some(timeframe.to_string()) },
                 Some(timeframe.to_string()),
@@ -79,10 +83,10 @@ impl HistoricalDataService {
 
         // 3. Load available data (don't wait for downloads to complete)
         for date in dates {
-            let cache_key = format!("{}_{}_{}.parquet", symbol, date, timeframe);
+            let cache_key = format!("{}_{}_{}.parquet", normalized_symbol, date, timeframe);
             let cache_path = self.cache_dir.join(cache_key);
 
-            let klines = self.load_cached_klines(&cache_path, symbol, &date, timeframe).await;
+            let klines = self.load_cached_klines(&cache_path, &normalized_symbol, &date, timeframe).await;
 
             // 4. Filter to visible range (only keep needed data)
             let filtered: Vec<KLine> = klines
@@ -104,6 +108,9 @@ impl HistoricalDataService {
         symbol: &str,
         range: TimeRange,
     ) -> Result<TickDataBuffer, DataError> {
+        // Normalize symbol to ensure consistency with cache file names
+        let normalized_symbol = normalize_binance_symbol(symbol);
+        
         // 1. Calculate date range for the requested time range
         let safe_cutoff = calculate_safe_historical_cutoff();
         let effective_end = range.end_us.min(safe_cutoff);
@@ -115,9 +122,9 @@ impl HistoricalDataService {
         filter_historical_dates(&mut dates, safe_cutoff);
         
         // 2. Check data availability and submit download tasks for missing data
-        self.submit_missing_download_tasks(symbol, &dates, |date| {
+        self.submit_missing_download_tasks(&normalized_symbol, &dates, |date| {
             DownloadTask::new(
-                symbol.to_string(),
+                normalized_symbol.clone(),
                 date.clone(),
                 DataType::Tick,
                 None,
@@ -131,10 +138,10 @@ impl HistoricalDataService {
 
         // 3. Load available data (don't wait for downloads to complete)
         for date in &dates {
-            let cache_key = format!("{}_{}_ticks.parquet", symbol, date);
+            let cache_key = format!("{}_{}_ticks.parquet", normalized_symbol, date);
             let cache_path = self.cache_dir.join(cache_key);
 
-            let ticks = self.load_cached_ticks(&cache_path, symbol, date).await;
+            let ticks = self.load_cached_ticks(&cache_path, &normalized_symbol, date).await;
 
             // 4. Merge data and time ranges
             let tick_count = ticks.prices.len();
