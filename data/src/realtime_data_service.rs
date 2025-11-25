@@ -6,6 +6,7 @@ use storage::MmapStore;
 use arrow::array; // Required for downcasting Arrow arrays
 
 use crate::{kline::KLine, data_error::DataError, compute::vp::TickDataBuffer, realtime_ingester::normalize_binance_symbol};
+use exchange::{AdapterRegistry, Exchange, Ticker, TickerInfo, Timeframe};
 
 /// Defines a time range with microsecond precision.
 /// Microsecond precision is sufficient for financial data and allows representing
@@ -37,6 +38,24 @@ fn normalize_key_hash_to_us(key_hash: u64) -> u64 {
         key_hash / 1_000
     } else {
         key_hash
+    }
+}
+
+/// Parse timeframe string (e.g., "1m", "5m", "1h") to Timeframe enum.
+fn parse_timeframe(s: &str) -> Option<Timeframe> {
+    match s {
+        "1m" => Some(Timeframe::M1),
+        "3m" => Some(Timeframe::M3),
+        "5m" => Some(Timeframe::M5),
+        "15m" => Some(Timeframe::M15),
+        "30m" => Some(Timeframe::M30),
+        "1h" => Some(Timeframe::H1),
+        "2h" => Some(Timeframe::H2),
+        "4h" => Some(Timeframe::H4),
+        "6h" => Some(Timeframe::H6),
+        "12h" => Some(Timeframe::H12),
+        "1d" => Some(Timeframe::D1),
+        _ => None,
     }
 }
 
@@ -157,10 +176,10 @@ impl RealtimeDataService {
     ///
     /// # Arguments
     ///
-    /// Fetches K-line data from Binance REST API.
+    /// Fetches K-line data using ExchangeAdapter trait (unified interface).
     /// 
-    /// This method directly fetches K-line data from Binance API instead of aggregating from trade data,
-    /// providing much faster response times for K-line chart display.
+    /// This method uses the AdapterRegistry to fetch K-line data through the ExchangeAdapter trait,
+    /// providing a unified interface for all exchanges and eliminating code duplication.
     /// 
     /// # Arguments
     /// 
@@ -185,100 +204,55 @@ impl RealtimeDataService {
             }
         }
 
-        // 2. Cache miss or insufficient coverage: fetch from API
-        // Binance K-line API endpoint
-        let url = format!(
-            "https://api.binance.com/api/v3/klines?symbol={}&interval={}&startTime={}&endTime={}&limit=1000",
-            api_symbol,
-            timeframe,
-            range.start_us / 1_000, // Convert us to ms
-            range.end_us / 1_000    // Convert us to ms
-        );
+        // 2. Cache miss or insufficient coverage: fetch from API using Trait pattern
+        // Parse timeframe string to Timeframe enum
+        let tf = parse_timeframe(timeframe)
+            .ok_or_else(|| DataError::InvalidInput(format!("Invalid timeframe: {}", timeframe)))?;
 
-        // Use blocking HTTP client
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| DataError::Network(reqwest::Error::from(e)))?;
+        // Determine Exchange type (currently hardcoded to BinanceSpot, can be extended later)
+        let exchange = Exchange::BinanceSpot;
+        
+        // Get adapter from registry
+        let registry = AdapterRegistry::global();
+        let adapter = registry.get(exchange)
+            .ok_or_else(|| DataError::Adapter(format!("No adapter found for exchange: {:?}", exchange)))?;
 
-        let response = client.get(&url).send()
-            .map_err(|e| DataError::Network(e))?;
+        // Create Ticker and TickerInfo
+        // Note: We use default values for min_ticksize and min_qty since we don't have ticker info here.
+        // The adapter will handle this internally or fetch it if needed.
+        let ticker = Ticker::new(&api_symbol, exchange);
+        // Use default ticker info - the adapter should handle missing info gracefully
+        // For Binance, we can use reasonable defaults: min_ticksize = 0.01, min_qty = 0.001
+        let ticker_info = TickerInfo::new(ticker, 0.01, 0.001, None);
 
-        if !response.status().is_success() {
-            return Err(DataError::Network(
-                response.error_for_status().unwrap_err()
-            ));
-        }
+        // Convert time range from microseconds to milliseconds for API call
+        let time_range_ms = Some((range.start_us / 1_000, range.end_us / 1_000));
 
-        // Parse JSON response
-        // Binance returns an array of arrays: [[open_time, open, high, low, close, volume, close_time, ...], ...]
-        let klines_json: Vec<Vec<serde_json::Value>> = response.json()
-            .map_err(|e| DataError::InvalidInput("Failed to parse JSON response".to_string()))?;
+        // Call async method using tokio runtime handle
+        // This allows us to call async code from a blocking context
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| DataError::InvalidInput("No tokio runtime available".to_string()))?;
 
-        let mut klines = Vec::new();
-        for kline_array in klines_json {
-            if kline_array.len() < 9 {
-                continue; // Skip invalid entries
-        }
+        let exchange_klines = handle.block_on(async {
+            adapter.fetch_klines(ticker_info, tf, time_range_ms).await
+        })
+        .map_err(|e| DataError::Adapter(format!("Exchange adapter error: {}", e)))?;
 
-            // Parse fields from Binance response
-            // [0] Open time (ms)
-            // [1] Open price (string)
-            // [2] High price (string)
-            // [3] Low price (string)
-            // [4] Close price (string)
-            // [5] Volume (string)
-            // [6] Close time (ms)
-            // [7] Quote asset volume (string)
-            // [8] Number of trades (u64)
-            // [9] Taker buy base asset volume (string)
-            // [10] Taker buy quote asset volume (string)
-            // [11] Ignore
+        // Convert exchange::Kline to data::KLine
+        let mut klines: Vec<KLine> = exchange_klines
+            .into_iter()
+            .map(|k| KLine {
+                open_time_us: k.time * 1_000, // Convert ms to us
+                open: k.open.to_f32() as f64,
+                high: k.high.to_f32() as f64,
+                low: k.low.to_f32() as f64,
+                close: k.close.to_f32() as f64,
+                volume: (k.volume.0 + k.volume.1) as f64,
+                num_trades: 0, // exchange::Kline doesn't have num_trades
+            })
+            .collect();
 
-            let open_time_ms = kline_array[0].as_u64()
-                .ok_or_else(|| DataError::InvalidInput("Invalid open_time".to_string()))?;
-            
-            let open = kline_array[1].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid open price".to_string()))?
-                .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse open price".to_string()))?;
-            
-            let high = kline_array[2].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid high price".to_string()))?
-                .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse high price".to_string()))?;
-            
-            let low = kline_array[3].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid low price".to_string()))?
-                .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse low price".to_string()))?;
-            
-            let close = kline_array[4].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid close price".to_string()))?
-                .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse close price".to_string()))?;
-            
-            let volume = kline_array[5].as_str()
-                .ok_or_else(|| DataError::InvalidInput("Invalid volume".to_string()))?
-                .parse::<f64>()
-                .map_err(|_| DataError::InvalidInput("Failed to parse volume".to_string()))?;
-            
-            let num_trades = kline_array[8].as_u64()
-                .ok_or_else(|| DataError::InvalidInput("Invalid num_trades".to_string()))?
-                as u32;
-
-            klines.push(KLine {
-                open_time_us: open_time_ms * 1_000, // Convert ms to us
-                open,
-                high,
-                low,
-                close,
-                volume,
-                num_trades,
-                });
-        }
-
-        // Filter to requested range (Binance API may return slightly more data)
+        // Filter to requested range (API may return slightly more data)
         klines.retain(|k| k.open_time_us >= range.start_us && k.open_time_us < range.end_us);
 
         // 3. Update cache with fetched data
