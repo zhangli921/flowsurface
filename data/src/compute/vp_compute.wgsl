@@ -18,6 +18,8 @@ struct ComputeParams {
     min_price: u32,
     // Factor to scale f32 volume to u32 for atomic operations
     volume_scaling_factor: u32,
+    // Offset for chunked processing (used when splitting large datasets)
+    tick_offset: u32,
 };
 
 @group(0) @binding(3) var<uniform> compute_params: ComputeParams;
@@ -25,7 +27,8 @@ struct ComputeParams {
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let tick_index = global_id.x;
+    // Calculate actual tick index with offset for chunked processing
+    let tick_index = global_id.x + compute_params.tick_offset;
 
     // Boundary check
     if (tick_index >= compute_params.num_ticks) {

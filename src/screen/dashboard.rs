@@ -98,11 +98,33 @@ impl Default for Dashboard {
                 // In practice, Dashboard::default() should not be used.
                 panic!("Dashboard::default() should not be used. Use Dashboard::new() instead.");
             });
+        
+        // Create temporary services for default dashboard
+        // In practice, these should be passed from main.rs
+        let event_bus = Arc::new(data::EventBus::new());
+        let availability_index = Arc::new(data::DataAvailabilityIndex::new());
+        let download_executor = Arc::new(data::HistoricalDownloadExecutor::new(None));
+        let download_coordinator = Arc::new(data::HistoricalDownloadCoordinator::new(
+            availability_index.clone(),
+            download_executor.clone(),
+            event_bus.clone(),
+        ));
+        
+        // Spawn download loop
+        let download_coordinator_clone = download_coordinator.clone();
+        tokio::spawn(async move {
+            download_coordinator_clone.run_download_loop().await;
+        });
+        
+        let historical_data_service = Arc::new(data::HistoricalDataService::new(
+            download_executor,
+            availability_index,
+            download_coordinator,
+        ));
+        
         let unified_service = Arc::new(data::UnifiedDataService::new(
             Arc::new(data::RealtimeDataService::new(data::data_path(Some("market_data")))),
-            Arc::new(data::HistoricalDataService::new(Arc::new(
-                data::HistoricalIngesterService::new(None),
-            ))),
+            historical_data_service,
         ));
         Self::new(unified_service)
     }

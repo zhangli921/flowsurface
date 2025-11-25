@@ -4,7 +4,7 @@
 //! - UnifiedDataService
 //! - RealtimeDataService
 //! - HistoricalDataService
-//! - HistoricalIngesterService
+//! - HistoricalDownloadExecutor
 //! - VP computation services
 
 use thiserror::Error;

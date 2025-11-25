@@ -10,8 +10,11 @@ use std::sync::Arc;
 use chrono::{TimeZone, Utc};
 
 use crate::{
+    data_availability_index::DataAvailabilityIndex,
     data_error::DataError,
-    historical_ingester::HistoricalIngesterService,
+    event_bus::{DataType, DownloadPriority},
+    historical_download_coordinator::{DownloadTask, HistoricalDownloadCoordinator},
+    historical_download_executor::HistoricalDownloadExecutor,
     kline::KLine,
     compute::vp::TickDataBuffer,
     TimeRange,
@@ -20,17 +23,25 @@ use crate::{
 /// Service for reading historical data from cache.
 #[derive(Clone)]
 pub struct HistoricalDataService {
-    ingester: Arc<HistoricalIngesterService>,
+    executor: Arc<HistoricalDownloadExecutor>,
     cache_dir: PathBuf,
+    availability_index: Arc<DataAvailabilityIndex>,
+    download_coordinator: Arc<HistoricalDownloadCoordinator>,
 }
 
 impl HistoricalDataService {
     /// Creates a new `HistoricalDataService`.
-    pub fn new(ingester: Arc<HistoricalIngesterService>) -> Self {
-        let cache_dir = ingester.cache_dir.clone();
+    pub fn new(
+        executor: Arc<HistoricalDownloadExecutor>,
+        availability_index: Arc<DataAvailabilityIndex>,
+        download_coordinator: Arc<HistoricalDownloadCoordinator>,
+    ) -> Self {
+        let cache_dir = executor.cache_dir.clone();
         Self {
-            ingester,
+            executor,
             cache_dir,
+            availability_index,
+            download_coordinator,
         }
     }
 
@@ -68,41 +79,64 @@ impl HistoricalDataService {
                 false
             }
         });
+        
+        // 2. Check data availability index and submit download tasks for missing data
+        let availability_results = self.availability_index.check_date_range(symbol, &dates).await;
+        let missing_dates: Vec<String> = availability_results
+            .into_iter()
+            .filter(|(_, status)| {
+                matches!(status, crate::event_bus::DataAvailability::Unknown | crate::event_bus::DataAvailability::Unavailable)
+            })
+            .map(|(date, _)| date)
+            .collect();
+        
+        // 3. Submit download tasks (non-blocking, UserRequest priority)
+        if !missing_dates.is_empty() {
+            log::info!("[HistoricalDataService] Submitting {} download tasks for {} (timeframe: {})", 
+                missing_dates.len(), symbol, timeframe);
+        }
+        for date in &missing_dates {
+            log::info!("[HistoricalDataService] Submitting download task: {} {} {}", symbol, date, timeframe);
+            self.download_coordinator.submit_task(DownloadTask::new(
+                symbol.to_string(),
+                date.clone(),
+                DataType::Kline { timeframe: Some(timeframe.to_string()) },
+                Some(timeframe.to_string()),
+                DownloadPriority::UserRequest,
+            )).await;
+        }
 
         let mut all_klines = Vec::new();
 
+        // 4. Load available data (don't wait for downloads to complete)
         for date in dates {
-            // 2. Check cache
             let cache_key = format!("{}_{}_{}.parquet", symbol, date, timeframe);
             let cache_path = self.cache_dir.join(cache_key);
 
             let klines = if cache_path.exists() {
-                // 3. Cache hit: load from cache
-                match self.ingester.load_klines_from_cache(&cache_path).await {
+                // Cache hit: load from cache
+                match self.executor.load_klines_from_cache(&cache_path).await {
                     Ok(cached_klines) => cached_klines,
                     Err(e) => {
-                        log::warn!("Cache file corrupted, will re-download: {}", e);
-                        // Cache corrupted, trigger download
-                        // If download fails (e.g., 404 for today's data), continue with empty data
-                        match self.ingester.download_and_cache_kline(symbol, &date, timeframe).await {
-                            Ok(downloaded_klines) => downloaded_klines,
-                            Err(e) => {
-                                log::warn!("Failed to download K-lines for {}/{}/{}: {}. Continuing with empty data.", symbol, timeframe, date, e);
-                                Vec::new()
-                            }
-                        }
-                    }
-                }
-            } else {
-                // 4. Cache miss: trigger download
-                // If download fails (e.g., 404 for today's data), continue with empty data
-                match self.ingester.download_and_cache_kline(symbol, &date, timeframe).await {
-                    Ok(downloaded_klines) => downloaded_klines,
-                    Err(e) => {
-                        log::warn!("Failed to download K-lines for {}/{}/{}: {}. Continuing with empty data.", symbol, timeframe, date, e);
+                        log::warn!("Cache file corrupted for {}/{}/{}: {}. Will be re-downloaded.", symbol, timeframe, date, e);
+                        // Mark as Partial and trigger re-download
+                        self.availability_index
+                            .update_availability(symbol, &date, crate::event_bus::DataAvailability::Partial)
+                            .await;
+                        self.download_coordinator.submit_task(DownloadTask::new(
+                            symbol.to_string(),
+                            date.clone(),
+                            DataType::Kline { timeframe: Some(timeframe.to_string()) },
+                            Some(timeframe.to_string()),
+                            DownloadPriority::UserRequest,
+                        )).await;
                         Vec::new()
                     }
                 }
+            } else {
+                // Cache miss: data will be downloaded by download service
+                // Return empty for now, data will be available after download completes
+                Vec::new()
             };
 
             // 5. Filter to visible range (only keep needed data)
@@ -151,44 +185,62 @@ impl HistoricalDataService {
             }
         });
         
+        // 2. Check data availability index and submit download tasks for missing data
+        let availability_results = self.availability_index.check_date_range(symbol, &dates).await;
+        let missing_dates: Vec<String> = availability_results
+            .into_iter()
+            .filter(|(_, status)| {
+                matches!(status, crate::event_bus::DataAvailability::Unknown | crate::event_bus::DataAvailability::Unavailable)
+            })
+            .map(|(date, _)| date)
+            .collect();
+        
+        // 3. Submit download tasks (non-blocking, UserRequest priority)
+        for date in &missing_dates {
+            self.download_coordinator.submit_task(DownloadTask::new(
+                symbol.to_string(),
+                date.clone(),
+                DataType::Tick,
+                None,
+                DownloadPriority::UserRequest,
+            )).await;
+        }
 
         let mut all_prices = Vec::new();
         let mut all_volumes = Vec::new();
         let mut merged_time_range: Option<(u64, u64)> = None;
 
-        for date in dates {
-            // 2. Check cache
+        // 4. Load available data (don't wait for downloads to complete)
+        for date in &dates {
             let cache_key = format!("{}_{}_ticks.parquet", symbol, date);
             let cache_path = self.cache_dir.join(cache_key);
 
             let ticks = if cache_path.exists() {
-                // 3. Cache hit: load from cache
-                match self.ingester.load_ticks_from_cache(&cache_path).await {
-                    Ok(cached_ticks) => cached_ticks,
-                    Err(e) => {
-                        log::warn!("Cache file corrupted, will re-download: {}", e);
-                        // Cache corrupted, trigger download
-                        // If download fails (e.g., 404 for today's data), continue with empty data
-                        match self.ingester.download_and_cache_ticks(symbol, &date).await {
-                            Ok(downloaded_ticks) => downloaded_ticks,
-                            Err(e) => {
-                                log::warn!("Failed to download ticks for {}/{}: {}. Continuing with empty data.", symbol, date, e);
-                                TickDataBuffer {
-                                    prices: Vec::new(),
-                                    volumes: Vec::new(),
-                                    time_range: None,
-                                }
-                            }
-                        }
+                // Cache hit: load from cache
+                match self.executor.load_ticks_from_cache(&cache_path).await {
+                    Ok(cached_ticks) => {
+                        log::debug!(
+                            "[HistoricalDataService] Loaded {} ticks for {}/{} (time_range: {:?})",
+                            cached_ticks.prices.len(),
+                            symbol,
+                            date,
+                            cached_ticks.time_range
+                        );
+                        cached_ticks
                     }
-                }
-            } else {
-                // 4. Cache miss: trigger download
-                // If download fails (e.g., 404 for today's data), continue with empty data
-                match self.ingester.download_and_cache_ticks(symbol, &date).await {
-                    Ok(downloaded_ticks) => downloaded_ticks,
                     Err(e) => {
-                        log::warn!("Failed to download ticks for {}/{}: {}. Continuing with empty data.", symbol, date, e);
+                        log::warn!("Cache file corrupted for {}/{}: {}. Will be re-downloaded.", symbol, date, e);
+                        // Mark as Partial and trigger re-download
+                        self.availability_index
+                            .update_availability(symbol, date, crate::event_bus::DataAvailability::Partial)
+                            .await;
+                        self.download_coordinator.submit_task(DownloadTask::new(
+                            symbol.to_string(),
+                            date.clone(),
+                            DataType::Tick,
+                            None,
+                            DownloadPriority::UserRequest,
+                        )).await;
                         TickDataBuffer {
                             prices: Vec::new(),
                             volumes: Vec::new(),
@@ -196,9 +248,19 @@ impl HistoricalDataService {
                         }
                     }
                 }
+            } else {
+                log::debug!("[HistoricalDataService] Cache miss for {}/{}", symbol, date);
+                // Cache miss: data will be downloaded by download service
+                // Return empty for now, data will be available after download completes
+                TickDataBuffer {
+                    prices: Vec::new(),
+                    volumes: Vec::new(),
+                    time_range: None,
+                }
             };
 
             // 5. Merge data and time ranges
+            let tick_count = ticks.prices.len();
             all_prices.extend(ticks.prices);
             all_volumes.extend(ticks.volumes);
             
@@ -210,7 +272,26 @@ impl HistoricalDataService {
                     }
                     None => (start, end),
                 });
+            } else if tick_count > 0 {
+                // Data exists but no time_range (old format, e.g., 23号)
+                log::debug!("[HistoricalDataService] {}/{} has {} ticks but no time_range (old format)", symbol, date, tick_count);
             }
+        }
+        
+        log::info!(
+            "[HistoricalDataService] Merged {} ticks from {} dates, time_range: {:?}",
+            all_prices.len(),
+            dates.len(),
+            merged_time_range
+        );
+
+        // If we have data but time_range is incomplete (some dates missing),
+        // we should still compute the expected time range based on requested dates
+        // to help with data completeness validation
+        // However, if we have no data at all, we can't infer a time range
+        if merged_time_range.is_none() && !all_prices.is_empty() {
+            // This shouldn't happen if data has timestamps, but handle gracefully
+            log::warn!("Historical tick data has no time_range but contains {} ticks. This may indicate old cache format.", all_prices.len());
         }
 
         // Historical data now tracks time_range from timestamps

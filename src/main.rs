@@ -20,8 +20,10 @@ use data::{
     kline_cache::KlineCache,
     layout::WindowSpec,
     sidebar, DataError,
+    data_availability_index::DataAvailabilityIndex,
     historical_data_service::HistoricalDataService,
-    historical_ingester::HistoricalIngesterService,
+    historical_download_coordinator::HistoricalDownloadCoordinator,
+    historical_download_executor::HistoricalDownloadExecutor,
 };
 use layout::{configuration, Layout};
 use modal::{audio, dashboard_modal, main_dialog_modal, LayoutManager, ThemeEditor};
@@ -86,6 +88,10 @@ struct Flowsurface {
     theme: data::Theme,
     notifications: Vec<Toast>,
     ingest_tx: tokio::sync::mpsc::Sender<IngestCommand>,
+    event_bus: Arc<data::EventBus>, // Unified event bus for data services
+    availability_index: Arc<DataAvailabilityIndex>,
+    download_coordinator: Arc<HistoricalDownloadCoordinator>,
+    historical_data_status_window: Option<(window::Id, screen::historical_data_status::HistoricalDataStatusWindow)>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +119,9 @@ enum Message {
     ThemeEditor(modal::theme_editor::Message),
     Layouts(modal::layout_manager::Message),
     AudioStream(modal::audio::Message),
+    DataEvent(data::DataEvent), // Event from data service event bus
+    OpenHistoricalDataStatusWindow,
+    HistoricalDataStatus(screen::historical_data_status::Message),
 }
 
 impl Flowsurface {
@@ -134,16 +143,46 @@ impl Flowsurface {
         // -------------------------------
 
         // --- Start of Unified Data Service Initialization ---
+        // Create unified event bus for data services
+        let event_bus = Arc::new(data::EventBus::new());
+        
+        // Create data availability index
+        let availability_index = Arc::new(data::DataAvailabilityIndex::new());
+        
+        // Create historical download executor
+        let download_executor = Arc::new(HistoricalDownloadExecutor::new(None));
+        
+        // Create historical download coordinator (and spawn download loop)
+        let download_coordinator = Arc::new(HistoricalDownloadCoordinator::new(
+            availability_index.clone(),
+            download_executor.clone(),
+            event_bus.clone(),
+        ));
+        
+        // Spawn download loop as background task
+        let download_coordinator_clone = download_coordinator.clone();
+        tokio::spawn(async move {
+            download_coordinator_clone.run_download_loop().await;
+        });
+        
         let data_dir = data::data_path(Some("market_data"));
         std::fs::create_dir_all(&data_dir).ok();
 
         let mut realtime_data_service = RealtimeDataService::new(data_dir.clone());
         realtime_data_service.set_kline_cache(kline_cache.clone());
+        
+        // Create historical data service with new dependencies
+        let historical_data_service = Arc::new(HistoricalDataService::new(
+            download_executor.clone(),
+            availability_index.clone(),
+            download_coordinator.clone(),
+        ));
+        
         let unified_data_service = Arc::new(UnifiedDataService::new(
             Arc::new(realtime_data_service),
-            Arc::new(HistoricalDataService::new(Arc::new(HistoricalIngesterService::new(None)))),
+            historical_data_service,
         ));
-        // --- End of Arbiter Service Initialization ---
+        // --- End of Unified Data Service Initialization ---
 
         let saved_state = layout::load_saved_state(unified_data_service.clone());
 
@@ -177,6 +216,10 @@ impl Flowsurface {
             layout_manager: saved_state.layout_manager,
             theme_editor: ThemeEditor::new(saved_state.custom_theme),
             audio_stream: audio::AudioStream::new(saved_state.audio_cfg),
+            event_bus: event_bus.clone(),
+            availability_index: availability_index.clone(),
+            download_coordinator: download_coordinator.clone(),
+            historical_data_status_window: None,
             sidebar,
             confirm_dialog: None,
             timezone: saved_state.timezone,
@@ -355,14 +398,20 @@ impl Flowsurface {
                                 let requested_span = range.end_us.saturating_sub(range.start_us);
                                 let overlap_span = overlap_end.saturating_sub(overlap_start);
                                 
-                                // Require at least 50% overlap with requested range
-                                // This allows VP computation even if historical data is missing
-                                if requested_span > 0 {
-                                    let overlap_ratio = overlap_span as f64 / requested_span as f64;
-                                    overlap_ratio >= 0.5 // At least 50% overlap
+                                // For historical data, we're more lenient:
+                                // - If overlap covers at least 50% of requested range, proceed
+                                // - OR if the actual data range is large enough (>= 12 hours), proceed
+                                //   (this handles cases where some dates are missing but we have substantial data)
+                                let overlap_ratio = if requested_span > 0 {
+                                    overlap_span as f64 / requested_span as f64
                                 } else {
-                                    true
-                                }
+                                    1.0
+                                };
+                                
+                                let actual_span = actual_end.saturating_sub(actual_start);
+                                let has_substantial_data = actual_span >= 12 * 3_600_000_000; // 12 hours in microseconds
+                                
+                                overlap_ratio >= 0.5 || has_substantial_data
                             }
                         } else {
                             // If time_range is None (old cache files or data without timestamps), we can't verify completeness
@@ -401,6 +450,7 @@ impl Flowsurface {
                             price_resolution,
                             min_price,
                             volume_scaling_factor: 10000, // Scale by 10000 to preserve 4 decimal places
+                            tick_offset: 0, // Start from beginning
                         };
                         
                         // Run compute on GPU
@@ -414,6 +464,14 @@ impl Flowsurface {
             Message::VpComputed(symbol, result) => {
                 match result {
                     Ok(profile) => {
+                        log::debug!(
+                            "[VP] Computation successful for {}: {} bars, POC: {}, VA: {} - {}",
+                            symbol,
+                            profile.bars.len(),
+                            profile.point_of_control,
+                            profile.value_area_start,
+                            profile.value_area_end
+                        );
                         // Find the chart for this symbol and update its VP data
                         let dashboard = self.active_dashboard_mut();
                         
@@ -421,10 +479,10 @@ impl Flowsurface {
                             if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
                                 chart.set_volume_profile(profile);
                             } else {
-                                // Chart not found or not a Kline chart
+                                log::warn!("[VP] Chart not found or not a Kline chart for {}", symbol);
                             }
                         } else {
-                            // Pane not found
+                            log::warn!("[VP] Pane not found for {}", symbol);
                         }
                     }
                     Err(e) => {
@@ -459,13 +517,25 @@ impl Flowsurface {
             Message::WindowEvent(event) => match event {
                 window::Event::CloseRequested(window) => {
                     let main_window = self.main_window.id;
-                    let dashboard = self.active_dashboard_mut();
 
                     if window != main_window {
+                        // Check if it's the historical data status window
+                        let is_historical_window = self.historical_data_status_window
+                            .as_ref()
+                            .map_or(false, |(window_id, _)| *window_id == window);
+                        
+                        if is_historical_window {
+                            self.historical_data_status_window = None;
+                            return window::close(window);
+                        }
+                        
+                        // Otherwise, it's a popout window
+                        let dashboard = self.active_dashboard_mut();
                         dashboard.popout.remove(&window);
                         return window::close(window);
                     }
 
+                    let dashboard = self.active_dashboard_mut();
                     let mut opened_windows = dashboard
                         .popout
                         .keys()
@@ -770,6 +840,60 @@ impl Flowsurface {
                 }
             }
             Message::AudioStream(message) => self.audio_stream.update(message),
+            Message::DataEvent(event) => {
+                // Forward events to historical data status window if open
+                if let Some((_, ref mut window)) = self.historical_data_status_window {
+                    return window.update(screen::historical_data_status::Message::DataEvent(event))
+                        .map(Message::HistoricalDataStatus);
+                }
+                
+                // Log events if window is not open
+                match event {
+                    data::DataEvent::DownloadStarted { symbol, date, .. } => {
+                        log::debug!("Download started: {} {}", symbol, date);
+                    }
+                    data::DataEvent::DownloadCompleted { symbol, date, .. } => {
+                        log::debug!("Download completed: {} {}", symbol, date);
+                    }
+                    data::DataEvent::DownloadFailed { symbol, date, error, .. } => {
+                        log::warn!("Download failed: {} {} - {}", symbol, date, error);
+                    }
+                    data::DataEvent::AvailabilityChanged { symbol, date, status } => {
+                        log::debug!("Availability changed: {} {} - {:?}", symbol, date, status);
+                    }
+                    _ => {}
+                }
+            }
+            Message::OpenHistoricalDataStatusWindow => {
+                if self.historical_data_status_window.is_none() {
+                    let (mut window_state, _predefined_window_id) = screen::historical_data_status::HistoricalDataStatusWindow::new(
+                        self.availability_index.clone(),
+                        self.download_coordinator.clone(),
+                        self.event_bus.clone(),
+                    );
+                    
+                    // Trigger initial data refresh
+                    let refresh_task = window_state.update(screen::historical_data_status::Message::Refresh);
+                    
+                    let window_config = window::Settings {
+                        size: iced::Size::new(1000.0, 700.0),
+                        exit_on_close_request: false,
+                        ..window::settings()
+                    };
+                    
+                    let (actual_window_id, open_task) = window::open(window_config);
+                    self.historical_data_status_window = Some((actual_window_id, window_state));
+                    
+                    return open_task
+                        .map(|_| Message::Tick(std::time::Instant::now()))
+                        .chain(refresh_task.map(Message::HistoricalDataStatus));
+                }
+            }
+            Message::HistoricalDataStatus(msg) => {
+                if let Some((_, ref mut window)) = self.historical_data_status_window {
+                    return window.update(msg).map(Message::HistoricalDataStatus);
+                }
+            }
             Message::DataFolderRequested => {
                 if let Err(err) = data::open_data_folder() {
                     self.notifications
@@ -881,6 +1005,14 @@ impl Flowsurface {
             } else {
                 base.into()
             }
+        } else if let Some((window_id, window_state)) = &self.historical_data_status_window {
+            // Historical data status window
+            if *window_id == id {
+                window_state.view().map(Message::HistoricalDataStatus)
+            } else {
+                // Unknown window, return empty
+                container(text("Unknown window")).into()
+            }
         } else {
             container(
                 dashboard
@@ -931,13 +1063,20 @@ impl Flowsurface {
             _ => None,
         });
 
-        Subscription::batch(vec![
+        let mut subscriptions = vec![
             exchange_streams,
             sidebar,
             window_events,
             tick,
             hotkeys,
-        ])
+        ];
+        
+        // Add subscription for historical data status window if open
+        if let Some((_, window)) = &self.historical_data_status_window {
+            subscriptions.push(window.subscription().map(Message::HistoricalDataStatus));
+        }
+
+        Subscription::batch(subscriptions)
     }
 
     fn active_dashboard(&self) -> &Dashboard {
@@ -1094,8 +1233,19 @@ impl Flowsurface {
                         )
                     };
 
+                    let open_historical_data_status = {
+                        let button = button(text("历史数据状态"))
+                            .on_press(Message::OpenHistoricalDataStatusWindow);
+
+                        tooltip(
+                            button,
+                            Some("查看和管理历史数据的下载状态"),
+                            TooltipPosition::Top,
+                        )
+                    };
+
                     let column_content = split_column![
-                        column![open_data_folder,].spacing(8),
+                        column![open_data_folder, open_historical_data_status,].spacing(8),
                         column![text("Sidebar position").size(14), sidebar_pos,].spacing(12),
                         column![text("Time zone").size(14), timezone_picklist,].spacing(12),
                         column![text("Market data").size(14), size_in_quote_currency_checkbox,].spacing(12),

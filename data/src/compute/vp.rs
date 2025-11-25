@@ -14,6 +14,7 @@ pub struct ComputeParams {
     pub price_resolution: u32,
     pub min_price: u32,
     pub volume_scaling_factor: u32,
+    pub tick_offset: u32, // Offset for chunked processing
 }
 
 // TickDataBuffer to match the shader's input structure
@@ -190,6 +191,73 @@ impl VpComputePipeline {
             ],
         });
 
+        let workgroup_size = 64;
+        let total_workgroups = (params.num_ticks + workgroup_size - 1) / workgroup_size;
+        
+        // WGPU limits: Each dispatch group size dimension must be <= 65535
+        const MAX_WORKGROUPS_PER_DISPATCH: u32 = 65535;
+        
+        // Pre-create all uniform buffers and bind groups if we need to split
+        let mut chunk_uniform_buffers = Vec::new();
+        let mut chunk_bind_groups = Vec::new();
+        let mut chunk_workgroups = Vec::new();
+        
+        if total_workgroups > MAX_WORKGROUPS_PER_DISPATCH {
+            // Split into multiple dispatches with offset support
+            let mut offset = 0u32;
+            let mut remaining_ticks = params.num_ticks;
+            
+            while remaining_ticks > 0 {
+                let workgroups_this_dispatch = (remaining_ticks + workgroup_size - 1) / workgroup_size;
+                let workgroups_this_dispatch = workgroups_this_dispatch.min(MAX_WORKGROUPS_PER_DISPATCH);
+                let ticks_this_dispatch = workgroups_this_dispatch * workgroup_size;
+                let ticks_this_dispatch = ticks_this_dispatch.min(remaining_ticks);
+                
+                // Create a new uniform buffer with updated offset
+                let chunk_params = ComputeParams {
+                    num_ticks: params.num_ticks, // Keep original total for boundary check
+                    price_resolution: params.price_resolution,
+                    min_price: params.min_price,
+                    volume_scaling_factor: params.volume_scaling_factor,
+                    tick_offset: offset,
+                };
+                
+                let chunk_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("VP Uniform Buffer (Chunk)"),
+                    contents: bytemuck::bytes_of(&chunk_params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                
+                let chunk_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("VP Bind Group (Chunk)"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: price_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: volume_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: histogram_buffer.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: chunk_uniform_buffer.as_entire_binding() },
+                    ],
+                });
+                
+                chunk_uniform_buffers.push(chunk_uniform_buffer);
+                chunk_bind_groups.push(chunk_bind_group);
+                chunk_workgroups.push(workgroups_this_dispatch);
+                
+                offset += ticks_this_dispatch;
+                remaining_ticks = remaining_ticks.saturating_sub(ticks_this_dispatch);
+                
+                if remaining_ticks == 0 {
+                    break;
+                }
+            }
+            
+            log::debug!(
+                "VP computation: Split {} ticks into {} dispatches",
+                params.num_ticks,
+                chunk_bind_groups.len()
+            );
+        }
+
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("VP Command Encoder"),
         });
@@ -203,11 +271,18 @@ impl VpComputePipeline {
                 timestamp_writes: None,
             });
             compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
             
-            let workgroup_size = 64;
-            let workgroup_count = (params.num_ticks + workgroup_size - 1) / workgroup_size;
-            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+            if total_workgroups <= MAX_WORKGROUPS_PER_DISPATCH {
+                // Single dispatch is sufficient
+                compute_pass.set_bind_group(0, &bind_group, &[]);
+                compute_pass.dispatch_workgroups(total_workgroups, 1, 1);
+            } else {
+                // Dispatch all chunks (bind groups are kept alive by the vectors)
+                for (bind_group, workgroups) in chunk_bind_groups.iter().zip(chunk_workgroups.iter()) {
+                    compute_pass.set_bind_group(0, bind_group, &[]);
+                    compute_pass.dispatch_workgroups(*workgroups, 1, 1);
+                }
+            }
         }
 
         encoder.copy_buffer_to_buffer(&histogram_buffer, 0, &staging_buffer, 0, histogram_buffer_size);

@@ -1,9 +1,14 @@
-//! Service for downloading historical data from Binance Data Vision and writing to cache.
+//! Historical data download executor for downloading and caching data.
 //!
-//! This service is responsible for:
+//! This executor is responsible for:
 //! - Downloading historical K-line and Tick data from Binance Data Vision
 //! - Writing downloaded data to Parquet cache files
+//! - Reading cached data from Parquet files
 //! - Managing cache directory structure
+//!
+//! The executor performs the actual download and cache operations, but does not
+//! manage task queues, retry logic, or state. Those responsibilities belong to
+//! `HistoricalDownloadCoordinator`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,17 +28,20 @@ use csv;
 
 use crate::{data_error::DataError, data_path, kline::KLine, compute::vp::TickDataBuffer};
 
-/// Service for downloading and caching historical data.
+/// Executor for downloading and caching historical data.
+///
+/// This executor performs the actual download and cache operations. It is called
+/// by `HistoricalDownloadCoordinator` to execute download tasks.
 #[derive(Clone)]
-pub struct HistoricalIngesterService {
+pub struct HistoricalDownloadExecutor {
     client: Client,
     pub(crate) cache_dir: PathBuf,
     // Track ongoing downloads to prevent duplicate concurrent downloads
     downloading: Arc<Mutex<HashSet<String>>>,
 }
 
-impl HistoricalIngesterService {
-    /// Creates a new `HistoricalIngesterService`.
+impl HistoricalDownloadExecutor {
+    /// Creates a new `HistoricalDownloadExecutor`.
     pub fn new(cache_dir: Option<PathBuf>) -> Self {
         let cache_dir = cache_dir.unwrap_or_else(|| data_path(Some("cache")));
         Self {
@@ -41,6 +49,11 @@ impl HistoricalIngesterService {
             cache_dir,
             downloading: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+    
+    /// Gets the cache directory path.
+    pub fn cache_dir(&self) -> &PathBuf {
+        &self.cache_dir
     }
 
     /// Downloads historical K-line data for a specific date and writes it to cache.
@@ -50,14 +63,18 @@ impl HistoricalIngesterService {
         date: &str, // Format: "YYYY-MM-DD"
         timeframe: &str, // e.g., "1m", "5m", "1h"
     ) -> Result<Vec<KLine>, DataError> {
+        log::info!("[DownloadExecutor] Starting K-line download: {} {} {}", symbol, date, timeframe);
         // 1. Check if cache already exists
         let cache_key = format!("{}_{}_{}.parquet", symbol, date, timeframe);
         let cache_path = self.cache_dir.join(&cache_key);
         
         if cache_path.exists() {
+            log::info!("[DownloadExecutor] Cache exists, loading from cache: {}", cache_path.display());
             // Cache already exists, load from cache
             return self.load_klines_from_cache(&cache_path).await;
         }
+        
+        log::info!("[DownloadExecutor] Cache not found, downloading from Binance Data Vision...");
 
         // 2. Check if download is already in progress (prevent duplicate downloads)
         let download_key = format!("kline:{}_{}_{}", symbol, date, timeframe);
@@ -110,6 +127,7 @@ impl HistoricalIngesterService {
         symbol: &str,
         date: &str, // Format: "YYYY-MM-DD"
     ) -> Result<TickDataBuffer, DataError> {
+        log::info!("[DownloadExecutor] Starting tick download: {} {}", symbol, date);
         // 1. Check if cache already exists
         let cache_key = format!("{}_{}_ticks.parquet", symbol, date);
         let cache_path = self.cache_dir.join(&cache_key);
@@ -508,12 +526,32 @@ impl HistoricalIngesterService {
             volumes: Vec::new(),
             time_range: None,
         };
-        if let Some(batch_result) = reader.next() {
+        
+        // Read all batches (not just the first one)
+        let mut batch_count = 0;
+        while let Some(batch_result) = reader.next() {
             let batch = batch_result?;
             let ticks = record_batch_to_ticks(&batch)?;
+            batch_count += 1;
+            
+            // Merge time_range: use the first non-None time_range we find
+            // Time range should be the same across all batches (stored in first row of first batch)
+            if all_ticks.time_range.is_none() {
+                all_ticks.time_range = ticks.time_range;
+            }
+            
             all_ticks.prices.extend(ticks.prices);
             all_ticks.volumes.extend(ticks.volumes);
         }
+        
+        log::debug!(
+            "[DownloadExecutor] Loaded {} ticks from {} batches, cache: {} (time_range: {:?})",
+            all_ticks.prices.len(),
+            batch_count,
+            cache_path.display(),
+            all_ticks.time_range
+        );
+        
         Ok(all_ticks)
     }
 }
@@ -725,7 +763,19 @@ fn record_batch_to_ticks(batch: &RecordBatch) -> Result<TickDataBuffer, DataErro
         
         // Read from first row (where time_range is stored)
         if start_array.len() > 0 && end_array.len() > 0 && start_array.is_valid(0) && end_array.is_valid(0) {
-            Some((start_array.value(0), end_array.value(0)))
+            let start_val = start_array.value(0);
+            let end_val = end_array.value(0);
+            
+            // Check if values look like nanoseconds (too large for microseconds)
+            // Microseconds for 2025 dates should be around 1.7e15, nanoseconds would be 1.7e18
+            let (start_us, end_us) = if start_val > 1_000_000_000_000_000_000 {
+                // Looks like nanoseconds, convert to microseconds
+                (start_val / 1_000, end_val / 1_000)
+            } else {
+                (start_val, end_val)
+            };
+            
+            Some((start_us, end_us))
         } else {
             None
         }

@@ -1,4 +1,5 @@
 pub mod dashboard;
+pub mod historical_data_status;
 
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum DashboardError {
@@ -9,3 +10,4 @@ pub enum DashboardError {
     #[error("Unknown error: {0}")]
     Unknown(String),
 }
+
