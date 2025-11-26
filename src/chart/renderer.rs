@@ -179,11 +179,9 @@ impl shader::Primitive for ChartRenderer {
         renderer.kline_renderer.prepare(device, queue, &self.kline_data, &self.view_state, bounds);
 
         // Prepare SVP data for rendering
-        if !self.svp_data.is_empty() {
-            if let Some(svp_renderer) = &mut renderer.svp_renderer {
-                // Delegate preparation to SvpRenderer
-                svp_renderer.prepare(device, queue, &self.svp_data, &self.view_state, ());
-            }
+        // Always call prepare, even if svp_data is empty, to clear old VP data
+        if let Some(svp_renderer) = &mut renderer.svp_renderer {
+            svp_renderer.prepare(device, queue, &self.svp_data, &self.view_state, ());
         }
     }
     
@@ -192,9 +190,11 @@ impl shader::Primitive for ChartRenderer {
         renderer: &Self::Renderer,
         render_pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        // Draw SVP (background layer)
-        if let Some(svp_renderer) = &renderer.svp_renderer {
-            svp_renderer.draw(render_pass);
+        // Draw SVP (background layer) - only if data is not empty
+        if !self.svp_data.is_empty() {
+            if let Some(svp_renderer) = &renderer.svp_renderer {
+                svp_renderer.draw(render_pass);
+            }
         }
 
         // Draw K-lines (foreground layer)

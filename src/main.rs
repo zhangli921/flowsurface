@@ -113,7 +113,7 @@ enum Message {
     FetchKLines(String, TimeRange, String), // symbol, time range, timeframe
     KLineDataFetched(Result<Vec<KLine>, Arc<DataError>>),
     ComputeVp(String, TimeRange), // symbol, time range
-    VpComputed(String, Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>), // (symbol, result)
+    VpComputed(String, Result<data::compute::vp::VolumeProfile, data::compute::vp::ComputeError>, Option<TimeRange>), // (symbol, result, time_range)
     VpServiceInitialized(Result<Arc<VpComputeService>, String>),
     Tick(std::time::Instant),
     WindowEvent(window::Event),
@@ -411,7 +411,7 @@ impl Flowsurface {
                     log::warn!("ComputeVp requested but VpComputeService is not ready.");
                 }
             }
-            Message::VpComputed(symbol, result) => {
+            Message::VpComputed(symbol, result, time_range) => {
                 match result {
                     Ok(profile) => {
                         log::debug!(
@@ -427,7 +427,26 @@ impl Flowsurface {
                         
                         if let Some(pane) = dashboard.find_pane_by_symbol(&symbol) {
                             if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
-                                chart.set_volume_profile(profile);
+                                // Double-check: if there are no K-lines visible on screen, clear VP
+                                // Use screen coordinate check (more accurate than time range check)
+                                let has_visible_klines = chart.has_visible_klines_on_screen();
+                                
+                                log::debug!(
+                                    "[VP Post-Check] {}: Has visible K-lines on screen: {}",
+                                    symbol, has_visible_klines
+                                );
+                                
+                                if !has_visible_klines {
+                                    log::debug!(
+                                        "[VP] Clearing VP for {}: No K-lines visible on screen after computation",
+                                        symbol
+                                    );
+                                    chart.clear_volume_profile();
+                                } else {
+                                    // Convert TimeRange to (start_us, end_us) tuple
+                                    let time_range_tuple = time_range.map(|tr| (tr.start_us, tr.end_us));
+                                    chart.set_volume_profile(profile, time_range_tuple);
+                                }
                             } else {
                                 log::warn!("[VP] Chart not found or not a Kline chart for {}", symbol);
                             }
@@ -436,20 +455,27 @@ impl Flowsurface {
                         }
                     }
                     Err(e) => {
-                        // VP computation failed - check if it's due to incomplete data
-                        let error_msg = e.to_string();
-                        let is_data_incomplete = error_msg.contains("incomplete") || error_msg.contains("No ticks found");
-                        
-                        if is_data_incomplete {
-                            // Mark VP as needing update so it will retry when data is available
-                            let dashboard = self.active_dashboard_mut();
-                            if let Some(pane) = dashboard.find_pane_by_symbol(&symbol) {
-                                if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
-                                    // Re-enable VP update flag so it will retry
+                        // VP computation failed - clear existing VP data since it's no longer valid
+                        let dashboard = self.active_dashboard_mut();
+                        if let Some(pane) = dashboard.find_pane_by_symbol(&symbol) {
+                            if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &mut pane.content {
+                                // Clear VP data since computation failed
+                                chart.clear_volume_profile();
+                                
+                                // Check if it's due to incomplete data - if so, mark for retry
+                                let error_msg = e.to_string();
+                                let is_data_incomplete = error_msg.contains("incomplete") || error_msg.contains("No ticks found");
+                                if is_data_incomplete {
+                                    // Mark VP as needing update so it will retry when data is available
                                     chart.mark_vp_needs_update();
                                 }
                             }
-                        } else {
+                        }
+                        
+                        // Log the error
+                        let error_msg = e.to_string();
+                        let is_data_incomplete = error_msg.contains("incomplete") || error_msg.contains("No ticks found");
+                        if !is_data_incomplete {
                             // Other errors (GPU, computation, etc.) - log but don't retry
                             log::warn!("VP computation failed for {}: {}", symbol, e);
                         }
@@ -1167,6 +1193,46 @@ impl Flowsurface {
             range_end_us: range.end_us,
         });
         
+        // Check if there are K-lines actually visible on screen before computing VP
+        // Use screen coordinate check (more accurate than time range check)
+        let has_visible_klines = {
+            let dashboard = self.active_dashboard_mut();
+            if let Some(pane) = dashboard.find_pane_by_symbol(&symbol_clone) {
+                if let screen::dashboard::pane::Content::Kline { chart: Some(chart), .. } = &pane.content {
+                    let has_visible = chart.has_visible_klines_on_screen();
+                    log::debug!(
+                        "[VP K-line Check] {}: Has visible K-lines on screen: {}",
+                        symbol_clone, has_visible
+                    );
+                    has_visible
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        
+        // If no K-lines visible on screen, return empty VP immediately
+        // Use Err to indicate this is a skip, not a successful computation
+        if !has_visible_klines {
+            log::debug!(
+                "[VP] Computation skipped for {}: No K-lines visible on screen. Requested: {} - {} us",
+                symbol_clone, range.start_us, range.end_us
+            );
+            let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
+                symbol: symbol_clone.clone(),
+                range_start_us: range.start_us,
+                range_end_us: range.end_us,
+                error: "No K-lines visible on screen".to_string(),
+            });
+            return Task::done(Message::VpComputed(symbol_clone.clone(), Err(
+                data::compute::vp::ComputeError::Other(
+                    "No K-lines visible on screen".to_string()
+                )
+            ), Some(range)));
+        }
+        
         Task::future(async move {
             // Use UnifiedDataService to fetch ticks (automatically handles real-time and historical)
             let ticks = match unified_service.fetch_ticks(symbol_clone.clone(), range).await {
@@ -1179,7 +1245,7 @@ impl Flowsurface {
                         range_end_us: range.end_us,
                         error: compute_err.to_string(),
                     });
-                    return Message::VpComputed(symbol_clone.clone(), Err(compute_err));
+                    return Message::VpComputed(symbol_clone.clone(), Err(compute_err), Some(range));
                 },
             };
             
@@ -1227,61 +1293,60 @@ impl Flowsurface {
             
             // Verify data completeness
             // Use the same buffer adjustment for consistency (constant defined above)
+            // Only check if there's any overlap at all - no threshold on overlap ratio
             let data_complete = if let Some((actual_start, actual_end)) = ticks.time_range {
                 // Add buffer to actual_end for real-time data to account for write/index delays
                 let adjusted_actual_end = actual_end.saturating_add(WRITE_DELAY_BUFFER_US);
                 let overlap_start = actual_start.max(range.start_us);
                 let overlap_end = adjusted_actual_end.min(range.end_us);
                 
-                if overlap_start >= overlap_end {
-                    false
-                } else {
-                    let requested_span = range.end_us.saturating_sub(range.start_us);
-                    let overlap_span = overlap_end.saturating_sub(overlap_start);
-                    let overlap_ratio = if requested_span > 0 {
-                        overlap_span as f64 / requested_span as f64
-                    } else {
-                        1.0
-                    };
-                    
-                    let actual_span = actual_end.saturating_sub(actual_start);
-                    let has_substantial_data = actual_span >= 12 * 3_600_000_000;
-                    
-                    overlap_ratio >= 0.5 || has_substantial_data
-                }
+                // Any overlap means data is available for computation
+                overlap_start < overlap_end
             } else {
+                // Old format - assume complete
                 true
             };
             
             if !data_complete {
                 log::warn!(
-                    "VP computation skipped for {}: Data incomplete. Requested: {} - {} us, Actual: {:?}",
+                    "VP computation skipped for {}: No data overlap. Requested: {} - {} us, Actual: {:?}",
                     symbol_clone, range.start_us, range.end_us, ticks.time_range
                 );
                 let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
                     symbol: symbol_clone.clone(),
                     range_start_us: range.start_us,
                     range_end_us: range.end_us,
-                    error: format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us),
+                    error: format!("No data overlap for range {} - {} us", range.start_us, range.end_us),
                 });
-                return Message::VpComputed(symbol_clone.clone(), Err(
-                    data::compute::vp::ComputeError::Other(
-                        format!("Tick data incomplete for range {} - {} us", range.start_us, range.end_us)
-                    )
-                ));
+                // Return empty VP to clear existing VP data
+                return Message::VpComputed(symbol_clone.clone(), Ok(
+                    data::compute::vp::VolumeProfile {
+                        bars: Arc::new(Vec::new()),
+                        point_of_control: 0,
+                        value_area_start: 0,
+                        value_area_end: 0,
+                    }
+                ), Some(range));
             }
             
             let num_ticks = ticks.prices.len() as u32;
             if num_ticks == 0 {
+                // No ticks found - return empty VP result to clear existing VP data
                 let _ = event_bus.publish(data::DataEvent::VpComputeFailed {
                     symbol: symbol_clone.clone(),
                     range_start_us: range.start_us,
                     range_end_us: range.end_us,
                     error: "No ticks found".to_string(),
                 });
-                return Message::VpComputed(symbol_clone.clone(), Err(
-                    data::compute::vp::ComputeError::Other("No ticks found".to_string())
-                ));
+                // Return empty VP profile to trigger clearing of existing VP data
+                return Message::VpComputed(symbol_clone.clone(), Ok(
+                    data::compute::vp::VolumeProfile {
+                        bars: Arc::new(Vec::new()),
+                        point_of_control: 0,
+                        value_area_start: 0,
+                        value_area_end: 0,
+                    }
+                ), Some(range));
             }
             
             let min_price = *ticks.prices.iter().min().unwrap_or(&0) as u32;
@@ -1319,7 +1384,7 @@ impl Flowsurface {
                 }
             }
             
-            Message::VpComputed(symbol_clone, result)
+            Message::VpComputed(symbol_clone, result, Some(range))
         })
     }
 

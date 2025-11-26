@@ -45,11 +45,16 @@ impl Chart for KlineChart {
     fn chart_data(&self) -> renderer::ChartData {
         let kline_data = self.render_cache_kline.clone();
         
-        let svp_data = self.chart.state.volume_profile.as_ref().map(|vp| {
-            vp.bars.clone()
-        }).unwrap_or_else(|| {
+        // Only show VP if there are visible K-lines on screen
+        // Use the same screen coordinate check method
+        let svp_data = if self.has_visible_klines_on_screen() {
+            self.chart.state.volume_profile.as_ref()
+                .map(|vp| vp.bars.clone())
+                .unwrap_or_else(|| Arc::new(Vec::new()))
+        } else {
+            // No visible K-lines - return empty VP data
             Arc::new(Vec::new())
-        });
+        };
         
         renderer::ChartData {
             kline_data,
@@ -1209,14 +1214,64 @@ impl KlineChart {
     }
     
     /// Update the stored volume profile data
-    pub fn set_volume_profile(&mut self, vp: data::compute::vp::VolumeProfile) {
-        self.chart.state.volume_profile = Some(vp);
+    /// If bars is empty, clears the VP data instead of storing it
+    pub fn set_volume_profile(&mut self, vp: data::compute::vp::VolumeProfile, _time_range: Option<(u64, u64)>) {
+        // If VP computation returned empty bars, clear the VP data
+        if vp.bars.is_empty() {
+            self.chart.state.volume_profile = None;
+        } else {
+            self.chart.state.volume_profile = Some(vp);
+        }
         self.chart.state.vp_needs_update = false;
     }
     
     /// Mark VP as needing update (e.g., when data becomes available)
     pub fn mark_vp_needs_update(&mut self) {
         self.chart.state.vp_needs_update = true;
+    }
+    
+    /// Clear VP data (e.g., when computation fails)
+    pub fn clear_volume_profile(&mut self) {
+        self.chart.state.volume_profile = None;
+    }
+    
+    /// Check if there are any K-lines actually visible on screen using screen coordinates
+    /// Returns true if at least one K-line overlaps with the visible screen region
+    pub fn has_visible_klines_on_screen(&self) -> bool {
+        let chart = self.state();
+        if chart.bounds.width <= 0.0 || chart.bounds.height <= 0.0 || chart.scaling <= f32::EPSILON {
+            return false;
+        }
+        if self.render_cache_kline.is_empty() {
+            return false;
+        }
+        
+        // Calculate screen coordinates for K-lines (same logic as invalidate and chart_data)
+        let base_time_ms = (self.render_cache_kline[0].open_time_us / 1_000) as f64;
+        let interval_ms = match chart.basis {
+            Basis::Time(tf) => tf.to_milliseconds() as f64,
+            _ => 1.0,
+        };
+        let cell_width = chart.cell_width as f64;
+        let latest_x = chart.latest_x as f64;
+        let scale_factor = cell_width / interval_ms.max(1.0);
+        let transform_x = (scale_factor as f32) * chart.scaling;
+        let base_diff = base_time_ms - latest_x;
+        let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
+        
+        let candle_width = chart.cell_width;
+        let half_candle_width_screen = (candle_width / 2.0) * chart.scaling;
+        
+        // Check if any K-line is visible on screen
+        self.render_cache_kline.iter().any(|k| {
+            let kline_time_ms = (k.open_time_us / 1_000) as f64;
+            let time_offset = (kline_time_ms - base_time_ms) as f32;
+            let kline_center_x_screen = (time_offset * transform_x) + transform_y;
+            let kline_left_screen = kline_center_x_screen - half_candle_width_screen;
+            let kline_right_screen = kline_center_x_screen + half_candle_width_screen;
+            // K-line is visible if it overlaps with screen bounds [0, bounds.width]
+            kline_left_screen <= chart.bounds.width && kline_right_screen >= 0.0
+        })
     }
 
     fn rebuild_render_cache(&mut self) {
