@@ -7,6 +7,7 @@ pub mod renderer;
 pub mod svp_renderer;
 pub mod kline_renderer;
 pub mod axes;
+pub mod visibility;
 
 use crate::style;
 use crate::widget::multi_split::{MultiSplit};

@@ -305,23 +305,11 @@ impl<'a> canvas::Program<()> for YAxis<'a> {
             
             let visible_region = state.visible_region(content_bounds.size());
             
-            // Calculate price range from visible K-lines if available, otherwise fallback to coordinate-based calculation
-            // Use unified time range calculation (no padding for rendering)
+            // Calculate price range from visible K-lines if available, using screen coordinate check
             let raw_range = if let Some(klines) = self.kline_data {
-                let (start_ts, end_ts) = if let Some(range) = state.visible_time_range_ms_for_render() {
-                    range
-                } else {
-                    // Fallback to interval_range if visible_time_range_ms_for_render returns None
-                    state.interval_range(&visible_region)
-                };
-                // Convert to microseconds for comparison with K-line timestamps
-                let start_ts_us = start_ts.checked_mul(1_000).unwrap_or(0);
-                let end_ts_us = end_ts.checked_mul(1_000).unwrap_or(0);
-                
-                // Filter K-lines within visible time range
-                let visible_klines: Vec<_> = klines.iter()
-                    .filter(|k| k.open_time_us >= start_ts_us && k.open_time_us <= end_ts_us)
-                    .collect();
+                // Use screen coordinate check to get visible K-lines (more accurate than time range)
+                use crate::chart::visibility;
+                let visible_klines = visibility::get_visible_klines(state, klines);
                 
                 if !visible_klines.is_empty() {
                     // Find min low and max high from visible K-lines

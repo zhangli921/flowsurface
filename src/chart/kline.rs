@@ -690,6 +690,8 @@ impl KlineChart {
     }
 
     pub fn invalidate(&mut self, now: Option<Instant>) -> Option<Action> {
+        // Clone state snapshot before mutable borrow for visible K-line calculation
+        let chart_state_snapshot = self.chart.state.clone();
         let chart = &mut self.chart.state;
 
         if let Some(autoscale) = chart.layout.autoscale {
@@ -736,60 +738,17 @@ impl KlineChart {
                     self.yaxis_cache.clear();
                 }
                 super::Autoscale::FitToVisible => {
+                    // Get visible K-lines using the state snapshot (already cloned above)
+                    use crate::chart::visibility;
+                    let visible_klines_refs = visibility::get_visible_klines(&chart_state_snapshot, &self.render_cache_kline);
+                    
                     // Use unified time range calculation (no padding for rendering)
-                    let (start_interval, end_interval) = if let Some(range) = chart.visible_time_range_ms_for_render() {
+                    let (start_interval, end_interval) = if let Some(range) = chart_state_snapshot.visible_time_range_ms_for_render() {
                         range
                     } else {
                         // Cannot calculate range, skip autoscale
                         return None;
                     };
-
-                    // Calculate price range from K-lines that are actually visible on screen
-                    // Use the same coordinate calculation as the renderer to ensure consistency
-                    let base_time_ms = if !self.render_cache_kline.is_empty() {
-                        (self.render_cache_kline[0].open_time_us / 1_000) as f64
-                    } else {
-                        chart.latest_x as f64
-                    };
-                    
-                    let interval_ms = match chart.basis {
-                        Basis::Time(tf) => tf.to_milliseconds() as f64,
-                        _ => 1.0,
-                    };
-                    let cell_width = chart.cell_width as f64;
-                    let latest_x = chart.latest_x as f64;
-                    let scale_factor = cell_width / interval_ms.max(1.0);
-                    
-                    // Calculate transform parameters (same as renderer)
-                    let transform_x = (scale_factor as f32) * chart.scaling;
-                    let base_diff = base_time_ms - latest_x;
-                    let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
-                    
-                    let candle_width = chart.cell_width;
-                    let half_candle_width = candle_width / 2.0;
-                    let half_candle_width_screen = half_candle_width * chart.scaling;
-                    
-                    // Filter K-lines that are visible on screen using renderer's coordinate system
-                    let visible_klines_refs: Vec<_> = self.render_cache_kline.iter()
-                        .filter_map(|k| {
-                            let kline_time_ms = (k.open_time_us / 1_000) as f64;
-                            let time_offset = (kline_time_ms - base_time_ms) as f32;
-                            let kline_center_x_screen = (time_offset * transform_x) + transform_y;
-                            
-                            let kline_left_screen = kline_center_x_screen - half_candle_width_screen;
-                            let kline_right_screen = kline_center_x_screen + half_candle_width_screen;
-                            
-                            // Check if K-line overlaps with visible region [0, bounds.width]
-                            let is_visible = kline_left_screen <= chart.bounds.width && kline_right_screen >= 0.0;
-                            
-                            if is_visible {
-                                Some(k)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    
                     
                     let (lowest, highest) = if !visible_klines_refs.is_empty() {
                         let lowest = visible_klines_refs.iter()
@@ -801,22 +760,8 @@ impl KlineChart {
                         
                         (lowest, highest)
                     } else {
-                        // Fallback to time-based filtering
-                        let start_interval_us = start_interval * 1000;
-                        let end_interval_us = end_interval * 1000;
-                        let time_filtered_klines: Vec<_> = self.render_cache_kline.iter()
-                            .filter(|k| k.open_time_us >= start_interval_us && k.open_time_us <= end_interval_us)
-                            .collect();
-                        
-                        if !time_filtered_klines.is_empty() {
-                            let lowest = time_filtered_klines.iter()
-                                .map(|k| k.low)
-                                .fold(f64::INFINITY, |a, b| a.min(b)) as f32;
-                            let highest = time_filtered_klines.iter()
-                                .map(|k| k.high)
-                                .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
-                            (lowest, highest)
-                        } else if let Some((lowest, highest)) = self
+                        // Fallback to data source if no K-lines visible on screen
+                        if let Some((lowest, highest)) = self
                             .data_source
                             .visible_price_range(start_interval, end_interval)
                         {
@@ -907,37 +852,11 @@ impl KlineChart {
             return None;
         };
         
-        // Use renderer's coordinate system to find visible K-lines
-        let base_time_ms = if !self.render_cache_kline.is_empty() {
-            (self.render_cache_kline[0].open_time_us / 1_000) as f64
-        } else {
-            chart.latest_x as f64
-        };
-        
-        let interval_ms = match chart.basis {
-            Basis::Time(tf) => tf.to_milliseconds() as f64,
-            _ => 1.0,
-        };
-        let cell_width = chart.cell_width as f64;
-        let latest_x = chart.latest_x as f64;
-        let scale_factor = cell_width / interval_ms.max(1.0);
-        let transform_x = (scale_factor as f32) * chart.scaling;
-        let base_diff = base_time_ms - latest_x;
-        let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
-        
-        let candle_width = chart.cell_width;
-        let half_candle_width_screen = (candle_width / 2.0) * chart.scaling;
-        
-        let visible_klines: Vec<_> = self.render_cache_kline.iter()
-            .filter(|k| {
-                let kline_time_ms = (k.open_time_us / 1_000) as f64;
-                let time_offset = (kline_time_ms - base_time_ms) as f32;
-                let kline_center_x_screen = (time_offset * transform_x) + transform_y;
-                let kline_left_screen = kline_center_x_screen - half_candle_width_screen;
-                let kline_right_screen = kline_center_x_screen + half_candle_width_screen;
-                kline_left_screen <= chart.bounds.width && kline_right_screen >= 0.0
-            })
-            .collect();
+        // Use unified screen coordinate check to get visible K-lines
+        // Clone the necessary state to avoid borrowing conflicts
+        let chart_state_snapshot = chart.clone();
+        use crate::chart::visibility;
+        let visible_klines = visibility::get_visible_klines(&chart_state_snapshot, &self.render_cache_kline);
         
         if !visible_klines.is_empty() {
             let lowest = visible_klines.iter()
@@ -948,22 +867,8 @@ impl KlineChart {
                 .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
             chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
         } else {
-            // Fallback to time-based filtering if no K-lines found by X coordinate
-            let start_interval_us = start_interval * 1000;
-            let end_interval_us = end_interval * 1000;
-            let time_filtered_klines: Vec<_> = self.render_cache_kline.iter()
-                .filter(|k| k.open_time_us >= start_interval_us && k.open_time_us <= end_interval_us)
-                .collect();
-            
-            if !time_filtered_klines.is_empty() {
-                let lowest = time_filtered_klines.iter()
-                    .map(|k| k.low)
-                    .fold(f64::INFINITY, |a, b| a.min(b)) as f32;
-                let highest = time_filtered_klines.iter()
-                    .map(|k| k.high)
-                    .fold(f64::NEG_INFINITY, |a, b| a.max(b)) as f32;
-                chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
-            } else if let Some((lowest, highest)) = self
+            // Fallback to data source if no K-lines visible on screen
+            if let Some((lowest, highest)) = self
                 .data_source
                 .visible_price_range(start_interval, end_interval)
             {
@@ -996,22 +901,8 @@ impl KlineChart {
         use crate::chart::axes::YAxis;
         use exchange::util::PriceStep;
         
-        let chart = &self.chart.state;
-        // Use unified time range calculation (no padding for rendering)
-        let (start_ts, end_ts) = if let Some(range) = chart.visible_time_range_ms_for_render() {
-            range
-        } else {
-            return; // Cannot calculate range
-        };
-        
-        // Convert to microseconds for comparison with K-line timestamps
-        let start_ts_us = start_ts.checked_mul(1_000).unwrap_or(0);
-        let end_ts_us = end_ts.checked_mul(1_000).unwrap_or(0);
-        
-        // Filter K-lines within visible time range
-        let visible_klines: Vec<_> = self.render_cache_kline.iter()
-            .filter(|k| k.open_time_us >= start_ts_us && k.open_time_us <= end_ts_us)
-            .collect();
+        // Use screen coordinate check to get visible K-lines (more accurate than time range)
+        let visible_klines = self.get_visible_klines_on_screen();
         
         if !visible_klines.is_empty() {
             // Find min low and max high from visible K-lines
@@ -1025,6 +916,7 @@ impl KlineChart {
                 .unwrap_or(0.0);
             
             // Round the price range to nice values
+            let chart = &self.chart.state;
             let rounded = YAxis::round_price_range(min_low, max_high, chart.tick_size);
             
             // Apply stabilization: only update cache if change is significant
@@ -1235,43 +1127,18 @@ impl KlineChart {
         self.chart.state.volume_profile = None;
     }
     
+    /// Get K-lines that are actually visible on screen using screen coordinates
+    /// Returns a vector of references to visible K-lines
+    fn get_visible_klines_on_screen(&self) -> Vec<&data::kline::KLine> {
+        use crate::chart::visibility;
+        visibility::get_visible_klines(self.state(), &self.render_cache_kline)
+    }
+    
     /// Check if there are any K-lines actually visible on screen using screen coordinates
     /// Returns true if at least one K-line overlaps with the visible screen region
     pub fn has_visible_klines_on_screen(&self) -> bool {
-        let chart = self.state();
-        if chart.bounds.width <= 0.0 || chart.bounds.height <= 0.0 || chart.scaling <= f32::EPSILON {
-            return false;
-        }
-        if self.render_cache_kline.is_empty() {
-            return false;
-        }
-        
-        // Calculate screen coordinates for K-lines (same logic as invalidate and chart_data)
-        let base_time_ms = (self.render_cache_kline[0].open_time_us / 1_000) as f64;
-        let interval_ms = match chart.basis {
-            Basis::Time(tf) => tf.to_milliseconds() as f64,
-            _ => 1.0,
-        };
-        let cell_width = chart.cell_width as f64;
-        let latest_x = chart.latest_x as f64;
-        let scale_factor = cell_width / interval_ms.max(1.0);
-        let transform_x = (scale_factor as f32) * chart.scaling;
-        let base_diff = base_time_ms - latest_x;
-        let transform_y = ((base_diff * scale_factor) as f32 * chart.scaling) + (chart.translation.x * chart.scaling);
-        
-        let candle_width = chart.cell_width;
-        let half_candle_width_screen = (candle_width / 2.0) * chart.scaling;
-        
-        // Check if any K-line is visible on screen
-        self.render_cache_kline.iter().any(|k| {
-            let kline_time_ms = (k.open_time_us / 1_000) as f64;
-            let time_offset = (kline_time_ms - base_time_ms) as f32;
-            let kline_center_x_screen = (time_offset * transform_x) + transform_y;
-            let kline_left_screen = kline_center_x_screen - half_candle_width_screen;
-            let kline_right_screen = kline_center_x_screen + half_candle_width_screen;
-            // K-line is visible if it overlaps with screen bounds [0, bounds.width]
-            kline_left_screen <= chart.bounds.width && kline_right_screen >= 0.0
-        })
+        use crate::chart::visibility;
+        visibility::has_visible_klines(self.state(), &self.render_cache_kline)
     }
 
     fn rebuild_render_cache(&mut self) {
