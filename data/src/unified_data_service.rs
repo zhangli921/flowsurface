@@ -195,11 +195,43 @@ impl UnifiedDataService {
             let merged_time_range = match (historical.time_range, realtime.time_range) {
                 (Some((hist_start, hist_end)), Some((rt_start, rt_end))) => {
                     // Both have ranges: merge them (historical is earlier, realtime is later)
-                    Some((hist_start.min(rt_start), hist_end.max(rt_end)))
+                    // The merged range should cover from the earliest start to the latest end
+                    let merged_start = hist_start.min(rt_start);
+                    let merged_end = hist_end.max(rt_end);
+                    
+                    // Debug logging for time range merging
+                    log::debug!(
+                        "[UnifiedDataService] Merging tick data time ranges for {}: Historical: {} - {} us, Real-time: {} - {} us, Merged: {} - {} us, Requested: {} - {} us",
+                        symbol,
+                        hist_start, hist_end,
+                        rt_start, rt_end,
+                        merged_start, merged_end,
+                        range.start_us, range.end_us
+                    );
+                    
+                    Some((merged_start, merged_end))
                 }
-                (Some(hist_range), None) => Some(hist_range),
-                (None, Some(rt_range)) => Some(rt_range),
-                (None, None) => None,
+                (Some(hist_range), None) => {
+                    log::debug!(
+                        "[UnifiedDataService] Merging tick data for {}: Only historical data available: {:?}, Requested: {} - {} us",
+                        symbol, hist_range, range.start_us, range.end_us
+                    );
+                    Some(hist_range)
+                }
+                (None, Some(rt_range)) => {
+                    log::debug!(
+                        "[UnifiedDataService] Merging tick data for {}: Only real-time data available: {:?}, Requested: {} - {} us",
+                        symbol, rt_range, range.start_us, range.end_us
+                    );
+                    Some(rt_range)
+                }
+                (None, None) => {
+                    log::warn!(
+                        "[UnifiedDataService] Merging tick data for {}: No time range information available, Requested: {} - {} us",
+                        symbol, range.start_us, range.end_us
+                    );
+                    None
+                }
             };
 
             Ok(TickDataBuffer {

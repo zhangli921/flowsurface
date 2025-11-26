@@ -353,7 +353,7 @@ impl<'a> canvas::Program<()> for YAxis<'a> {
             // Screen Y coordinates: 0 (top) to bounds.height (bottom)
             let screen_top = 0.0;
             let screen_bottom = bounds.height;
-            
+                
             // Convert screen Y to chart Y coordinates
             // screen_y = (chart_y + translation.y) * scaling + height / 2.0
             // chart_y = (screen_y - height / 2.0) / scaling - translation.y
@@ -379,7 +379,7 @@ impl<'a> canvas::Program<()> for YAxis<'a> {
             // Generate labels at evenly spaced screen Y positions
             for i in 0..=num_ticks {
                 let screen_y = (i as f32 / num_ticks as f32) * bounds.height;
-                
+            
                 // Convert screen Y to chart Y, then to price
                 let chart_y = (screen_y - content_bounds.height / 2.0) / state.scaling - state.translation.y;
                 let price = state.y_to_price(chart_y);

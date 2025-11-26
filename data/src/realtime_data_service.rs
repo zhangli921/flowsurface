@@ -332,11 +332,9 @@ impl RealtimeDataService {
 
         let mut prices: Vec<u32> = Vec::new();
         let mut volumes: Vec<f32> = Vec::new();
-        let mut chunks_checked = 0;
-        let mut chunks_with_data = 0;
-        let mut ticks_before_filter = 0;
         let mut actual_start: Option<u64> = None;
         let mut actual_end: Option<u64> = None;
+        let mut chunk_time_ranges: Vec<(u64, u64)> = Vec::new(); // Track time ranges from each chunk
 
         // Iterate through index entries that overlap with the requested time range.
         for entry in &index[scan_start_idx..] {
@@ -347,8 +345,6 @@ impl RealtimeDataService {
             if chunk_start_us >= range.end_us {
                 break;
             }
-            
-            chunks_checked += 1;
 
             // Load and deserialize payload
             let payload = store.get_payload(entry);
@@ -364,8 +360,6 @@ impl RealtimeDataService {
                     chunk_start_us, entry.length, payload.len());
                 continue;
             }
-            
-            chunks_with_data += 1;
             let payload_bytes = bytes::Bytes::from(payload.to_vec());
             
             // Wrap Parquet parsing in a more descriptive error context
@@ -377,6 +371,9 @@ impl RealtimeDataService {
                     continue;
                 }
             }?;
+
+            let mut chunk_min_ts: Option<u64> = None;
+            let mut chunk_max_ts: Option<u64> = None;
 
             for batch_result in reader {
                 let batch = batch_result?;
@@ -399,8 +396,6 @@ impl RealtimeDataService {
 
                 for i in 0..batch.num_rows() {
                     let ts = timestamps.value(i) as u64;
-                    ticks_before_filter += 1;
-                    // Filter ticks to be within the requested range
                     // Filter ticks to be within the requested range
                     if ts >= range.start_us && ts < range.end_us {
                         // Convert price from f64 to u32 (fixed-point representation)
@@ -418,14 +413,54 @@ impl RealtimeDataService {
                             actual_end = Some(ts);
                         }
                     }
+                    
+                    // Track chunk-level time range (including all ticks, not just filtered ones)
+                    if chunk_min_ts.is_none() || ts < chunk_min_ts.unwrap() {
+                        chunk_min_ts = Some(ts);
+                    }
+                    if chunk_max_ts.is_none() || ts > chunk_max_ts.unwrap() {
+                        chunk_max_ts = Some(ts);
+                    }
                 }
+            }
+            
+            // Record this chunk's time range if it has data
+            if let (Some(chunk_start), Some(chunk_end)) = (chunk_min_ts, chunk_max_ts) {
+                chunk_time_ranges.push((chunk_start, chunk_end));
             }
         }
         
 
-        // Record the actual time range covered by the data
+        // Calculate the actual time range covered by the data
+        // Use the union of all chunk time ranges that overlap with the requested range
         let time_range = if let (Some(start), Some(end)) = (actual_start, actual_end) {
-            Some((start, end))
+            // If we have chunk time ranges, use them to get a more accurate coverage
+            if !chunk_time_ranges.is_empty() {
+                // Find the overall range covered by chunks that have data in the requested range
+                let mut overall_start = start;
+                let mut overall_end = end;
+                
+                for (chunk_start, chunk_end) in &chunk_time_ranges {
+                    // Only consider chunks that overlap with the requested range
+                    if *chunk_end >= range.start_us && *chunk_start < range.end_us {
+                        // Clamp chunk range to requested range
+                        let clamped_start = chunk_start.max(&range.start_us);
+                        let clamped_end = chunk_end.min(&range.end_us);
+                        
+                        if clamped_start < &overall_start {
+                            overall_start = *clamped_start;
+                        }
+                        if clamped_end > &overall_end {
+                            overall_end = *clamped_end;
+                        }
+                    }
+                }
+                
+                Some((overall_start, overall_end))
+            } else {
+                // Fallback to tick-based range
+                Some((start, end))
+            }
         } else {
             None
         };

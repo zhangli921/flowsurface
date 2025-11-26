@@ -83,3 +83,31 @@ pub fn filter_historical_dates(dates: &mut Vec<String>, safe_cutoff: u64) {
     });
 }
 
+/// Checks if a timestamp (in microseconds) is within today's date.
+///
+/// This is used to determine if data should be fetched from real-time sources
+/// (Mmap) or historical sources (Parquet cache). Only data from today should
+/// be fetched from real-time sources.
+///
+/// # Arguments
+/// - `timestamp_us`: Timestamp in microseconds
+///
+/// # Returns
+/// - `true` if the timestamp is today
+/// - `false` if the timestamp is before today
+pub fn is_today(timestamp_us: u64) -> bool {
+    let now = Utc::now();
+    let today = now.date_naive();
+    let today_midnight = today.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let today_midnight_us = today_midnight.timestamp_micros() as u64;
+    
+    let tomorrow_midnight = today.succ_opt()
+        .unwrap_or(today)
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    let tomorrow_midnight_us = tomorrow_midnight.timestamp_micros() as u64;
+    
+    timestamp_us >= today_midnight_us && timestamp_us < tomorrow_midnight_us
+}
+

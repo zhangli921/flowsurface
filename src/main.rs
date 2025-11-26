@@ -1184,15 +1184,31 @@ impl Flowsurface {
             };
             
             // Calculate overlap ratio and publish event
+            // Note: For real-time data, we add a small buffer (2 seconds) to account for
+            // data writing and index update delays. This improves overlap ratio accuracy
+            // when viewing recent data.
+            const WRITE_DELAY_BUFFER_US: u64 = 2_000_000; // 2 seconds in microseconds
             let overlap_ratio = if let Some((actual_start, actual_end)) = ticks.time_range {
+                // Add buffer to actual_end for real-time data to account for write/index delays
+                let adjusted_actual_end = actual_end.saturating_add(WRITE_DELAY_BUFFER_US);
                 let overlap_start = actual_start.max(range.start_us);
-                let overlap_end = actual_end.min(range.end_us);
+                let overlap_end = adjusted_actual_end.min(range.end_us);
                 
                 if overlap_start >= overlap_end {
                     0.0
                 } else {
                     let requested_span = range.end_us.saturating_sub(range.start_us);
                     let overlap_span = overlap_end.saturating_sub(overlap_start);
+                    
+                    // Debug logging for overlap calculation
+                    log::debug!(
+                        "[VP Overlap] {}: Requested range: {} - {} us (span: {} us), Actual data: {} - {} us (span: {} us, adjusted end: {} us), Overlap: {} - {} us (span: {} us), Ratio: {:.2}%",
+                        symbol_clone,
+                        range.start_us, range.end_us, requested_span,
+                        actual_start, actual_end, actual_end.saturating_sub(actual_start), adjusted_actual_end,
+                        overlap_start, overlap_end, overlap_span,
+                        if requested_span > 0 { (overlap_span as f64 / requested_span as f64) * 100.0 } else { 100.0 }
+                    );
                     
                     if requested_span > 0 {
                         overlap_span as f64 / requested_span as f64
@@ -1210,9 +1226,12 @@ impl Flowsurface {
             });
             
             // Verify data completeness
+            // Use the same buffer adjustment for consistency (constant defined above)
             let data_complete = if let Some((actual_start, actual_end)) = ticks.time_range {
+                // Add buffer to actual_end for real-time data to account for write/index delays
+                let adjusted_actual_end = actual_end.saturating_add(WRITE_DELAY_BUFFER_US);
                 let overlap_start = actual_start.max(range.start_us);
-                let overlap_end = actual_end.min(range.end_us);
+                let overlap_end = adjusted_actual_end.min(range.end_us);
                 
                 if overlap_start >= overlap_end {
                     false

@@ -313,7 +313,7 @@ async fn run_ingest_task(symbol: String, data_dir: PathBuf, kline_cache: Option<
     let (_, mut read) = ws_stream.split();
     let mut live_buffer: Vec<Trade> = Vec::new();
     let mut last_flush_time = SystemTime::now();
-    let flush_interval = Duration::from_secs(1);
+    let flush_interval = Duration::from_millis(500); // Reduced from 1s to 500ms to improve VP calculation real-time performance
 
     while let Some(message) = read.next().await {
         match message {
@@ -604,7 +604,9 @@ struct MmapWriter {
 }
 
 const INDEX_UPDATE_BATCH_SIZE: usize = 10; // Update index every N chunks
-const INDEX_UPDATE_INTERVAL_SECS: u64 = 1; // Update index at least every N seconds
+const INDEX_UPDATE_INTERVAL_MS: u64 = 500; // Update index at least every 500ms (reduced from 1s to improve VP calculation real-time performance)
+// Note: For real-time data, we want index updates to be frequent enough that
+// readers can see new data quickly. Reduced to 500ms to improve VP calculation latency.
 
 impl MmapWriter {
     fn open_or_create(path: &str) -> (Self, Option<u64>) {
@@ -911,10 +913,10 @@ impl MmapWriter {
 
         self.index_entries.sort_by_key(|e| e.key_hash);
         
-        // Batch index updates: only update every N chunks or every N seconds
+        // Batch index updates: only update every N chunks or every N milliseconds
         self.pending_index_updates += 1;
         let should_update = self.pending_index_updates >= INDEX_UPDATE_BATCH_SIZE ||
-            self.last_index_update.elapsed().as_secs() >= INDEX_UPDATE_INTERVAL_SECS;
+            self.last_index_update.elapsed().as_millis() >= INDEX_UPDATE_INTERVAL_MS as u128;
         
         if should_update {
             self.write_indices();
