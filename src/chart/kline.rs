@@ -774,70 +774,91 @@ impl KlineChart {
                     // Save debug info to state
                     chart.debug_visible_range = Some((start_interval, end_interval, lowest, highest));
                     
-                    // No padding - use exact price range from visible K-lines
-                    let padded_lowest = lowest;
-                    let padded_highest = highest;
-                    let price_span = padded_highest - padded_lowest;
+                    // Use cached_y_range stabilization to prevent Y-axis jumping
+                    // Round the price range to nice values (same as Y-axis labels)
+                    use crate::chart::axes::YAxis;
+                    let rounded_range = YAxis::round_price_range(lowest as f64, highest as f64, chart.tick_size);
+                    
+                    // Check if we should update the Y-axis range based on cached value
+                    // This prevents the last K-line from causing Y-axis to jump
+                    // CRITICAL: Only update if the change is significant
+                    // The threshold in should_update_range is 15% range change or 20% center shift
+                    // This ensures small price fluctuations in the last K-line don't cause Y-axis to jump
+                    let should_update = YAxis::should_update_range(chart.cached_y_range, rounded_range);
+                    
+                    // CRITICAL: Only update Y-axis range if change is significant
+                    // This prevents the last K-line from causing Y-axis to jump
+                    if should_update {
+                        // Update cache and use new range
+                        chart.cached_y_range = Some(rounded_range);
+                        let padded_lowest = rounded_range.1.to_f32_lossy();
+                        let padded_highest = rounded_range.0.to_f32_lossy();
+                        let price_span = padded_highest - padded_lowest;
 
-                    if price_span > 0.0 && chart.bounds.height > f32::EPSILON {
-                        let chart_height = chart.bounds.height;
-                        let tick_size = chart.tick_size.to_f32_lossy();
+                        if price_span > 0.0 && chart.bounds.height > f32::EPSILON {
+                            let chart_height = chart.bounds.height;
+                            let tick_size = chart.tick_size.to_f32_lossy();
 
-                        if tick_size > 0.0 {
-                            // Calculate cell_height so that price_span fits exactly in chart_height
-                            // Formula: cell_height = (chart_height * tick_size) / price_span
-                            // This ensures that price_span / tick_size * cell_height = chart_height
-                            chart.cell_height = (chart_height * tick_size) / price_span;
-                            
-                            // Set base_price_y to padded_highest so that highest price maps to y=0 in chart coordinates
-                            chart.base_price_y = Price::from_f32(padded_highest);
-                            
-                            // Calculate translation.y to ensure:
-                            // - Highest price (y=0 in chart coords) maps to top of screen
-                            // - Lowest price (y=price_span_in_chart_coords in chart coords) maps to bottom of screen
-                            //
-                            // In chart coordinates:
-                            // - price_to_y(padded_highest) = 0 (since base_price_y = padded_highest)
-                            // - price_to_y(padded_lowest) = (padded_highest - padded_lowest) / tick_size * cell_height = price_span / tick_size * cell_height
-                            //
-                            // From the calculation: cell_height = (chart_height * tick_size) / price_span
-                            // So: price_to_y(padded_lowest) = price_span / tick_size * (chart_height * tick_size / price_span) = chart_height
-                            //
-                            // In screen coordinates (from shader):
-                            // screen_y = (y_chart + translation.y) * scaling + height/2
-                            //
-                            // We want:
-                            // - y_chart=0 (highest) -> screen_y=0 (top)
-                            // - y_chart=chart_height (lowest) -> screen_y=height (bottom)
-                            //
-                            // So: (0 + translation.y) * scaling + height/2 = 0
-                            //     => translation.y * scaling = -height/2
-                            //     => translation.y = -height/(2*scaling)
-                            //
-                            // And: (chart_height + translation.y) * scaling + height/2 = height
-                            //     => (chart_height + translation.y) * scaling = height/2
-                            //     => chart_height * scaling + translation.y * scaling = height/2
-                            //     => chart_height * scaling - height/2 = height/2
-                            //     => chart_height * scaling = height
-                            //     => chart_height = height / scaling
-                            //
-                            // So we need: chart_height (in chart coords) = height / scaling
-                            // But we calculated cell_height using screen pixels (chart.bounds.height),
-                            // so chart_height in chart coords = chart.bounds.height / scaling
-                            let chart_coord_height = chart_height / chart.scaling;
-                            
-                            // Calculate translation.y so that y=0 maps to screen top
-                            // screen_y = (y_chart + translation.y) * scaling + height/2
-                            // For y_chart=0 to map to screen_y=0:
-                            // 0 = (0 + translation.y) * scaling + height/2
-                            // translation.y = -height/(2*scaling) = -(height/scaling)/2 = -chart_coord_height/2
-                            // Calculate translation.y so that y=0 maps to screen top
-                            chart.translation.y = -chart_coord_height / 2.0;
-                            
-                            // Clear Y-axis cache when auto scale updates translation.y and cell_height
-                            // This ensures Y-axis labels are recalculated with the new scale
-                            self.yaxis_cache.clear();
+                            if tick_size > 0.0 {
+                                // Calculate cell_height so that price_span fits exactly in chart_height
+                                // Formula: cell_height = (chart_height * tick_size) / price_span
+                                // This ensures that price_span / tick_size * cell_height = chart_height
+                                chart.cell_height = (chart_height * tick_size) / price_span;
+                                
+                                // Set base_price_y to padded_highest so that highest price maps to y=0 in chart coordinates
+                                chart.base_price_y = Price::from_f32(padded_highest);
+                                
+                                // Calculate translation.y to ensure:
+                                // - Highest price (y=0 in chart coords) maps to top of screen
+                                // - Lowest price (y=price_span_in_chart_coords in chart coords) maps to bottom of screen
+                                //
+                                // In chart coordinates:
+                                // - price_to_y(padded_highest) = 0 (since base_price_y = padded_highest)
+                                // - price_to_y(padded_lowest) = (padded_highest - padded_lowest) / tick_size * cell_height = price_span / tick_size * cell_height
+                                //
+                                // From the calculation: cell_height = (chart_height * tick_size) / price_span
+                                // So: price_to_y(padded_lowest) = price_span / tick_size * (chart_height * tick_size / price_span) = chart_height
+                                //
+                                // In screen coordinates (from shader):
+                                // screen_y = (y_chart + translation.y) * scaling + height/2
+                                //
+                                // We want:
+                                // - y_chart=0 (highest) -> screen_y=0 (top)
+                                // - y_chart=chart_height (lowest) -> screen_y=height (bottom)
+                                //
+                                // So: (0 + translation.y) * scaling + height/2 = 0
+                                //     => translation.y * scaling = -height/2
+                                //     => translation.y = -height/(2*scaling)
+                                //
+                                // And: (chart_height + translation.y) * scaling + height/2 = height
+                                //     => (chart_height + translation.y) * scaling = height/2
+                                //     => chart_height * scaling + translation.y * scaling = height/2
+                                //     => chart_height * scaling - height/2 = height/2
+                                //     => chart_height * scaling = height
+                                //     => chart_height = height / scaling
+                                //
+                                // So we need: chart_height (in chart coords) = height / scaling
+                                // But we calculated cell_height using screen pixels (chart.bounds.height),
+                                // so chart_height in chart coords = chart.bounds.height / scaling
+                                let chart_coord_height = chart_height / chart.scaling;
+                                
+                                // Calculate translation.y so that y=0 maps to screen top
+                                // screen_y = (y_chart + translation.y) * scaling + height/2
+                                // For y_chart=0 to map to screen_y=0:
+                                // 0 = (0 + translation.y) * scaling + height/2
+                                // translation.y = -height/(2*scaling) = -(height/scaling)/2 = -chart_coord_height/2
+                                // Calculate translation.y so that y=0 maps to screen top
+                                chart.translation.y = -chart_coord_height / 2.0;
+                                
+                                // Clear Y-axis cache when auto scale updates translation.y and cell_height
+                                // This ensures Y-axis labels are recalculated with the new scale
+                                self.yaxis_cache.clear();
+                            }
                         }
+                    } else {
+                        // Change is not significant - keep existing Y-axis range unchanged
+                        // This prevents the last K-line from causing Y-axis to jump
+                        // Do NOT update cell_height, base_price_y, or translation.y
                     }
                 }
             }

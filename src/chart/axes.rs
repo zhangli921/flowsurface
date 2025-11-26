@@ -279,9 +279,9 @@ impl<'a> YAxis<'a> {
             let new_center = ((new.0.units + new.1.units) as f64) / 2.0;
             let center_shift = ((new_center - cached_center) / cached_range).abs();
             
-            // Update if range changed by more than 15% or center shifted by more than 20%
-            // Use larger thresholds for better stability
-            range_change > 0.15 || center_shift > 0.20
+            // Update if range changed by more than 25% or center shifted by more than 30%
+            // Use larger thresholds for better stability to prevent last K-line from causing Y-axis to jump
+            range_change > 0.25 || center_shift > 0.30
         } else {
             true // No cache, always update
         }
