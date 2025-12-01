@@ -549,6 +549,8 @@ impl Dashboard {
                                     .map(|r| (r.req_id, r.fetch, r.stream))
                                     .collect();
                                 let pane_id = state.unique_id();
+                                // 从 state 中提取精确的 basis（在 drop 之前）
+                                let basis = Self::extract_basis_from_state(state);
                                 drop(state);  // 释放可变借用
                                 
                                 // 现在可以安全地调用 request_fetch_by_pane_id
@@ -564,6 +566,7 @@ impl Dashboard {
                                             req_id,
                                             fetch,
                                             stream,
+                                            basis, // 传递精确的 basis
                                         )
                                     })
                                     .collect();
@@ -1321,7 +1324,8 @@ impl Dashboard {
         let layout_id = self.layout_id;
         
         // 收集所有需要处理的请求，避免在 for_each 中借用冲突
-        let mut pending_requests: Vec<(window::Id, pane_grid::Pane, uuid::Uuid, Vec<(uuid::Uuid, FetchRange, Option<StreamKind>)>)> = vec![];
+        // 同时收集 basis 信息，以便使用精确的缓存键
+        let mut pending_requests: Vec<(window::Id, pane_grid::Pane, uuid::Uuid, data::chart::Basis, Vec<(uuid::Uuid, FetchRange, Option<StreamKind>)>)> = vec![];
 
         self.iter_all_panes_mut(main_window)
             .for_each(|(window_id, pane_grid, state)| match state.tick(now) {
@@ -1343,7 +1347,9 @@ impl Dashboard {
                             .map(|r| (r.req_id, r.fetch, r.stream))
                             .collect();
                         let pane_id = state.unique_id();
-                        pending_requests.push((window_id, pane_grid, pane_id, reqs_vec));
+                        // 从 state 中提取精确的 basis
+                        let basis = Self::extract_basis_from_state(&state);
+                        pending_requests.push((window_id, pane_grid, pane_id, basis, reqs_vec));
                     }
                 },
                 Some(pane::Action::Panel(_action)) => {}
@@ -1592,9 +1598,47 @@ fn request_fetch_legacy(
 }
 
 impl Dashboard {
+    /// 从 state 中提取精确的 basis
+    fn extract_basis_from_state(state: &pane::State) -> data::chart::Basis {
+        // 优先从图表中获取（最准确）
+        match &state.content {
+            pane::Content::Kline { chart: Some(c), .. } => {
+                c.basis()
+            }
+            pane::Content::Heatmap { chart: Some(c), .. } => {
+                // HeatmapChart 没有 basis() 方法，从 settings 获取
+                state.settings.selected_basis.unwrap_or_else(|| {
+                    // 从 stream 中推断
+                    state.streams.find_ready_map(|s| match s {
+                        StreamKind::Kline { timeframe, .. } => Some(data::chart::Basis::Time(*timeframe)),
+                        _ => None,
+                    }).unwrap_or(data::chart::Basis::Time(Timeframe::M1))
+                })
+            }
+            pane::Content::Comparison(Some(_c)) => {
+                // ComparisonChart 可能有 basis 方法，如果没有则从 settings 获取
+                state.settings.selected_basis.unwrap_or_else(|| {
+                    state.streams.find_ready_map(|s| match s {
+                        StreamKind::Kline { timeframe, .. } => Some(data::chart::Basis::Time(*timeframe)),
+                        _ => None,
+                    }).unwrap_or(data::chart::Basis::Time(Timeframe::M15))
+                })
+            }
+            _ => {
+                // 从 settings 或 stream 中获取
+                state.settings.selected_basis.unwrap_or_else(|| {
+                    state.streams.find_ready_map(|s| match s {
+                        StreamKind::Kline { timeframe, .. } => Some(data::chart::Basis::Time(*timeframe)),
+                        _ => None,
+                    }).unwrap_or(data::chart::Basis::Time(Timeframe::M1))
+                })
+            }
+        }
+    }
+    
     /// 请求数据（支持新架构的统一数据管理）
     /// 
-    /// 这个方法接受 pane_id 而不是 state，避免借用冲突
+    /// 这个方法接受 pane_id 和 basis 而不是 state，避免借用冲突
     fn request_fetch_by_pane_id(
         &mut self,
         main_window: window::Id,
@@ -1605,6 +1649,7 @@ impl Dashboard {
         req_id: uuid::Uuid,
         fetch: FetchRange,
         stream: Option<StreamKind>,
+        basis: data::chart::Basis, // 精确的 basis
     ) -> Task<Message> {
         // 如果新架构已启用，先检查缓存和去重（不需要 state）
         if let Some(data_manager) = &self.unified_data_manager {
@@ -1619,10 +1664,7 @@ impl Dashboard {
                         });
                         
                         if let Some(ti) = ticker_info {
-                            // 简化：使用默认 basis（大多数情况下是 Time-based）
-                            // 如果需要精确的 basis，需要获取 state，但会导致借用冲突
-                            // 这里先尝试使用默认值，如果缓存未命中，会在 request_fetch_legacy 中处理
-                            let basis = data::chart::Basis::Time(Timeframe::M1); // 默认值
+                            // 使用传入的精确 basis（而不是默认值）
                             let key = unified_data_manager::DataKey::new(ti, fetch, basis);
                             let result = data_manager.request_data(key.clone(), subscriber_id, &metadata.requirements);
                             
