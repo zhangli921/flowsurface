@@ -30,6 +30,7 @@ use iced::{
 use enum_map::EnumMap;
 use rustc_hash::FxHashMap;
 use std::time::Instant;
+use uuid::Uuid;
 
 const MIN_SCALING: f32 = 0.6;
 const MAX_SCALING: f32 = 1.2;
@@ -152,6 +153,9 @@ pub struct HeatmapChart {
     study_configurator: study::Configurator<HeatmapStudy>,
     last_tick: Instant,
     pub studies: Vec<HeatmapStudy>,
+    // 新架构：唯一 ID（用于数据订阅）
+    #[allow(dead_code)]
+    pub(crate) subscriber_id: uuid::Uuid,
 }
 
 impl HeatmapChart {
@@ -198,6 +202,7 @@ impl HeatmapChart {
             study_configurator: study::Configurator::new(),
             studies,
             last_tick: Instant::now(),
+            subscriber_id: uuid::Uuid::new_v4(), // 新架构：唯一 ID
         }
     }
 

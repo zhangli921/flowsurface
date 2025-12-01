@@ -149,9 +149,13 @@ impl<D: DataPoint> TimeSeries<D> {
                 time += interval;
             }
 
-            log::warn!(
-                "Integrity check failed: missing {} klines",
-                missing_keys.len()
+            // 使用 debug 级别而不是 warn，因为这是正常的数据完整性检查
+            // 缺失的 klines 会被自动下载，不需要警告用户
+            log::debug!(
+                "Integrity check: missing {} klines in range [{}, {}]. Will attempt to fetch.",
+                missing_keys.len(),
+                earliest,
+                latest
             );
             return Some(missing_keys);
         }

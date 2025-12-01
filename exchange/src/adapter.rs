@@ -419,8 +419,8 @@ pub enum ExchangeInclusive {
 
 impl ExchangeInclusive {
     pub const ALL: [ExchangeInclusive; 4] = [
-        ExchangeInclusive::Bybit,
         ExchangeInclusive::Binance,
+        ExchangeInclusive::Bybit,
         ExchangeInclusive::Hyperliquid,
         ExchangeInclusive::Okex,
     ];

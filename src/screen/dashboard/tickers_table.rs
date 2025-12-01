@@ -43,12 +43,12 @@ const SORT_AND_FILTER_HEIGHT: f32 = 200.0;
 const COMPACT_ROW_HEIGHT: f32 = 28.0;
 
 const EXCHANGE_FILTERS: [(ExchangeInclusive, Exchange, &str); 4] = [
-    (ExchangeInclusive::Bybit, Exchange::BybitLinear, "Bybit"),
     (
         ExchangeInclusive::Binance,
         Exchange::BinanceLinear,
         "Binance",
     ),
+    (ExchangeInclusive::Bybit, Exchange::BybitLinear, "Bybit"),
     (
         ExchangeInclusive::Hyperliquid,
         Exchange::HyperliquidLinear,

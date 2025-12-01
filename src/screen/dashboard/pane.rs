@@ -235,10 +235,32 @@ impl State {
                         )
                     };
 
+                    // 检查是否启用了 HVN
+                    let has_hvn = if let Content::Kline { kind, .. } = &content {
+                        match kind {
+                            data::chart::KlineChartKind::Candles { studies } => {
+                                studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+
                     let streams = by_basis_default(
                         derived_plan.basis,
                         Timeframe::M15,
-                        |tf| vec![kline_stream(derived_plan.ticker_info, tf)],
+                        |tf| {
+                            if has_hvn {
+                                // 如果启用了 HVN，需要 DepthAndTrades 流来获取交易数据
+                                vec![
+                                    depth_stream(&derived_plan),
+                                    kline_stream(derived_plan.ticker_info, tf),
+                                ]
+                            } else {
+                                vec![kline_stream(derived_plan.ticker_info, tf)]
+                            }
+                        },
                         || {
                             let depth_aggr = derived_plan
                                 .ticker_info
@@ -776,7 +798,7 @@ impl State {
 
                             stream_info_element = stream_info_element.push(modifiers);
                         }
-                        data::chart::KlineChartKind::Candles => {
+                        data::chart::KlineChartKind::Candles { .. } => {
                             let selected_basis = self
                                 .settings
                                 .selected_basis
@@ -826,7 +848,7 @@ impl State {
                     )
                 } else {
                     let content_kind = match chart_kind {
-                        data::chart::KlineChartKind::Candles => ContentKind::CandlestickChart,
+                        data::chart::KlineChartKind::Candles { .. } => ContentKind::CandlestickChart,
                         data::chart::KlineChartKind::Footprint { .. } => {
                             ContentKind::FootprintChart
                         }
@@ -1089,10 +1111,16 @@ impl State {
                                                     };
                                                     let mut streams = vec![kline_stream];
 
-                                                    if matches!(
-                                                        c.kind,
-                                                        data::chart::KlineChartKind::Footprint { .. }
-                                                    ) {
+                                                    // Footprint 类型总是需要 DepthAndTrades stream
+                                                    // Candles 类型，如果启用了 HVN，也需要 DepthAndTrades stream
+                                                    let needs_depth_stream = match &c.kind {
+                                                        data::chart::KlineChartKind::Footprint { .. } => true,
+                                                        data::chart::KlineChartKind::Candles { studies } => {
+                                                            studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
+                                                        }
+                                                    };
+
+                                                    if needs_depth_stream {
                                                         let depth_aggr = if base_ticker
                                                             .exchange()
                                                             .is_depth_client_aggr()
@@ -1667,7 +1695,14 @@ impl Content {
                         studies: vec![],
                     }),
             ),
-            ContentKind::CandlestickChart => (Timeframe::M15, data::chart::KlineChartKind::Candles),
+            ContentKind::CandlestickChart => (
+                Timeframe::M15,
+                prev_kind_opt
+                    .filter(|k| matches!(k, data::chart::KlineChartKind::Candles { .. }))
+                    .unwrap_or_else(|| data::chart::KlineChartKind::Candles {
+                        studies: vec![],
+                    }),
+            ),
             _ => unreachable!("invalid content kind for kline chart"),
         };
 
@@ -1740,7 +1775,9 @@ impl Content {
             ContentKind::CandlestickChart => Content::Kline {
                 chart: None,
                 indicators: vec![KlineIndicator::Volume],
-                kind: data::chart::KlineChartKind::Candles,
+                kind: data::chart::KlineChartKind::Candles {
+                    studies: vec![],
+                },
                 layout: ViewConfig {
                     splits: vec![],
                     autoscale: Some(data::chart::Autoscale::FitToVisible),
@@ -1901,11 +1938,15 @@ impl Content {
                     .as_mut()
                     .expect("kline chart not initialized")
                     .set_studies(studies.clone());
-                if let data::chart::KlineChartKind::Footprint {
-                    studies: k_studies, ..
-                } = kind
-                {
-                    *k_studies = studies;
+                match kind {
+                    data::chart::KlineChartKind::Footprint {
+                        studies: k_studies, ..
+                    } => {
+                        *k_studies = studies;
+                    }
+                    data::chart::KlineChartKind::Candles { studies: k_studies } => {
+                        *k_studies = studies;
+                    }
                 }
             }
             _ => {}
@@ -1917,7 +1958,7 @@ impl Content {
             Content::Heatmap { .. } => ContentKind::HeatmapChart,
             Content::Kline { kind, .. } => match kind {
                 data::chart::KlineChartKind::Footprint { .. } => ContentKind::FootprintChart,
-                data::chart::KlineChartKind::Candles => ContentKind::CandlestickChart,
+                data::chart::KlineChartKind::Candles { .. } => ContentKind::CandlestickChart,
             },
             Content::TimeAndSales(_) => ContentKind::TimeAndSales,
             Content::Ladder(_) => ContentKind::Ladder,

@@ -11,7 +11,8 @@ use data::chart::kline::ClusterScaling;
 use data::chart::{
     KlineChartKind, ViewConfig,
     indicator::{Indicator, KlineIndicator},
-    kline::{ClusterKind, FootprintStudy, KlineDataPoint, KlineTrades, NPoc, PointOfControl},
+    kline::{ClusterKind, FootprintStudy, KlineDataPoint, KlineTrades, NPoc, PointOfControl, HVNResult},
+    kline::hvn::HVNCalculator,
 };
 use data::util::{abbr_large_numbers, count_decimals};
 use exchange::util::{Price, PriceStep};
@@ -27,6 +28,17 @@ use iced::{Alignment, Element, Point, Rectangle, Renderer, Size, Theme, Vector, 
 
 use enum_map::EnumMap;
 use std::time::Instant;
+use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::cell::RefCell;
+use uuid::Uuid;
+
+// 新架构：可选的 ChartDataManager trait 实现
+#[cfg(feature = "unified_data_manager")]
+use crate::screen::dashboard::chart_traits::ChartDataManager;
+#[cfg(feature = "unified_data_manager")]
+use crate::screen::dashboard::unified_data_manager::{DataRequirements, SubscriberId};
 
 impl Chart for KlineChart {
     type IndicatorKind = KlineIndicator;
@@ -86,8 +98,8 @@ impl Chart for KlineChart {
                 let interval = timeframe.to_milliseconds();
 
                 let (earliest, latest) = (
-                    chart.x_to_interval(region.x) - (interval / 2),
-                    chart.x_to_interval(region.x + region.width) + (interval / 2),
+                    chart.x_to_interval(region.x).saturating_sub(interval / 2),
+                    chart.x_to_interval(region.x + region.width).saturating_add(interval / 2),
                 );
 
                 Some((earliest, latest))
@@ -117,7 +129,7 @@ impl Chart for KlineChart {
             KlineChartKind::Footprint { .. } => {
                 0.5 * (chart.bounds.width / chart.scaling) - (chart.cell_width / chart.scaling)
             }
-            KlineChartKind::Candles => {
+            KlineChartKind::Candles { .. } => {
                 0.5 * (chart.bounds.width / chart.scaling)
                     - (8.0 * chart.cell_width / chart.scaling)
             }
@@ -167,16 +179,72 @@ impl PlotConstants for KlineChart {
     }
 }
 
+/// HVN 缓存管理器
+struct HVNCache {
+    result: Option<Arc<HVNResult>>,
+    data_hash: u64,
+    config_hash: u64,
+    last_update: Instant,
+    ttl_ms: u64,
+}
+
+impl HVNCache {
+    fn new(ttl_ms: u64) -> Self {
+        Self {
+            result: None,
+            data_hash: 0,
+            config_hash: 0,
+            last_update: Instant::now(),
+            ttl_ms,
+        }
+    }
+
+    fn is_valid(&self, data_hash: u64, config_hash: u64) -> bool {
+        if self.result.is_none() {
+            return false;
+        }
+
+        if self.data_hash != data_hash || self.config_hash != config_hash {
+            return false;
+        }
+
+        let elapsed = self.last_update.elapsed().as_millis() as u64;
+        elapsed < self.ttl_ms
+    }
+
+    fn get(&self) -> Option<Arc<HVNResult>> {
+        self.result.clone()
+    }
+
+    fn update(&mut self, data_hash: u64, config_hash: u64, result: HVNResult) {
+        self.result = Some(Arc::new(result));
+        self.data_hash = data_hash;
+        self.config_hash = config_hash;
+        self.last_update = Instant::now();
+    }
+
+    fn clear(&mut self) {
+        self.result = None;
+        self.data_hash = 0;
+        self.config_hash = 0;
+    }
+}
+
 pub struct KlineChart {
     chart: ViewState,
     data_source: PlotData<KlineDataPoint>,
     raw_trades: Vec<Trade>,
     indicators: EnumMap<KlineIndicator, Option<Box<dyn KlineIndicatorImpl>>>,
     fetching_trades: (bool, Option<Handle>),
+    trades_fetch_start_time: Option<Instant>, // 记录 trades 下载开始时间，用于超时检测
     pub(crate) kind: KlineChartKind,
     request_handler: RequestHandler,
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
+    hvn_cache: RefCell<HVNCache>,
+    // 新架构：唯一 ID（用于数据订阅）
+    #[allow(dead_code)]
+    pub(crate) subscriber_id: uuid::Uuid,
 }
 
 impl KlineChart {
@@ -202,7 +270,7 @@ impl KlineChart {
                 let (scale_high, scale_low) = timeseries.price_scale({
                     match kind {
                         KlineChartKind::Footprint { .. } => 12,
-                        KlineChartKind::Candles => 60,
+                        KlineChartKind::Candles { .. } => 60,
                     }
                 });
 
@@ -216,11 +284,11 @@ impl KlineChart {
 
                 let cell_width = match kind {
                     KlineChartKind::Footprint { .. } => 80.0,
-                    KlineChartKind::Candles => 4.0,
+                    KlineChartKind::Candles { .. } => 4.0,
                 };
                 let cell_height = match kind {
                     KlineChartKind::Footprint { .. } => 800.0 / y_ticks,
-                    KlineChartKind::Candles => 200.0 / y_ticks,
+                    KlineChartKind::Candles { .. } => 200.0 / y_ticks,
                 };
 
                 let mut chart = ViewState::new(
@@ -243,7 +311,7 @@ impl KlineChart {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (chart.cell_width / chart.scaling)
                     }
-                    KlineChartKind::Candles => {
+                    KlineChartKind::Candles { .. } => {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (8.0 * chart.cell_width / chart.scaling)
                     }
@@ -265,10 +333,13 @@ impl KlineChart {
                     raw_trades,
                     indicators,
                     fetching_trades: (false, None),
+                    trades_fetch_start_time: None,
                     request_handler: RequestHandler::new(),
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    hvn_cache: RefCell::new(HVNCache::new(100)), // TTL = 100ms
+                    subscriber_id: Uuid::new_v4(), // 新架构：唯一 ID
                 }
             }
             Basis::Tick(interval) => {
@@ -276,11 +347,11 @@ impl KlineChart {
 
                 let cell_width = match kind {
                     KlineChartKind::Footprint { .. } => 80.0,
-                    KlineChartKind::Candles => 4.0,
+                    KlineChartKind::Candles { .. } => 4.0,
                 };
                 let cell_height = match kind {
                     KlineChartKind::Footprint { .. } => 90.0,
-                    KlineChartKind::Candles => 8.0,
+                    KlineChartKind::Candles { .. } => 8.0,
                 };
 
                 let mut chart = ViewState::new(
@@ -301,7 +372,7 @@ impl KlineChart {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (chart.cell_width / chart.scaling)
                     }
-                    KlineChartKind::Candles => {
+                    KlineChartKind::Candles { .. } => {
                         0.5 * (chart.bounds.width / chart.scaling)
                             - (8.0 * chart.cell_width / chart.scaling)
                     }
@@ -323,10 +394,13 @@ impl KlineChart {
                     raw_trades,
                     indicators,
                     fetching_trades: (false, None),
+                    trades_fetch_start_time: None,
                     request_handler: RequestHandler::new(),
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
+                    hvn_cache: RefCell::new(HVNCache::new(100)), // TTL = 100ms
+                    subscriber_id: Uuid::new_v4(), // 新架构：唯一 ID
                 }
             }
         }
@@ -367,8 +441,18 @@ impl KlineChart {
                 let (kline_earliest, kline_latest) = timeseries.timerange();
                 let earliest = visible_earliest.saturating_sub(visible_latest - visible_earliest);
 
+                log::debug!(
+                    "KlineChart::missing_data_task: visible=({}, {}), kline=({}, {}), datapoints={}",
+                    visible_earliest,
+                    visible_latest,
+                    kline_earliest,
+                    kline_latest,
+                    timeseries.datapoints.len()
+                );
+
                 if timeseries.datapoints.is_empty() {
                     let range = FetchRange::Kline(earliest, visible_latest + timeframe_ms);
+                    log::debug!("KlineChart::missing_data_task: datapoints empty, requesting range: {:?}", range);
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
@@ -377,22 +461,118 @@ impl KlineChart {
                 // priority 1, basic kline data fetch
                 if visible_earliest < kline_earliest {
                     let range = FetchRange::Kline(earliest, kline_earliest);
-
+                    log::debug!(
+                        "KlineChart::missing_data_task: requesting historical klines, range: {:?}",
+                        range
+                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
+                } else {
+                    log::debug!(
+                        "KlineChart::missing_data_task: No historical data needed. visible_earliest={} >= kline_earliest={} (diff={}ms, {}min)",
+                        visible_earliest,
+                        kline_earliest,
+                        visible_earliest.saturating_sub(kline_earliest),
+                        (visible_earliest.saturating_sub(kline_earliest) as f64 / 1000.0 / 60.0)
+                    );
                 }
 
                 // priority 2, trades fetch
+                // 对于 Footprint 类型，总是需要交易数据
+                // 对于 Candles 类型，如果启用了 HVN，也需要交易数据
+                let needs_trades = match &self.kind {
+                    KlineChartKind::Footprint { .. } => true,
+                    KlineChartKind::Candles { studies } => {
+                        // 如果启用了 HVN，需要交易数据
+                        studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }))
+                    }
+                };
+                
+                // 检查交易所是否支持历史 trades 下载（目前只有 Binance 支持）
+                let exchange = self.chart.ticker_info.exchange();
+                let is_binance = matches!(
+                    exchange,
+                    exchange::adapter::Exchange::BinanceSpot
+                        | exchange::adapter::Exchange::BinanceLinear
+                        | exchange::adapter::Exchange::BinanceInverse
+                );
+                
+                if needs_trades {
+                    log::debug!(
+                        "KlineChart::missing_data_task: Checking trades fetch - fetching_trades={}, is_trade_fetch_enabled={}, exchange={:?}, is_binance={}",
+                        self.fetching_trades.0,
+                        exchange::fetcher::is_trade_fetch_enabled(),
+                        exchange,
+                        is_binance
+                    );
+                }
+                
                 if !self.fetching_trades.0
+                    && needs_trades
                     && exchange::fetcher::is_trade_fetch_enabled()
-                    && let Some((fetch_from, fetch_to)) =
-                        timeseries.suggest_trade_fetch_range(visible_earliest, visible_latest)
+                    && is_binance  // 只有 Binance 支持历史 trades 下载
                 {
+                    // 尝试从 trade gap 获取下载范围
+                    // 如果返回 None（例如所有 footprint 都为空），使用可见范围
+                    let (fetch_from, fetch_to) = timeseries
+                        .suggest_trade_fetch_range(visible_earliest, visible_latest)
+                        .unwrap_or((visible_earliest, visible_latest));
+                    
                     let range = FetchRange::Trades(fetch_from, fetch_to);
+                    log::debug!(
+                        "KlineChart::missing_data_task: requesting historical trades, range: {:?}",
+                        range
+                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         self.fetching_trades = (true, None);
+                        self.trades_fetch_start_time = Some(Instant::now());
                         return Some(action);
+                    } else {
+                        // request_fetch 返回 None 可能的原因：
+                        // 1. 请求被去重
+                        // 2. 交易所不支持（如 Bybit）
+                        // 3. 其他错误
+                        // 对于不支持的交易所，不应该设置 fetching_trades=true
+                        // 但是我们已经检查了 is_trade_fetch_enabled()，所以这里可能是去重
+                        log::debug!(
+                            "KlineChart::missing_data_task: trades request was deduplicated, failed, or not supported for this exchange"
+                        );
+                        // 注意：如果是因为交易所不支持，fetching_trades 不会被设置，这是正确的
+                        // 但如果之前已经设置了 fetching_trades=true，我们需要检查是否应该重置
+                    }
+                } else if needs_trades {
+                    if self.fetching_trades.0 {
+                        // 检查是否超时（超过 30 秒，缩短超时时间以便更快恢复）
+                        if let Some(start_time) = self.trades_fetch_start_time {
+                            let elapsed = start_time.elapsed();
+                            if elapsed.as_secs() > 30 {
+                                log::warn!(
+                                    "KlineChart::missing_data_task: Trades fetch timeout ({}s), resetting flag. This may indicate the fetch task failed or was never started.",
+                                    elapsed.as_secs()
+                                );
+                                self.fetching_trades = (false, None);
+                                self.trades_fetch_start_time = None;
+                            } else {
+                                log::debug!(
+                                    "KlineChart::missing_data_task: Already fetching trades, skipping (elapsed: {}s)",
+                                    elapsed.as_secs()
+                                );
+                            }
+                        } else {
+                            // 如果没有开始时间记录，可能是旧的状态，重置标志
+                            log::warn!(
+                                "KlineChart::missing_data_task: fetching_trades=true but no start_time, resetting. This indicates a stale state."
+                            );
+                            self.fetching_trades = (false, None);
+                        }
+                    } else if !exchange::fetcher::is_trade_fetch_enabled() {
+                        log::debug!(
+                            "KlineChart::missing_data_task: Trade fetch is disabled"
+                        );
+                    } else if !is_binance {
+                        // 交易所不支持历史 trades 下载，静默跳过（避免日志刷屏）
+                        // 不记录日志，因为用户已经知道这个交易所不支持
                     }
                 }
 
@@ -438,6 +618,7 @@ impl KlineChart {
     pub fn reset_request_handler(&mut self) {
         self.request_handler = RequestHandler::new();
         self.fetching_trades = (false, None);
+        self.trades_fetch_start_time = None;
     }
 
     pub fn raw_trades(&self) -> Vec<Trade> {
@@ -457,11 +638,9 @@ impl KlineChart {
     }
 
     pub fn update_study_configurator(&mut self, message: study::Message<FootprintStudy>) {
-        let KlineChartKind::Footprint {
-            ref mut studies, ..
-        } = self.kind
-        else {
-            return;
+        let studies = match &mut self.kind {
+            KlineChartKind::Footprint { studies, .. } => studies,
+            KlineChartKind::Candles { studies } => studies,
         };
 
         match self.study_configurator.update(message) {
@@ -610,33 +789,87 @@ impl KlineChart {
                 self.invalidate(None);
             }
             PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(trades_buffer);
+                // 对于 Candles 图表启用 HVN 时，需要创建不存在的数据点
+                let needs_hvn = match &self.kind {
+                    KlineChartKind::Candles { studies } => {
+                        studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }))
+                    }
+                    KlineChartKind::Footprint { .. } => false,
+                };
+                if needs_hvn {
+                    timeseries.insert_trades_or_create_bucket(trades_buffer);
+                } else {
+                    timeseries.insert_trades_existing_buckets(trades_buffer);
+                }
             }
         }
     }
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
+        log::debug!(
+            "KlineChart::insert_raw_trades: trades_count={}, is_batches_done={}, fetching_trades={}",
+            raw_trades.len(),
+            is_batches_done,
+            self.fetching_trades.0
+        );
+        
         match self.data_source {
             PlotData::TickBased(ref mut tick_aggr) => {
                 tick_aggr.insert_trades(&raw_trades);
             }
             PlotData::TimeBased(ref mut timeseries) => {
-                timeseries.insert_trades_existing_buckets(&raw_trades);
+                // 对于 Candles 图表启用 HVN 时，需要创建不存在的数据点
+                let needs_hvn = match &self.kind {
+                    KlineChartKind::Candles { studies } => {
+                        studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }))
+                    }
+                    KlineChartKind::Footprint { .. } => false,
+                };
+                if needs_hvn {
+                    timeseries.insert_trades_or_create_bucket(&raw_trades);
+                } else {
+                    timeseries.insert_trades_existing_buckets(&raw_trades);
+                }
             }
         }
 
         self.raw_trades.extend(raw_trades);
 
         if is_batches_done {
+            log::debug!("KlineChart::insert_raw_trades: Resetting fetching_trades flag");
             self.fetching_trades = (false, None);
+            self.trades_fetch_start_time = None;
         }
     }
 
     pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+        log::debug!(
+            "KlineChart::insert_hist_klines: req_id={}, klines_count={}",
+            req_id,
+            klines_raw.len()
+        );
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
+                let before_count = timeseries.datapoints.len();
                 timeseries.insert_klines(klines_raw);
-                timeseries.insert_trades_existing_buckets(&self.raw_trades);
+                let after_count = timeseries.datapoints.len();
+                log::debug!(
+                    "KlineChart::insert_hist_klines: datapoints before={}, after={}",
+                    before_count,
+                    after_count
+                );
+                // 对于 Candles 图表启用 HVN 时，需要创建不存在的数据点
+                let needs_hvn = match &self.kind {
+                    KlineChartKind::Candles { studies } => {
+                        studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }))
+                    }
+                    KlineChartKind::Footprint { .. } => false,
+                };
+                if needs_hvn {
+                    timeseries.insert_trades_or_create_bucket(&self.raw_trades);
+                } else {
+                    timeseries.insert_trades_existing_buckets(&self.raw_trades);
+                }
 
                 self.indicators
                     .values_mut()
@@ -721,7 +954,7 @@ impl KlineChart {
                             0.5 * (chart.bounds.width / chart.scaling)
                                 - (chart.cell_width / chart.scaling)
                         }
-                        KlineChartKind::Candles => {
+                        KlineChartKind::Candles { .. } => {
                             0.5 * (chart.bounds.width / chart.scaling)
                                 - (8.0 * chart.cell_width / chart.scaling)
                         }
@@ -930,6 +1163,28 @@ impl canvas::Program<Message> for KlineChart {
                         imbalance.is_some(),
                     );
 
+                    // 绘制 HVN
+                    let has_hvn = studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }));
+                    if has_hvn {
+                        draw_all_hvns(
+                            &self.data_source,
+                            frame,
+                            price_to_y,
+                            interval_to_x,
+                            candle_width,
+                            chart.cell_width,
+                            chart.cell_height,
+                            palette,
+                            studies,
+                            earliest,
+                            latest,
+                            *clusters,
+                            content_spacing,
+                            chart.tick_size,
+                            &self.hvn_cache,
+                        );
+                    }
+
                     render_data_source(
                         &self.data_source,
                         frame,
@@ -961,8 +1216,30 @@ impl canvas::Program<Message> for KlineChart {
                         },
                     );
                 }
-                KlineChartKind::Candles => {
+                KlineChartKind::Candles { studies } => {
                     let candle_width = chart.cell_width * 0.8;
+
+                    // 绘制 HVN（如果启用）
+                    let has_hvn = studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }));
+                    if has_hvn {
+                        draw_all_hvns(
+                            &self.data_source,
+                            frame,
+                            price_to_y,
+                            interval_to_x,
+                            candle_width,
+                            chart.cell_width,
+                            chart.cell_height,
+                            palette,
+                            studies,
+                            earliest,
+                            latest,
+                            ClusterKind::BidAsk, // Candles 使用默认的 BidAsk
+                            ContentGaps::from_view(candle_width, chart.scaling),
+                            chart.tick_size,
+                            &self.hvn_cache,
+                        );
+                    }
 
                     render_data_source(
                         &self.data_source,
@@ -1297,6 +1574,274 @@ fn draw_all_npocs(
                 })
                 .for_each(|(interval, poc)| draw_the_line(interval, poc));
         }
+    }
+}
+
+/// 计算数据哈希（用于缓存）
+fn hash_trades_list(trades_list: &[&KlineTrades]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    trades_list.len().hash(&mut hasher);
+    
+    if let Some(first) = trades_list.first() {
+        if let Some((&first_price, _)) = first.trades.iter().next() {
+            first_price.hash(&mut hasher);
+        }
+    }
+    
+    if let Some(last) = trades_list.last() {
+        if let Some((&last_price, _)) = last.trades.iter().next() {
+            last_price.hash(&mut hasher);
+        }
+    }
+    
+    let total_trades: usize = trades_list
+        .iter()
+        .map(|t| t.trades.len())
+        .sum();
+    total_trades.hash(&mut hasher);
+    
+    hasher.finish()
+}
+
+/// 计算配置哈希
+fn hash_hvn_config(
+    lookback: usize,
+    smoothing_window: usize,
+    relative_threshold: u32,
+    min_peak_width: usize,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    lookback.hash(&mut hasher);
+    smoothing_window.hash(&mut hasher);
+    relative_threshold.hash(&mut hasher);
+    min_peak_width.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn draw_all_hvns(
+    data_source: &PlotData<KlineDataPoint>,
+    frame: &mut canvas::Frame,
+    price_to_y: impl Fn(Price) -> f32,
+    interval_to_x: impl Fn(u64) -> f32,
+    candle_width: f32,
+    cell_width: f32,
+    cell_height: f32,
+    palette: &Extended,
+    studies: &[FootprintStudy],
+    visible_earliest: u64,
+    visible_latest: u64,
+    cluster_kind: ClusterKind,
+    spacing: ContentGaps,
+    tick_size: PriceStep,
+    hvn_cache: &RefCell<HVNCache>,
+) {
+    let Some((lookback, smoothing_window, relative_threshold, min_peak_width)) = studies.iter().find_map(|study| {
+        if let FootprintStudy::HVN {
+            lookback,
+            smoothing_window,
+            relative_threshold,
+            min_peak_width,
+        } = study {
+            Some((*lookback, *smoothing_window, *relative_threshold, *min_peak_width))
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    
+    // 限制 lookback 最大值，防止性能问题
+    let lookback = lookback.min(500);
+    
+    // 收集需要计算的数据
+    let trades_list: Vec<&KlineTrades> = match data_source {
+        PlotData::TickBased(tick_aggr) => {
+            tick_aggr
+                .datapoints
+                .iter()
+                .rev()
+                .take(lookback)
+                .map(|dp| &dp.footprint)
+                .collect()
+        }
+        PlotData::TimeBased(timeseries) => {
+            timeseries
+                .datapoints
+                .iter()
+                .rev()
+                .take(lookback)
+                .map(|(_, dp)| &dp.footprint)
+                .collect()
+        }
+    };
+    
+    if trades_list.is_empty() {
+        return;
+    }
+    
+    // 检查是否有任何交易数据（至少有一个footprint包含交易）
+    let has_any_trades = trades_list.iter().any(|trades| !trades.trades.is_empty());
+    if !has_any_trades {
+        return;
+    }
+    
+    // 计算哈希
+    let data_hash = hash_trades_list(&trades_list);
+    let config_hash = hash_hvn_config(
+        lookback,
+        smoothing_window,
+        relative_threshold,
+        min_peak_width,
+    );
+    
+    // 检查缓存（使用RefCell内部可变性）
+    let mut cache = hvn_cache.borrow_mut();
+    let hvn_result = if cache.is_valid(data_hash, config_hash) {
+        if let Some(cached) = cache.get() {
+            cached
+        } else {
+            return;
+        }
+    } else {
+        // 缓存失效，重新计算
+        let calculator = HVNCalculator::new(tick_size);
+        let result = calculator.calculate_hvn(
+            &trades_list,
+            smoothing_window,
+            relative_threshold,
+            min_peak_width,
+        );
+        
+        // 更新缓存
+        cache.update(data_hash, config_hash, result);
+        let cached_result = cache.get().unwrap();
+        cached_result
+    };
+    
+    // 绘制完整的成交量分布图（Volume Profile），类似山峰形状
+    
+    // 计算绘制位置（类似 NPoC）
+    // 对于 Candles 类型，HVN 应该绘制在 K 线右侧
+    // 对于 Footprint 类型，HVN 应该绘制在 clusters 右侧
+    let start_x = {
+        let earliest_x = interval_to_x(visible_earliest);
+        let latest_x = interval_to_x(visible_latest);
+        let rightmost_x = if earliest_x > latest_x { earliest_x } else { latest_x };
+        
+        match cluster_kind {
+            ClusterKind::BidAsk => {
+                // Candles 类型：在 K 线右侧绘制
+                rightmost_x + (candle_width / 2.0) + spacing.candle_to_cluster
+            }
+            ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => {
+                // Footprint 类型：在 clusters 右侧绘制
+                let content_left = (rightmost_x - (cell_width / 2.0));
+                content_left + candle_width + spacing.candle_to_cluster
+            }
+        }
+    };
+    
+    let end_x = {
+        let earliest_x = interval_to_x(visible_earliest);
+        let latest_x = interval_to_x(visible_latest);
+        // 对于 Candles 类型，线条应该延伸到可见区域右边缘
+        // 对于 Footprint 类型，线条应该延伸到最右侧的 K 线
+        match cluster_kind {
+            ClusterKind::BidAsk => {
+                // Candles：延伸到可见区域右边缘
+                // 使用frame的宽度来计算右边缘
+                // frame已经应用了translation和scaling，所以需要计算世界坐标
+                let frame_width = frame.size().width;
+                let frame_height = frame.size().height;
+                // 获取frame的变换信息（简化：使用最右侧K线位置加上固定偏移）
+                let rightmost_x = if earliest_x > latest_x { earliest_x } else { latest_x };
+                // 延伸到K线右侧，但不要超出可见区域太多
+                rightmost_x + candle_width * 5.0 // 延伸到K线右侧一定距离
+            }
+            _ => {
+                // Footprint：延伸到最右侧 K 线
+                if earliest_x > latest_x { earliest_x } else { latest_x }
+            }
+        }
+    };
+    
+    let line_width = (end_x - start_x).max(0.0);
+    
+    // 获取可见价格范围（只渲染可见范围内的 HVN）
+    let (visible_high, visible_low) = {
+        let chart = &frame.size();
+        // 这里需要从frame获取可见范围，简化处理：渲染所有HVN
+        (Price::from_f32(f32::MAX), Price::from_f32(0.0))
+    };
+    
+    // 绘制完整的成交量分布图（Volume Profile），类似山峰形状
+    // 即使没有检测到峰值，也绘制完整的分布图
+    // 计算最大成交量（用于归一化条形长度）
+    let max_volume = hvn_result.volume_profile
+        .values()
+        .copied()
+        .fold(0.0, f32::max);
+    
+    if max_volume == 0.0 {
+        return;
+    }
+    
+    // 计算条形区域的最大宽度（从 start_x 向右延伸）
+    let profile_width = line_width.max(100.0); // 至少 100 像素宽
+    
+    // 获取峰值价格集合（用于高亮显示）
+    let peak_prices: std::collections::HashSet<_> = hvn_result.peaks
+        .iter()
+        .map(|hvn| hvn.price)
+        .collect();
+    
+    // 遍历所有价格档位，绘制成交量条形
+    for (price, volume) in &hvn_result.volume_profile {
+        let y_position = price_to_y(*price);
+        
+        // 检查绘制位置是否有效
+        if y_position.is_nan() || y_position.is_infinite() {
+            continue;
+        }
+        
+        // 计算条形高度（价格档位的高度）
+        // 需要获取下一个价格档位的 y 位置来计算高度
+        let tick_size = tick_size;
+        let next_price = price.add_steps(1, tick_size);
+        let next_y_position = price_to_y(next_price);
+        let bar_height = (next_y_position - y_position).abs().max(1.0);
+        
+        // 计算条形长度（与成交量成正比）
+        let bar_length = (volume / max_volume) * profile_width;
+        
+        if bar_length <= 0.0 {
+            continue;
+        }
+        
+        // 判断是否是峰值（用于高亮显示）
+        let is_peak = peak_prices.contains(price);
+        let bar_color = if is_peak {
+            // 峰值使用更明显的颜色
+            if palette.is_dark {
+                palette.primary.strong.color.scale_alpha(0.9)
+            } else {
+                palette.primary.strong.color.scale_alpha(1.0)
+            }
+        } else {
+            // 非峰值使用较淡的颜色
+            if palette.is_dark {
+                palette.primary.weak.color.scale_alpha(0.6)
+            } else {
+                palette.primary.weak.color.scale_alpha(0.7)
+            }
+        };
+        
+        // 绘制水平条形（从 start_x 向右延伸）
+        frame.fill_rectangle(
+            Point::new(start_x, y_position - bar_height / 2.0),
+            Size::new(bar_length, bar_height),
+            bar_color,
+        );
     }
 }
 

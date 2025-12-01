@@ -10,6 +10,7 @@ use iced::{Alignment, Event, Point, Rectangle, Renderer, Size, Theme, mouse};
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const TEXT_SIZE: f32 = 11.0;
 const ROW_HEIGHT: f32 = 16.0;
@@ -65,6 +66,9 @@ pub struct Ladder {
     trades: TradeStore,
     pending_tick_size: Option<PriceStep>,
     raw_price_spread: Option<Price>,
+    // 新架构：唯一 ID（用于数据订阅）
+    #[allow(dead_code)]
+    pub(crate) subscriber_id: uuid::Uuid,
 }
 
 impl Ladder {
@@ -81,6 +85,7 @@ impl Ladder {
             orderbook: [GroupedDepth::new(), GroupedDepth::new()],
             raw_price_spread: None,
             pending_tick_size: None,
+            subscriber_id: uuid::Uuid::new_v4(), // 新架构：唯一 ID
         }
     }
 

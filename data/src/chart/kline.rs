@@ -4,8 +4,11 @@ use exchange::{
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::aggr::time::DataPoint;
+
+pub mod hvn;
 
 #[derive(Clone)]
 pub struct KlineDataPoint {
@@ -230,10 +233,12 @@ impl KlineTrades {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum KlineChartKind {
-    #[default]
-    Candles,
+    Candles {
+        #[serde(default)]
+        studies: Vec<FootprintStudy>,
+    },
     Footprint {
         clusters: ClusterKind,
         #[serde(default)]
@@ -242,53 +247,77 @@ pub enum KlineChartKind {
     },
 }
 
+impl Default for KlineChartKind {
+    fn default() -> Self {
+        KlineChartKind::Candles {
+            studies: vec![],
+        }
+    }
+}
+
 impl KlineChartKind {
     pub fn min_scaling(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 0.4,
-            KlineChartKind::Candles => 0.6,
+            KlineChartKind::Candles { .. } => 0.6,
         }
     }
 
     pub fn max_scaling(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 1.2,
-            KlineChartKind::Candles => 2.5,
+            KlineChartKind::Candles { .. } => 2.5,
         }
     }
 
     pub fn max_cell_width(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 360.0,
-            KlineChartKind::Candles => 16.0,
+            KlineChartKind::Candles { .. } => 16.0,
         }
     }
 
     pub fn min_cell_width(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 80.0,
-            KlineChartKind::Candles => 1.0,
+            KlineChartKind::Candles { .. } => 1.0,
         }
     }
 
     pub fn max_cell_height(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 90.0,
-            KlineChartKind::Candles => 8.0,
+            KlineChartKind::Candles { .. } => 8.0,
         }
     }
 
     pub fn min_cell_height(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 1.0,
-            KlineChartKind::Candles => 0.001,
+            KlineChartKind::Candles { .. } => 0.001,
         }
     }
 
     pub fn default_cell_width(&self) -> f32 {
         match self {
             KlineChartKind::Footprint { .. } => 80.0,
-            KlineChartKind::Candles => 4.0,
+            KlineChartKind::Candles { .. } => 4.0,
+        }
+    }
+    
+    /// 获取 studies 列表（无论是 Candles 还是 Footprint）
+    pub fn studies(&self) -> &[FootprintStudy] {
+        match self {
+            KlineChartKind::Candles { studies } => studies,
+            KlineChartKind::Footprint { studies, .. } => studies,
+        }
+    }
+    
+    /// 获取可变的 studies 列表
+    pub fn studies_mut(&mut self) -> &mut Vec<FootprintStudy> {
+        match self {
+            KlineChartKind::Candles { studies } => studies,
+            KlineChartKind::Footprint { studies, .. } => studies,
         }
     }
 }
@@ -364,6 +393,16 @@ pub enum FootprintStudy {
         color_scale: Option<usize>,
         ignore_zeros: bool,
     },
+    HVN {
+        /// 时间窗口（回看多少个K线）
+        lookback: usize,
+        /// 平滑窗口大小（用于移动平均）
+        smoothing_window: usize,
+        /// 相对阈值（相对于POC的百分比，0-100）
+        relative_threshold: u32,
+        /// 最小峰值宽度（价格档位数）
+        min_peak_width: usize,
+    },
 }
 
 impl FootprintStudy {
@@ -375,12 +414,39 @@ impl FootprintStudy {
                     FootprintStudy::Imbalance { .. },
                     FootprintStudy::Imbalance { .. }
                 )
+                | (FootprintStudy::HVN { .. }, FootprintStudy::HVN { .. })
         )
     }
 }
 
 impl FootprintStudy {
-    pub const ALL: [FootprintStudy; 2] = [
+    pub const ALL: [FootprintStudy; 3] = [
+        FootprintStudy::NPoC { lookback: 80 },
+        FootprintStudy::Imbalance {
+            threshold: 200,
+            color_scale: Some(400),
+            ignore_zeros: true,
+        },
+        FootprintStudy::HVN {
+            lookback: 100,
+            smoothing_window: 5,
+            relative_threshold: 30, // 30%
+            min_peak_width: 3,
+        },
+    ];
+    
+    /// Studies that can be used with Candles chart type
+    pub const FOR_CANDLES: [FootprintStudy; 1] = [
+        FootprintStudy::HVN {
+            lookback: 100,
+            smoothing_window: 5,
+            relative_threshold: 30,
+            min_peak_width: 3,
+        },
+    ];
+    
+    /// Studies that can be used with Footprint chart type
+    pub const FOR_FOOTPRINT: [FootprintStudy; 2] = [
         FootprintStudy::NPoC { lookback: 80 },
         FootprintStudy::Imbalance {
             threshold: 200,
@@ -388,6 +454,21 @@ impl FootprintStudy {
             ignore_zeros: true,
         },
     ];
+    
+    /// 根据图表类型返回可用的study列表（静态引用，高效）
+    /// - Candles: 只有 HVN
+    /// - Footprint: 只有 NPoC 和 Imbalance
+    pub fn for_chart_kind(kind: &KlineChartKind) -> &'static [FootprintStudy] {
+        match kind {
+            KlineChartKind::Candles { .. } => &Self::FOR_CANDLES,
+            KlineChartKind::Footprint { .. } => &Self::FOR_FOOTPRINT,
+        }
+    }
+    
+    /// 检查该study是否适用于指定的图表类型
+    pub fn is_compatible_with(&self, kind: &KlineChartKind) -> bool {
+        Self::for_chart_kind(kind).iter().any(|s| s.is_same_type(self))
+    }
 }
 
 impl std::fmt::Display for FootprintStudy {
@@ -395,8 +476,33 @@ impl std::fmt::Display for FootprintStudy {
         match self {
             FootprintStudy::NPoC { .. } => write!(f, "Naked Point of Control"),
             FootprintStudy::Imbalance { .. } => write!(f, "Imbalance"),
-        }
+            FootprintStudy::HVN { .. } => write!(f, "High Volume Node"),
     }
+    }
+}
+
+/// 单个 HVN 峰值点
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HighVolumeNode {
+    /// 峰值价格
+    pub price: Price,
+    /// 峰值成交量
+    pub volume: f32,
+    /// 峰值宽度（价格档位数）
+    pub width: usize,
+    /// 峰值强度（相对于POC的百分比，0.0-1.0）
+    pub strength: f32,
+}
+
+/// HVN 计算结果
+#[derive(Debug, Clone, Default)]
+pub struct HVNResult {
+    /// 检测到的所有 HVN 峰值
+    pub peaks: Vec<HighVolumeNode>,
+    /// POC（用于计算相对阈值）
+    pub poc_volume: f32,
+    /// 价格档位到成交量的映射（用于调试/可视化）
+    pub volume_profile: BTreeMap<Price, f32>,
 }
 
 #[derive(Debug, Clone, Copy)]

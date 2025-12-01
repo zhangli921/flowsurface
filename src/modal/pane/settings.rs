@@ -466,9 +466,30 @@ pub fn kline_cfg_view<'a>(
     basis: data::chart::Basis,
 ) -> Element<'a, Message> {
     let content = match kind {
-        KlineChartKind::Candles => column![text(
-            "This chart type doesn't have any configurations, WIP..."
-        )],
+        KlineChartKind::Candles { studies } => {
+            // Candles 类型只显示 HVN（使用数据层定义的兼容性）
+            let study_cfg = study_config
+                .view_with_studies(
+                    FootprintStudy::for_chart_kind(kind),
+                    studies,
+                    basis,
+                )
+                .map(move |msg| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::StudyConfigurator(study::StudyMessage::Footprint(msg)),
+                    )
+                });
+
+            split_column![
+                column![text("Studies").size(14), study_cfg].spacing(8),
+                row![
+                    space::horizontal(),
+                    sync_all_button(pane, VisualConfig::Kline(cfg))
+                ],
+                ; spacing = 12, align_x = Alignment::Start
+            ]
+        }
         KlineChartKind::Footprint {
             clusters,
             scaling,
@@ -510,12 +531,19 @@ pub fn kline_cfg_view<'a>(
                 }
             };
 
-            let study_cfg = study_config.view(studies, basis).map(move |msg| {
-                Message::PaneEvent(
-                    pane,
-                    Event::StudyConfigurator(study::StudyMessage::Footprint(msg)),
+            // Footprint 类型只显示 NPoC 和 Imbalance（使用数据层定义的兼容性）
+            let study_cfg = study_config
+                .view_with_studies(
+                    FootprintStudy::for_chart_kind(kind),
+                    studies,
+                    basis,
                 )
-            });
+                .map(move |msg| {
+                    Message::PaneEvent(
+                        pane,
+                        Event::StudyConfigurator(study::StudyMessage::Footprint(msg)),
+                    )
+                });
 
             split_column![
                 column![text("Cluster type").size(14), cluster_picklist].spacing(8),
@@ -760,6 +788,72 @@ pub mod study {
                         .padding(4)
                         .into()
                 }
+                FootprintStudy::HVN {
+                    lookback,
+                    smoothing_window,
+                    relative_threshold,
+                    min_peak_width,
+                } => {
+                    let lookback_ui = {
+                        let info_text = text(format!("Lookback: {lookback} datapoints"));
+                        let slider_ui = slider(10.0..=500.0, lookback as f32, move |new_value| {
+                            on_change(FootprintStudy::HVN {
+                                lookback: new_value as usize,
+                                smoothing_window: smoothing_window,
+                                relative_threshold: relative_threshold,
+                                min_peak_width: min_peak_width,
+                            })
+                        })
+                        .step(10.0);
+                        column![info_text, slider_ui].padding(8).spacing(4)
+                    };
+
+                    let smoothing_ui = {
+                        let info_text = text(format!("Smoothing window: {smoothing_window}"));
+                        let slider_ui = slider(1.0..=20.0, smoothing_window as f32, move |new_value| {
+                            on_change(FootprintStudy::HVN {
+                                lookback: lookback,
+                                smoothing_window: new_value as usize,
+                                relative_threshold: relative_threshold,
+                                min_peak_width: min_peak_width,
+                            })
+                        })
+                        .step(1.0);
+                        column![info_text, slider_ui].padding(8).spacing(4)
+                    };
+
+                    let threshold_ui = {
+                        let info_text = text(format!("Threshold: {}%", relative_threshold));
+                        let slider_ui = slider(10.0..=100.0, relative_threshold as f32, move |new_value| {
+                            on_change(FootprintStudy::HVN {
+                                lookback: lookback,
+                                smoothing_window: smoothing_window,
+                                relative_threshold: new_value as u32,
+                                min_peak_width: min_peak_width,
+                            })
+                        })
+                        .step(5.0);
+                        column![info_text, slider_ui].padding(8).spacing(4)
+                    };
+
+                    let min_width_ui = {
+                        let info_text = text(format!("Min peak width: {min_peak_width}"));
+                        let slider_ui = slider(1.0..=10.0, min_peak_width as f32, move |new_value| {
+                            on_change(FootprintStudy::HVN {
+                                lookback: lookback,
+                                smoothing_window: smoothing_window,
+                                relative_threshold: relative_threshold,
+                                min_peak_width: new_value as usize,
+                            })
+                        })
+                        .step(1.0);
+                        column![info_text, slider_ui].padding(8).spacing(4)
+                    };
+
+                    split_column![lookback_ui, smoothing_ui, threshold_ui, min_width_ui]
+                        .padding(4)
+                        .into()
+                }
             }
         }
     }
@@ -914,6 +1008,23 @@ pub mod study {
             for available_study in S::all() {
                 content =
                     content.push(self.create_study_row(available_study, active_studies, basis));
+            }
+
+            content.into()
+        }
+        
+        /// 使用指定的study列表来显示（用于根据图表类型过滤）
+        pub fn view_with_studies<'a>(
+            &self,
+            available_studies: &'static [S],
+            active_studies: &'a [S],
+            basis: data::chart::Basis,
+        ) -> Element<'a, Message<S>> {
+            let mut content = column![].spacing(4);
+
+            for available_study in available_studies {
+                content =
+                    content.push(self.create_study_row(*available_study, active_studies, basis));
             }
 
             content.into()

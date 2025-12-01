@@ -312,9 +312,35 @@ impl Flowsurface {
                         Some(dashboard::Event::ResolveStreams { pane_id, streams }) => {
                             let tickers_info = self.sidebar.tickers_info();
 
-                            let resolved_streams =
+                            let resolved_streams: Result<Vec<exchange::adapter::StreamKind>, String> =
                                 streams.into_iter().try_fold(vec![], |mut acc, persist| {
                                     let resolver = |t: &exchange::Ticker| {
+                                        use exchange::adapter::Exchange;
+                                        
+                                        // 优先尝试 Binance 版本（如果原始不是 Binance）
+                                        let binance_exchange = match t.exchange {
+                                            Exchange::BybitLinear => Exchange::BinanceLinear,
+                                            Exchange::BybitInverse => Exchange::BinanceInverse,
+                                            Exchange::BybitSpot => Exchange::BinanceSpot,
+                                            Exchange::HyperliquidLinear => Exchange::BinanceLinear,
+                                            Exchange::HyperliquidSpot => Exchange::BinanceSpot,
+                                            Exchange::OkexLinear => Exchange::BinanceLinear,
+                                            Exchange::OkexInverse => Exchange::BinanceInverse,
+                                            Exchange::OkexSpot => Exchange::BinanceSpot,
+                                            _ => {
+                                                // 已经是 Binance，直接查找
+                                                return tickers_info.get(t).and_then(|opt| *opt);
+                                            }
+                                        };
+                                        
+                                        // 尝试 Binance 版本
+                                        let (ticker_str, _) = t.to_full_symbol_and_type();
+                                        let binance_ticker = exchange::Ticker::new(&ticker_str, binance_exchange);
+                                        if let Some(info) = tickers_info.get(&binance_ticker).and_then(|opt| *opt) {
+                                            return Some(info);
+                                        }
+                                        
+                                        // 如果 Binance 版本不存在，回退到原始 ticker
                                         tickers_info.get(t).and_then(|opt| *opt)
                                     };
 
@@ -323,10 +349,15 @@ impl Flowsurface {
                                             acc.push(stream);
                                             Ok(acc)
                                         }
-                                        Err(err) => Err(format!(
-                                            "Failed to resolve persisted stream: {}",
-                                            err
-                                        )),
+                                        Err(err) => {
+                                            // 如果 resolver 失败，记录警告但不阻止其他 stream 的解析
+                                            // 这样可以避免因为一个 stream 失败而导致所有 stream 都无法解析
+                                            log::warn!(
+                                                "Failed to resolve persisted stream: {}. This may happen if the ticker is not available or ticker_info hasn't loaded yet. The stream will be skipped.",
+                                                err
+                                            );
+                                            Ok(acc) // 继续处理其他 stream，而不是返回错误
+                                        }
                                     }
                                 });
 
@@ -485,6 +516,52 @@ impl Flowsurface {
                 match action {
                     Some(dashboard::sidebar::Action::TickerSelected(ticker_info, content)) => {
                         let main_window_id = self.main_window.id;
+                        
+                        // 优先使用 Binance 版本的 ticker
+                        let ticker_info = {
+                            use exchange::adapter::Exchange;
+                            let tickers_info = self.sidebar.tickers_info();
+                            
+                            // 如果原始 ticker 不是 Binance，尝试转换为 Binance
+                            let binance_exchange = match ticker_info.ticker.exchange {
+                                Exchange::BybitLinear => Exchange::BinanceLinear,
+                                Exchange::BybitInverse => Exchange::BinanceInverse,
+                                Exchange::BybitSpot => Exchange::BinanceSpot,
+                                Exchange::HyperliquidLinear => Exchange::BinanceLinear,
+                                Exchange::HyperliquidSpot => Exchange::BinanceSpot,
+                                Exchange::OkexLinear => Exchange::BinanceLinear,
+                                Exchange::OkexInverse => Exchange::BinanceInverse,
+                                Exchange::OkexSpot => Exchange::BinanceSpot,
+                                _ => {
+                                    // 已经是 Binance，直接使用
+                                    return {
+                                        let task = if let Some(kind) = content {
+                                            self.active_dashboard_mut().init_focused_pane(
+                                                main_window_id,
+                                                ticker_info,
+                                                kind,
+                                            )
+                                        } else {
+                                            self.active_dashboard_mut()
+                                                .switch_tickers_in_group(main_window_id, ticker_info)
+                                        };
+                                        task.map(move |msg| Message::Dashboard(None, msg))
+                                    };
+                                }
+                            };
+                            
+                            // 尝试查找 Binance 版本
+                            let (ticker_str, _) = ticker_info.ticker.to_full_symbol_and_type();
+                            let binance_ticker = exchange::Ticker::new(&ticker_str, binance_exchange);
+                            
+                            if let Some(Some(binance_ticker_info)) = tickers_info.get(&binance_ticker) {
+                                // 找到 Binance 版本，使用它
+                                *binance_ticker_info
+                            } else {
+                                // Binance 版本不存在，使用原始 ticker
+                                ticker_info
+                            }
+                        };
 
                         let task = {
                             if let Some(kind) = content {
