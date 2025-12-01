@@ -34,7 +34,7 @@ use std::hash::{Hash, Hasher};
 use std::cell::RefCell;
 use uuid::Uuid;
 
-// 新架构：可选的 ChartDataManager trait 实现
+// 新架构：可选的 ChartDataManager trait 实现（暂未启用）
 #[cfg(feature = "unified_data_manager")]
 use crate::screen::dashboard::chart_traits::ChartDataManager;
 #[cfg(feature = "unified_data_manager")]
@@ -242,7 +242,7 @@ pub struct KlineChart {
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
     hvn_cache: RefCell<HVNCache>,
-    // 新架构：唯一 ID（用于数据订阅）
+    // 新架构：唯一 ID（用于数据订阅，暂未启用）
     #[allow(dead_code)]
     pub(crate) subscriber_id: uuid::Uuid,
 }
@@ -441,18 +441,8 @@ impl KlineChart {
                 let (kline_earliest, kline_latest) = timeseries.timerange();
                 let earliest = visible_earliest.saturating_sub(visible_latest - visible_earliest);
 
-                log::debug!(
-                    "KlineChart::missing_data_task: visible=({}, {}), kline=({}, {}), datapoints={}",
-                    visible_earliest,
-                    visible_latest,
-                    kline_earliest,
-                    kline_latest,
-                    timeseries.datapoints.len()
-                );
-
                 if timeseries.datapoints.is_empty() {
                     let range = FetchRange::Kline(earliest, visible_latest + timeframe_ms);
-                    log::debug!("KlineChart::missing_data_task: datapoints empty, requesting range: {:?}", range);
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
@@ -461,30 +451,15 @@ impl KlineChart {
                 // priority 1, basic kline data fetch
                 if visible_earliest < kline_earliest {
                     let range = FetchRange::Kline(earliest, kline_earliest);
-                    log::debug!(
-                        "KlineChart::missing_data_task: requesting historical klines, range: {:?}",
-                        range
-                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
-                } else {
-                    log::debug!(
-                        "KlineChart::missing_data_task: No historical data needed. visible_earliest={} >= kline_earliest={} (diff={}ms, {}min)",
-                        visible_earliest,
-                        kline_earliest,
-                        visible_earliest.saturating_sub(kline_earliest),
-                        (visible_earliest.saturating_sub(kline_earliest) as f64 / 1000.0 / 60.0)
-                    );
                 }
 
                 // priority 2, trades fetch
-                // 对于 Footprint 类型，总是需要交易数据
-                // 对于 Candles 类型，如果启用了 HVN，也需要交易数据
                 let needs_trades = match &self.kind {
                     KlineChartKind::Footprint { .. } => true,
                     KlineChartKind::Candles { studies } => {
-                        // 如果启用了 HVN，需要交易数据
                         studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }))
                     }
                 };
@@ -498,48 +473,20 @@ impl KlineChart {
                         | exchange::adapter::Exchange::BinanceInverse
                 );
                 
-                if needs_trades {
-                    log::debug!(
-                        "KlineChart::missing_data_task: Checking trades fetch - fetching_trades={}, is_trade_fetch_enabled={}, exchange={:?}, is_binance={}",
-                        self.fetching_trades.0,
-                        exchange::fetcher::is_trade_fetch_enabled(),
-                        exchange,
-                        is_binance
-                    );
-                }
-                
                 if !self.fetching_trades.0
                     && needs_trades
                     && exchange::fetcher::is_trade_fetch_enabled()
-                    && is_binance  // 只有 Binance 支持历史 trades 下载
+                    && is_binance
                 {
-                    // 尝试从 trade gap 获取下载范围
-                    // 如果返回 None（例如所有 footprint 都为空），使用可见范围
                     let (fetch_from, fetch_to) = timeseries
                         .suggest_trade_fetch_range(visible_earliest, visible_latest)
                         .unwrap_or((visible_earliest, visible_latest));
                     
                     let range = FetchRange::Trades(fetch_from, fetch_to);
-                    log::debug!(
-                        "KlineChart::missing_data_task: requesting historical trades, range: {:?}",
-                        range
-                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         self.fetching_trades = (true, None);
                         self.trades_fetch_start_time = Some(Instant::now());
                         return Some(action);
-                    } else {
-                        // request_fetch 返回 None 可能的原因：
-                        // 1. 请求被去重
-                        // 2. 交易所不支持（如 Bybit）
-                        // 3. 其他错误
-                        // 对于不支持的交易所，不应该设置 fetching_trades=true
-                        // 但是我们已经检查了 is_trade_fetch_enabled()，所以这里可能是去重
-                        log::debug!(
-                            "KlineChart::missing_data_task: trades request was deduplicated, failed, or not supported for this exchange"
-                        );
-                        // 注意：如果是因为交易所不支持，fetching_trades 不会被设置，这是正确的
-                        // 但如果之前已经设置了 fetching_trades=true，我们需要检查是否应该重置
                     }
                 } else if needs_trades {
                     if self.fetching_trades.0 {
@@ -553,26 +500,13 @@ impl KlineChart {
                                 );
                                 self.fetching_trades = (false, None);
                                 self.trades_fetch_start_time = None;
-                            } else {
-                                log::debug!(
-                                    "KlineChart::missing_data_task: Already fetching trades, skipping (elapsed: {}s)",
-                                    elapsed.as_secs()
-                                );
                             }
                         } else {
-                            // 如果没有开始时间记录，可能是旧的状态，重置标志
                             log::warn!(
-                                "KlineChart::missing_data_task: fetching_trades=true but no start_time, resetting. This indicates a stale state."
+                                "KlineChart::missing_data_task: fetching_trades=true but no start_time, resetting stale state"
                             );
                             self.fetching_trades = (false, None);
                         }
-                    } else if !exchange::fetcher::is_trade_fetch_enabled() {
-                        log::debug!(
-                            "KlineChart::missing_data_task: Trade fetch is disabled"
-                        );
-                    } else if !is_binance {
-                        // 交易所不支持历史 trades 下载，静默跳过（避免日志刷屏）
-                        // 不记录日志，因为用户已经知道这个交易所不支持
                     }
                 }
 
@@ -789,7 +723,6 @@ impl KlineChart {
                 self.invalidate(None);
             }
             PlotData::TimeBased(ref mut timeseries) => {
-                // 对于 Candles 图表启用 HVN 时，需要创建不存在的数据点
                 let needs_hvn = match &self.kind {
                     KlineChartKind::Candles { studies } => {
                         studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }))
@@ -806,19 +739,11 @@ impl KlineChart {
     }
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
-        log::debug!(
-            "KlineChart::insert_raw_trades: trades_count={}, is_batches_done={}, fetching_trades={}",
-            raw_trades.len(),
-            is_batches_done,
-            self.fetching_trades.0
-        );
-        
         match self.data_source {
             PlotData::TickBased(ref mut tick_aggr) => {
                 tick_aggr.insert_trades(&raw_trades);
             }
             PlotData::TimeBased(ref mut timeseries) => {
-                // 对于 Candles 图表启用 HVN 时，需要创建不存在的数据点
                 let needs_hvn = match &self.kind {
                     KlineChartKind::Candles { studies } => {
                         studies.iter().any(|s| matches!(s, FootprintStudy::HVN { .. }))
@@ -836,28 +761,15 @@ impl KlineChart {
         self.raw_trades.extend(raw_trades);
 
         if is_batches_done {
-            log::debug!("KlineChart::insert_raw_trades: Resetting fetching_trades flag");
             self.fetching_trades = (false, None);
             self.trades_fetch_start_time = None;
         }
     }
 
     pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
-        log::debug!(
-            "KlineChart::insert_hist_klines: req_id={}, klines_count={}",
-            req_id,
-            klines_raw.len()
-        );
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
-                let before_count = timeseries.datapoints.len();
                 timeseries.insert_klines(klines_raw);
-                let after_count = timeseries.datapoints.len();
-                log::debug!(
-                    "KlineChart::insert_hist_klines: datapoints before={}, after={}",
-                    before_count,
-                    after_count
-                );
                 // 对于 Candles 图表启用 HVN 时，需要创建不存在的数据点
                 let needs_hvn = match &self.kind {
                     KlineChartKind::Candles { studies } => {
@@ -1744,8 +1656,7 @@ fn draw_all_hvns(
     let end_x = {
         let earliest_x = interval_to_x(visible_earliest);
         let latest_x = interval_to_x(visible_latest);
-        // 对于 Candles 类型，线条应该延伸到可见区域右边缘
-        // 对于 Footprint 类型，线条应该延伸到最右侧的 K 线
+        // 线条延伸：Candles 到可见区域右边缘，Footprint 到最右侧 K 线
         match cluster_kind {
             ClusterKind::BidAsk => {
                 // Candles：延伸到可见区域右边缘

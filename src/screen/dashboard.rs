@@ -3,7 +3,7 @@ pub mod panel;
 pub mod sidebar;
 pub mod tickers_table;
 
-// 新架构模块（默认不启用，不影响现有功能）
+// 新架构模块（暂未启用）
 #[allow(dead_code)]
 pub mod unified_data_manager;
 #[allow(dead_code)]
@@ -69,7 +69,7 @@ pub struct Dashboard {
     pub streams: UniqueStreams,
     layout_id: uuid::Uuid,
     
-    // 新架构组件（可选，默认不启用）
+    // 新架构组件（暂未启用）
     #[allow(dead_code)]
     unified_data_manager: Option<std::sync::Arc<unified_data_manager::UnifiedDataManager>>,
     #[allow(dead_code)]
