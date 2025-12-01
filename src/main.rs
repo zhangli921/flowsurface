@@ -353,7 +353,7 @@ impl Flowsurface {
                                             // 如果 resolver 失败，记录警告但不阻止其他 stream 的解析
                                             // 这样可以避免因为一个 stream 失败而导致所有 stream 都无法解析
                                             log::warn!(
-                                                "Failed to resolve persisted stream: {}. This may happen if the ticker is not available or ticker_info hasn't loaded yet. The stream will be skipped.",
+                                                "Failed to resolve persisted stream: {}. This may happen if the ticker is not available or ticker_info hasn't loaded yet. The stream will be skipped. (This is normal during startup)",
                                                 err
                                             );
                                             Ok(acc) // 继续处理其他 stream，而不是返回错误

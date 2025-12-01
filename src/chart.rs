@@ -1144,8 +1144,20 @@ fn request_fetch(handler: &mut RequestHandler, range: FetchRange) -> Option<Acti
         }
         Ok(None) => None,
         Err(reason) => {
-            log::error!("Failed to request {:?}: {}", range, reason);
-            // TODO: handle this more explicitly, maybe by returning Action::ErrorOccurred
+            // Overlaps 是正常的去重行为，不应该作为错误记录
+            // 其他错误（Failed, Completed）可能需要关注，但 Overlaps 是预期的
+            // 注意：Overlaps 时不需要记录日志，因为这是正常的去重行为
+            // 只有在 DEBUG 模式下，且需要详细追踪时才记录
+            match &reason {
+                exchange::fetcher::ReqError::Overlaps => {
+                    // 完全静默处理 Overlaps，因为这是预期的去重行为
+                    // 如果需要调试，可以取消下面的注释
+                    // log::debug!("Request {:?} overlaps with existing request (deduplication working)", range);
+                }
+                _ => {
+                    log::warn!("Request {:?} failed: {}", range, reason);
+                }
+            }
             None
         }
     }

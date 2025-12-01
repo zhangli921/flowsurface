@@ -484,9 +484,21 @@ impl KlineChart {
                     
                     let range = FetchRange::Trades(fetch_from, fetch_to);
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                        // 只有在成功创建请求时才设置标志
+                        log::debug!(
+                            "KlineChart::missing_data_task: Trades fetch requested, range: {:?}",
+                            range
+                        );
                         self.fetching_trades = (true, None);
                         self.trades_fetch_start_time = Some(Instant::now());
                         return Some(action);
+                    } else {
+                        // 如果 request_fetch 返回 None（可能是 Overlaps），不设置 fetching_trades
+                        // 因为请求可能已经在进行中，或者被去重了
+                        // 这种情况下，不需要设置 fetching_trades，避免超时警告
+                        log::debug!(
+                            "KlineChart::missing_data_task: Trades fetch request returned None (likely overlaps or deduplicated)"
+                        );
                     }
                 } else if needs_trades {
                     if self.fetching_trades.0 {
