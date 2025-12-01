@@ -235,31 +235,11 @@ impl State {
                         )
                     };
 
-                    // 检查是否启用了 HVN
-                    let has_hvn = if let Content::Kline { kind, .. } = &content {
-                        match kind {
-                            data::chart::KlineChartKind::Candles { studies } => {
-                                studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    };
-
                     let streams = by_basis_default(
                         derived_plan.basis,
                         Timeframe::M15,
                         |tf| {
-                            if has_hvn {
-                                // 如果启用了 HVN，需要 DepthAndTrades 流来获取交易数据
-                                vec![
-                                    depth_stream(&derived_plan),
-                                    kline_stream(derived_plan.ticker_info, tf),
-                                ]
-                            } else {
-                                vec![kline_stream(derived_plan.ticker_info, tf)]
-                            }
+                            vec![kline_stream(derived_plan.ticker_info, tf)]
                         },
                         || {
                             let depth_aggr = derived_plan
@@ -1143,12 +1123,10 @@ impl State {
                                                     let mut streams = vec![kline_stream];
 
                                                     // Footprint 类型总是需要 DepthAndTrades stream
-                                                    // Candles 类型，如果启用了 HVN，也需要 DepthAndTrades stream
+                                                    // Candles 类型不需要 DepthAndTrades stream
                                                     let needs_depth_stream = match &c.kind {
                                                         data::chart::KlineChartKind::Footprint { .. } => true,
-                                                        data::chart::KlineChartKind::Candles { studies } => {
-                                                            studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
-                                                        }
+                                                        data::chart::KlineChartKind::Candles { .. } => false,
                                                     };
 
                                                     if needs_depth_stream {

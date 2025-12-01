@@ -942,9 +942,7 @@ impl Dashboard {
                             // 手动计算 requirements（避免 trait 可见性问题）
                             let needs_trades = match kind {
                                 data::chart::KlineChartKind::Footprint { .. } => true,
-                                data::chart::KlineChartKind::Candles { studies } => {
-                                    studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
-                                }
+                                data::chart::KlineChartKind::Candles { .. } => false,
                             };
                             let requirements = unified_data_manager::DataRequirements {
                                 needs_klines: true,
@@ -1052,12 +1050,10 @@ impl Dashboard {
                     && let Some(c) = chart
                 {
                     // 对于 Footprint 类型，总是需要交易数据
-                    // 对于 Candles 类型，如果启用了 HVN，也需要交易数据
+                    // Candles 类型不需要交易数据
                     let needs_trades = match kind {
                         data::chart::KlineChartKind::Footprint { .. } => true,
-                        data::chart::KlineChartKind::Candles { studies } => {
-                            studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
-                        }
+                        data::chart::KlineChartKind::Candles { .. } => false,
                     };
                     
                     if needs_trades {

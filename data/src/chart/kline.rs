@@ -4,11 +4,8 @@ use exchange::{
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 use crate::aggr::time::DataPoint;
-
-pub mod hvn;
 
 #[derive(Clone)]
 pub struct KlineDataPoint {
@@ -393,16 +390,6 @@ pub enum FootprintStudy {
         color_scale: Option<usize>,
         ignore_zeros: bool,
     },
-    HVN {
-        /// 时间窗口（回看多少个K线）
-        lookback: usize,
-        /// 平滑窗口大小（用于移动平均）
-        smoothing_window: usize,
-        /// 相对阈值（相对于POC的百分比，0-100）
-        relative_threshold: u32,
-        /// 最小峰值宽度（价格档位数）
-        min_peak_width: usize,
-    },
 }
 
 impl FootprintStudy {
@@ -414,36 +401,22 @@ impl FootprintStudy {
                     FootprintStudy::Imbalance { .. },
                     FootprintStudy::Imbalance { .. }
                 )
-                | (FootprintStudy::HVN { .. }, FootprintStudy::HVN { .. })
         )
     }
 }
 
 impl FootprintStudy {
-    pub const ALL: [FootprintStudy; 3] = [
+    pub const ALL: [FootprintStudy; 2] = [
         FootprintStudy::NPoC { lookback: 80 },
         FootprintStudy::Imbalance {
             threshold: 200,
             color_scale: Some(400),
             ignore_zeros: true,
         },
-        FootprintStudy::HVN {
-            lookback: 100,
-            smoothing_window: 5,
-            relative_threshold: 30, // 30%
-            min_peak_width: 3,
-        },
     ];
     
     /// Studies that can be used with Candles chart type
-    pub const FOR_CANDLES: [FootprintStudy; 1] = [
-        FootprintStudy::HVN {
-            lookback: 100,
-            smoothing_window: 5,
-            relative_threshold: 30,
-            min_peak_width: 3,
-        },
-    ];
+    pub const FOR_CANDLES: [FootprintStudy; 0] = [];
     
     /// Studies that can be used with Footprint chart type
     pub const FOR_FOOTPRINT: [FootprintStudy; 2] = [
@@ -456,7 +429,7 @@ impl FootprintStudy {
     ];
     
     /// 根据图表类型返回可用的study列表（静态引用，高效）
-    /// - Candles: 只有 HVN
+    /// - Candles: 无可用 studies
     /// - Footprint: 只有 NPoC 和 Imbalance
     pub fn for_chart_kind(kind: &KlineChartKind) -> &'static [FootprintStudy] {
         match kind {
@@ -476,33 +449,8 @@ impl std::fmt::Display for FootprintStudy {
         match self {
             FootprintStudy::NPoC { .. } => write!(f, "Naked Point of Control"),
             FootprintStudy::Imbalance { .. } => write!(f, "Imbalance"),
-            FootprintStudy::HVN { .. } => write!(f, "High Volume Node"),
     }
     }
-}
-
-/// 单个 HVN 峰值点
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct HighVolumeNode {
-    /// 峰值价格
-    pub price: Price,
-    /// 峰值成交量
-    pub volume: f32,
-    /// 峰值宽度（价格档位数）
-    pub width: usize,
-    /// 峰值强度（相对于POC的百分比，0.0-1.0）
-    pub strength: f32,
-}
-
-/// HVN 计算结果
-#[derive(Debug, Clone, Default)]
-pub struct HVNResult {
-    /// 检测到的所有 HVN 峰值
-    pub peaks: Vec<HighVolumeNode>,
-    /// POC（用于计算相对阈值）
-    pub poc_volume: f32,
-    /// 价格档位到成交量的映射（用于调试/可视化）
-    pub volume_profile: BTreeMap<Price, f32>,
 }
 
 #[derive(Debug, Clone, Copy)]

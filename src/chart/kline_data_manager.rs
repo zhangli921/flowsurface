@@ -16,10 +16,7 @@ impl ChartDataManager for KlineChart {
         // 根据 chart kind 和 enabled studies 决定数据需求
         let needs_trades = match &self.kind {
             data::chart::KlineChartKind::Footprint { .. } => true,
-            data::chart::KlineChartKind::Candles { studies } => {
-                // Candles 只有在启用 HVN 时才需要 trades
-                studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
-            }
+            data::chart::KlineChartKind::Candles { .. } => false,
         };
         
         DataRequirements {
