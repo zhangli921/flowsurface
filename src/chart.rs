@@ -1,11 +1,11 @@
 pub mod comparison;
 pub mod heatmap;
 #[allow(dead_code)]
-mod heatmap_data_manager;  // 新架构：HeatmapChart 的 ChartDataManager 实现
+pub mod heatmap_data_manager;  // 新架构：HeatmapChart 的 ChartDataManager 实现
 pub mod indicator;
 pub mod kline;
 #[allow(dead_code)]
-mod kline_data_manager;  // 新架构：KlineChart 的 ChartDataManager 实现
+pub mod kline_data_manager;  // 新架构：KlineChart 的 ChartDataManager 实现
 mod scale;
 
 use crate::style;

@@ -21,7 +21,7 @@ pub enum RealtimeData {
     // 未来可以扩展其他类型
 }
 
-/// 图表数据管理接口
+/// 图表数据管理接口（完整版）
 /// 
 /// 注意：不要求 Send + Sync，因为图表可能包含非线程安全的内部状态（如 RefCell）
 pub trait ChartDataManager {

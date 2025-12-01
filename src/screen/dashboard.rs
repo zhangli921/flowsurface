@@ -136,19 +136,20 @@ impl Dashboard {
     
     /// 注册图表到 ChartRegistry（如果新架构已启用）
     /// 
-    /// 返回注册的订阅者 ID（如果成功）
-    /// 
-    /// 注意：图表需要满足 'static 生命周期约束
-    pub fn register_chart<C: chart_registry::ChartDataManager + 'static>(
+    /// 参数：
+    /// - `subscriber_id`: 图表的订阅者 ID（通常从图表本身获取）
+    /// - `chart_type`: 图表类型
+    /// - `requirements`: 数据需求
+    /// - `pane_id`: 对应的 pane ID
+    pub fn register_chart(
         &mut self,
-        chart: C,
+        subscriber_id: uuid::Uuid,
         chart_type: chart_registry::ChartType,
-    ) -> Option<uuid::Uuid> {
+        requirements: unified_data_manager::DataRequirements,
+        pane_id: uuid::Uuid,
+    ) {
         if let Some(registry) = &mut self.chart_registry {
-            let id = registry.register_chart(chart, chart_type);
-            Some(id)
-        } else {
-            None
+            registry.register_chart(subscriber_id, chart_type, requirements, pane_id);
         }
     }
     
@@ -156,6 +157,13 @@ impl Dashboard {
     pub fn unregister_chart(&mut self, subscriber_id: uuid::Uuid) {
         if let Some(registry) = &mut self.chart_registry {
             registry.unregister_chart(subscriber_id);
+        }
+    }
+    
+    /// 通过 pane_id 注销图表（如果新架构已启用）
+    pub fn unregister_chart_by_pane(&mut self, pane_id: uuid::Uuid) {
+        if let Some(registry) = &mut self.chart_registry {
+            registry.unregister_chart_by_pane(pane_id);
         }
     }
     
@@ -387,6 +395,12 @@ impl Dashboard {
                     self.panes.restore();
                 }
                 pane::Message::ReplacePane(pane) => {
+                    // 注销图表（如果新架构已启用）
+                    if self.is_unified_data_manager_enabled() {
+                        if let Some(state) = self.get_pane(main_window.id, window, pane) {
+                            self.unregister_chart_by_pane(state.unique_id());
+                        }
+                    }
                     if let Some(pane) = self.panes.get_mut(pane) {
                         *pane = pane::State::new();
                     }
@@ -861,30 +875,114 @@ impl Dashboard {
             self.focus = Some((main_window, *pane_id));
         }
 
-        if let Some((window, selected_pane)) = self.focus
-            && let Some(state) = self.get_mut_pane(main_window, window, selected_pane)
-        {
-            let previous_ticker = state.stream_pair();
-            if previous_ticker.is_some() && previous_ticker != Some(ticker_info) {
-                state.link_group = None;
-            }
-
-            let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
-
-            let pane_id = state.unique_id();
-            self.streams.extend(streams.iter());
-
-            for stream in &streams {
-                if let StreamKind::Kline { .. } = stream {
-                    return kline_fetch_task(self.layout_id, pane_id, *stream, None, None);
+        if let Some((window, selected_pane)) = self.focus {
+            // 先注销旧的图表（如果新架构已启用）
+            let pane_id = if let Some(state) = self.get_pane(main_window, window, selected_pane) {
+                let id = state.unique_id();
+                if self.is_unified_data_manager_enabled() {
+                    drop(state);  // 释放不可变借用
+                    self.unregister_chart_by_pane(id);
                 }
+                id
+            } else {
+                return Task::none();
+            };
+
+            // 现在可以安全地获取可变借用
+            if let Some(state) = self.get_mut_pane(main_window, window, selected_pane) {
+                let previous_ticker = state.stream_pair();
+                if previous_ticker.is_some() && previous_ticker != Some(ticker_info) {
+                    state.link_group = None;
+                }
+
+                let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
+                drop(state);  // 释放可变借用
+
+                // 注册新创建的图表（如果新架构已启用）
+                if self.is_unified_data_manager_enabled() {
+                    self.register_charts_in_pane(main_window, window, selected_pane);
+                }
+
+                self.streams.extend(streams.iter());
+
+                for stream in &streams {
+                    if let StreamKind::Kline { .. } = stream {
+                        return kline_fetch_task(self.layout_id, pane_id, *stream, None, None);
+                    }
+                }
+                return Task::none();
             }
-            return Task::none();
         }
 
         Task::done(Message::Notification(Toast::warn(
             "No focused pane found".to_string(),
         )))
+    }
+    
+    /// 注册 pane 中的所有图表到 ChartRegistry（如果新架构已启用）
+    fn register_charts_in_pane(
+        &mut self,
+        main_window: window::Id,
+        window: window::Id,
+        pane: pane_grid::Pane,
+    ) {
+        // 先收集信息，避免借用冲突
+        let content_info: Option<(uuid::Uuid, chart_registry::ChartType, uuid::Uuid, unified_data_manager::DataRequirements)> = {
+            let state = self.get_pane(main_window, window, pane);
+            state
+                .map(|s| {
+                    let pane_id = s.unique_id();
+                    match &s.content {
+                        pane::Content::Kline { chart: Some(c), kind, .. } => {
+                            // 手动计算 requirements（避免 trait 可见性问题）
+                            let needs_trades = match kind {
+                                data::chart::KlineChartKind::Footprint { .. } => true,
+                                data::chart::KlineChartKind::Candles { studies } => {
+                                    studies.iter().any(|s| matches!(s, data::chart::kline::FootprintStudy::HVN { .. }))
+                                }
+                            };
+                            let requirements = unified_data_manager::DataRequirements {
+                                needs_klines: true,
+                                needs_trades,
+                                needs_depth: false,
+                                needs_open_interest: false,
+                                supports_historical: true,
+                                supports_tick_basis: true,
+                            };
+                            Some((pane_id, chart_registry::ChartType::Kline, c.subscriber_id, requirements))
+                        }
+                        pane::Content::Heatmap { chart: Some(c), .. } => {
+                            let requirements = unified_data_manager::DataRequirements {
+                                needs_klines: false,
+                                needs_trades: true,
+                                needs_depth: false,
+                                needs_open_interest: false,
+                                supports_historical: true,
+                                supports_tick_basis: false,
+                            };
+                            Some((pane_id, chart_registry::ChartType::Heatmap, c.subscriber_id, requirements))
+                        }
+                        pane::Content::Ladder(Some(l)) => {
+                            let requirements = unified_data_manager::DataRequirements {
+                                needs_klines: false,
+                                needs_trades: true,
+                                needs_depth: true,
+                                needs_open_interest: false,
+                                supports_historical: false,
+                                supports_tick_basis: false,
+                            };
+                            Some((pane_id, chart_registry::ChartType::Ladder, l.subscriber_id, requirements))
+                        }
+                        _ => None,
+                    }
+                })
+                .flatten()
+        };
+        
+        // 现在可以安全地调用可变方法（不可变借用已释放）
+        if let Some((pane_id, chart_type, subscriber_id, requirements)) = content_info {
+            self.register_chart(subscriber_id, chart_type, requirements, pane_id);
+        }
     }
 
     pub fn switch_tickers_in_group(

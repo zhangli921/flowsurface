@@ -1,6 +1,6 @@
 pub mod ladder;
 #[allow(dead_code)]
-mod ladder_data_manager;  // 新架构：Ladder 的 ChartDataManager 实现
+pub mod ladder_data_manager;  // 新架构：Ladder 的 ChartDataManager 实现
 pub mod timeandsales;
 
 use iced::{
