@@ -372,6 +372,29 @@ impl State {
                     panic!("chart wasn't initialized when inserting klines");
                 };
 
+                // 添加日志：记录初始加载的数据量
+                let chart_kind = match &chart.kind() {
+                    data::chart::KlineChartKind::Footprint { .. } => "Footprint",
+                    data::chart::KlineChartKind::Candles { .. } => "Candles",
+                };
+                
+                if req_id.is_none() {
+                    log::info!(
+                        "[{}] insert_hist_klines: Initial load - {} klines, timeframe={:?}, ticker={:?}",
+                        chart_kind,
+                        klines.len(),
+                        timeframe,
+                        ticker_info.ticker
+                    );
+                } else {
+                    log::debug!(
+                        "[{}] insert_hist_klines: Incremental load - {} klines, req_id={:?}",
+                        chart_kind,
+                        klines.len(),
+                        req_id
+                    );
+                }
+
                 if let Some(id) = req_id {
                     chart.insert_hist_klines(id, klines);
                 } else {
@@ -387,6 +410,14 @@ impl State {
                         indicators,
                         ticker_info,
                         chart.kind(),
+                    );
+                    
+                    // 添加日志：记录重新创建图表后的数据点数量
+                    // 注意：data_source 是私有的，我们无法直接访问，所以只记录 klines 数量
+                    log::info!(
+                        "[{}] insert_hist_klines: Chart recreated with {} klines",
+                        chart_kind,
+                        klines.len()
                     );
                 }
             }

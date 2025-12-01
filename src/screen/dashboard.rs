@@ -66,22 +66,25 @@ pub struct Dashboard {
     pub streams: UniqueStreams,
     layout_id: uuid::Uuid,
     
-    // 新架构组件
-    unified_data_manager: Option<std::sync::Arc<unified_data_manager::UnifiedDataManager>>,
-    chart_registry: Option<chart_registry::ChartRegistry>,
+    // 新架构组件（始终启用）
+    unified_data_manager: std::sync::Arc<unified_data_manager::UnifiedDataManager>,
+    chart_registry: chart_registry::ChartRegistry,
 }
 
 impl Default for Dashboard {
     fn default() -> Self {
+        let data_manager = std::sync::Arc::new(unified_data_manager::UnifiedDataManager::new(1000));
+        let chart_registry = chart_registry::ChartRegistry::new(data_manager.clone());
+        
         Self {
             panes: pane_grid::State::with_configuration(Self::default_pane_config()),
             focus: None,
             streams: UniqueStreams::default(),
             popout: HashMap::new(),
             layout_id: uuid::Uuid::new_v4(),
-            // 新架构组件默认不启用
-            unified_data_manager: None,
-            chart_registry: None,
+            // 新架构组件（始终启用）
+            unified_data_manager: data_manager,
+            chart_registry,
         }
     }
 }
@@ -103,24 +106,14 @@ pub enum Event {
 
 impl Dashboard {
     /// 初始化新架构组件（始终启用）
+    /// 
+    /// 注意：新架构组件在 Default::default() 和 from_config() 中已经初始化
+    /// 这个方法现在只用于记录日志
     pub fn init_unified_data_manager(&mut self) {
-        // 如果已经初始化，直接返回，避免重复初始化和日志
-        if self.unified_data_manager.is_some() {
-            return;
-        }
-        
-        let data_manager = std::sync::Arc::new(
-            unified_data_manager::UnifiedDataManager::new(1000) // 最大缓存 1000 项
-        );
-        let chart_registry = chart_registry::ChartRegistry::new(data_manager.clone());
-        
-        self.unified_data_manager = Some(data_manager);
-        self.chart_registry = Some(chart_registry);
-        
         log::info!("UnifiedDataManager initialized");
     }
     
-    /// 注册图表到 ChartRegistry（如果新架构已启用）
+    /// 注册图表到 ChartRegistry
     /// 
     /// 参数：
     /// - `subscriber_id`: 图表的订阅者 ID（通常从图表本身获取）
@@ -134,102 +127,92 @@ impl Dashboard {
         requirements: unified_data_manager::DataRequirements,
         pane_id: uuid::Uuid,
     ) {
-        if let Some(registry) = &mut self.chart_registry {
-            registry.register_chart(subscriber_id, chart_type, requirements, pane_id);
-        }
+        self.chart_registry.register_chart(subscriber_id, chart_type, requirements, pane_id);
     }
     
-    /// 注销图表（如果新架构已启用）
+    /// 注销图表
     pub fn unregister_chart(&mut self, subscriber_id: uuid::Uuid) {
-        if let Some(registry) = &mut self.chart_registry {
-            registry.unregister_chart(subscriber_id);
-        }
+        self.chart_registry.unregister_chart(subscriber_id);
     }
     
-    /// 通过 pane_id 注销图表（如果新架构已启用）
+    /// 通过 pane_id 注销图表
     pub fn unregister_chart_by_pane(&mut self, pane_id: uuid::Uuid) {
-        if let Some(registry) = &mut self.chart_registry {
-            registry.unregister_chart_by_pane(pane_id);
-        }
+        self.chart_registry.unregister_chart_by_pane(pane_id);
     }
     
-    /// 分发数据到 UnifiedDataManager（如果启用）
+    /// 分发数据到 UnifiedDataManager
     /// 
     /// 这个方法会在数据到达时调用，将数据缓存并通知所有订阅者
     fn distribute_to_unified_manager(&self, data: &FetchedData, stream_type: &StreamKind) {
-        if let Some(data_manager) = &self.unified_data_manager {
-            // 从 stream_type 中提取 ticker_info
-            let ticker_info = match stream_type {
-                StreamKind::Kline { ticker_info, .. } => *ticker_info,
-                StreamKind::DepthAndTrades { ticker_info, .. } => *ticker_info,
-                _ => {
-                    // 其他类型的 stream 暂不支持
-                    return;
-                }
-            };
+        // 从 stream_type 中提取 ticker_info
+        let ticker_info = match stream_type {
+            StreamKind::Kline { ticker_info, .. } => *ticker_info,
+            StreamKind::DepthAndTrades { ticker_info, .. } => *ticker_info,
+            _ => {
+                // 其他类型的 stream 暂不支持
+                return;
+            }
+        };
+        
+        // 构建 DataKey
+        // 注意：我们需要从 data 中提取 range 和 basis
+        // 由于 FetchedData 不直接包含这些信息，我们需要从 stream_type 推断
+        let (range, basis) = match (data, stream_type) {
+            (FetchedData::Trades { batch, until_time }, _) => {
+                let from = batch.first().map(|t| t.time).unwrap_or(0);
+                let to = *until_time;
+                (
+                    FetchRange::Trades(from, to),
+                    data::chart::Basis::Time(exchange::Timeframe::M1), // 默认值，实际应该从 pane 获取
+                )
+            }
+            (FetchedData::Klines { data: klines, .. }, StreamKind::Kline { timeframe, .. }) => {
+                let from = klines.first().map(|k| k.time).unwrap_or(0);
+                // Kline 的 time 是开始时间，结束时间需要根据 timeframe 计算
+                let interval_ms = timeframe.to_milliseconds();
+                let to = klines.last().map(|k| k.time + interval_ms).unwrap_or(0);
+                (
+                    FetchRange::Kline(from, to),
+                    data::chart::Basis::Time(*timeframe),
+                )
+            }
+            (FetchedData::OI { data: oi, .. }, StreamKind::Kline { timeframe, .. }) => {
+                let from = oi.first().map(|o| o.time).unwrap_or(0);
+                let to = oi.last().map(|o| o.time).unwrap_or(0);
+                (
+                    FetchRange::OpenInterest(from, to),
+                    data::chart::Basis::Time(*timeframe),
+                )
+            }
+            _ => {
+                // 不支持的数据类型
+                return;
+            }
+        };
+        
+        let key = unified_data_manager::DataKey::new(ticker_info, range, basis);
+        
+        // 通知 UnifiedDataManager 数据已到达，获取订阅者列表
+        let subscribers = self.unified_data_manager.on_data_fetched(key.clone(), data.clone());
+        
+        if !subscribers.is_empty() {
+            log::debug!(
+                "UnifiedDataManager: Data fetched for key {:?}, notifying {} subscribers",
+                key,
+                subscribers.len()
+            );
             
-            // 构建 DataKey
-            // 注意：我们需要从 data 中提取 range 和 basis
-            // 由于 FetchedData 不直接包含这些信息，我们需要从 stream_type 推断
-            let (range, basis) = match (data, stream_type) {
-                (FetchedData::Trades { batch, until_time }, _) => {
-                    let from = batch.first().map(|t| t.time).unwrap_or(0);
-                    let to = *until_time;
-                    (
-                        FetchRange::Trades(from, to),
-                        data::chart::Basis::Time(exchange::Timeframe::M1), // 默认值，实际应该从 pane 获取
-                    )
-                }
-                (FetchedData::Klines { data: klines, .. }, StreamKind::Kline { timeframe, .. }) => {
-                    let from = klines.first().map(|k| k.time).unwrap_or(0);
-                    // Kline 的 time 是开始时间，结束时间需要根据 timeframe 计算
-                    let interval_ms = timeframe.to_milliseconds();
-                    let to = klines.last().map(|k| k.time + interval_ms).unwrap_or(0);
-                    (
-                        FetchRange::Kline(from, to),
-                        data::chart::Basis::Time(*timeframe),
-                    )
-                }
-                (FetchedData::OI { data: oi, .. }, StreamKind::Kline { timeframe, .. }) => {
-                    let from = oi.first().map(|o| o.time).unwrap_or(0);
-                    let to = oi.last().map(|o| o.time).unwrap_or(0);
-                    (
-                        FetchRange::OpenInterest(from, to),
-                        data::chart::Basis::Time(*timeframe),
-                    )
-                }
-                _ => {
-                    // 不支持的数据类型
-                    return;
-                }
-            };
-            
-            let key = unified_data_manager::DataKey::new(ticker_info, range, basis);
-            
-            // 通知 UnifiedDataManager 数据已到达，获取订阅者列表
-            let subscribers = data_manager.on_data_fetched(key.clone(), data.clone());
-            
-            if !subscribers.is_empty() {
-                log::debug!(
-                    "UnifiedDataManager: Data fetched for key {:?}, notifying {} subscribers",
-                    key,
-                    subscribers.len()
-                );
-                
-                // 通过 ChartRegistry 找到所有订阅者对应的 pane，并分发数据
-                if let Some(registry) = &self.chart_registry {
-                    for subscriber_id in subscribers {
-                        if let Some(metadata) = registry.get_metadata(subscriber_id) {
-                            // 数据已经通过原有逻辑分发给请求者了
-                            // 这里主要是记录日志，表明数据已缓存并可供其他订阅者使用
-                            log::debug!(
-                                "UnifiedDataManager: Subscriber {} (pane_id={}, type={:?}) can now use cached data",
-                                subscriber_id,
-                                metadata.pane_id,
-                                metadata.chart_type
-                            );
-                        }
-                    }
+            // 通过 ChartRegistry 找到所有订阅者对应的 pane，并分发数据
+            for subscriber_id in subscribers {
+                if let Some(metadata) = self.chart_registry.get_metadata(subscriber_id) {
+                    // 数据已经通过原有逻辑分发给请求者了
+                    // 这里主要是记录日志，表明数据已缓存并可供其他订阅者使用
+                    log::debug!(
+                        "UnifiedDataManager: Subscriber {} (pane_id={}, type={:?}) can now use cached data",
+                        subscriber_id,
+                        metadata.pane_id,
+                        metadata.chart_type
+                    );
                 }
             }
         }
@@ -275,18 +258,21 @@ impl Dashboard {
             );
         }
 
+        let data_manager = std::sync::Arc::new(unified_data_manager::UnifiedDataManager::new(1000));
+        let chart_registry = chart_registry::ChartRegistry::new(data_manager.clone());
+        
         let mut dashboard = Self {
             panes,
             focus: None,
             streams: UniqueStreams::default(),
             popout,
             layout_id,
-            // 新架构组件默认不启用
-            unified_data_manager: None,
-            chart_registry: None,
+            // 新架构组件（始终启用）
+            unified_data_manager: data_manager,
+            chart_registry,
         };
         
-        // 尝试初始化新架构（如果环境变量启用）
+        // 记录初始化日志
         dashboard.init_unified_data_manager();
         
         dashboard
@@ -1093,9 +1079,7 @@ impl Dashboard {
         stream_type: StreamKind,
     ) -> Task<Message> {
         // 新架构：分发数据到 UnifiedDataManager
-        if let Some(data_manager) = &self.unified_data_manager {
-            self.distribute_to_unified_manager(&data, &stream_type);
-        }
+        self.distribute_to_unified_manager(&data, &stream_type);
         
         match data {
             FetchedData::Trades { batch, until_time } => {
@@ -1148,11 +1132,20 @@ impl Dashboard {
                         // 初始加载后（req_id 为 None），触发 invalidate 以加载更多历史数据
                         // 这确保 missing_data_task 会被调用，从而加载完整的可见范围数据
                         if req_id.is_none() {
-                            if let Some(action) = pane_state.invalidate(Instant::now()) {
-                                // 如果 invalidate 返回了 Action，需要通过 tick 来处理
-                                // 但这里我们无法直接处理，所以先记录日志
-                                // 实际上，tick 会在下一帧自动调用，所以这里不需要特殊处理
-                                log::debug!("KlineChart::invalidate returned action after initial load, will be processed in next tick");
+                            log::info!(
+                                "distribute_fetched_data: Initial load complete, triggering invalidate for pane_id={}",
+                                pane_id
+                            );
+                            // 触发 invalidate，返回的 Action 会在下一帧的 tick 中处理
+                            // 但为了确保数据能尽快加载，我们也可以直接调用一次 tick
+                            if pane_state.invalidate(Instant::now()).is_some() {
+                                log::debug!(
+                                    "distribute_fetched_data: invalidate returned Some(action)"
+                                );
+                            } else {
+                                log::debug!(
+                                    "distribute_fetched_data: invalidate returned None"
+                                );
                             }
                         }
                     }
@@ -1498,11 +1491,9 @@ impl Dashboard {
         stream: Option<StreamKind>,
         basis: data::chart::Basis, // 精确的 basis
     ) -> Task<Message> {
-        // 如果新架构已启用，先检查缓存和去重（不需要 state）
-        if let Some(data_manager) = &self.unified_data_manager {
-            if let Some(registry) = &self.chart_registry {
-                if let Some(subscriber_id) = registry.get_subscriber_id(pane_id) {
-                    if let Some(metadata) = registry.get_metadata(subscriber_id) {
+        // 先检查缓存和去重（不需要 state）
+        if let Some(subscriber_id) = self.chart_registry.get_subscriber_id(pane_id) {
+            if let Some(metadata) = self.chart_registry.get_metadata(subscriber_id) {
                         // 需要从 state 中提取信息来构建 DataKey，但先尝试从 stream 中获取
                         let ticker_info = stream.and_then(|s| match s {
                             StreamKind::Kline { ticker_info, .. } => Some(ticker_info),
@@ -1513,7 +1504,7 @@ impl Dashboard {
                         if let Some(ti) = ticker_info {
                             // 使用传入的精确 basis（而不是默认值）
                             let key = unified_data_manager::DataKey::new(ti, fetch, basis);
-                            let result = data_manager.request_data(key.clone(), subscriber_id, &metadata.requirements);
+                            let result = self.unified_data_manager.request_data(key.clone(), subscriber_id, &metadata.requirements);
                             
                             match result {
                                 unified_data_manager::RequestResult::Cached(data) => {
@@ -1564,8 +1555,6 @@ impl Dashboard {
                         }
                     }
                 }
-            }
-        }
         
         // 执行实际 fetch（需要获取 state）
         if let Some(state) = self.get_mut_pane(main_window, window_id, pane_grid) {
@@ -1750,13 +1739,11 @@ impl Dashboard {
     ) -> Task<Message> {
         let pane_id = state.unique_id();
         
-        // 如果新架构已启用，先通过 UnifiedDataManager 检查缓存和去重
-        if let Some(data_manager) = &self.unified_data_manager {
-            if let Some(registry) = &self.chart_registry {
-                if let Some(subscriber_id) = registry.get_subscriber_id(pane_id) {
-                    if let Some(metadata) = registry.get_metadata(subscriber_id) {
-                        // 构建 DataKey
-                        let ticker_info = match state.stream_pair() {
+        // 先通过 UnifiedDataManager 检查缓存和去重
+        if let Some(subscriber_id) = self.chart_registry.get_subscriber_id(pane_id) {
+            if let Some(metadata) = self.chart_registry.get_metadata(subscriber_id) {
+                // 构建 DataKey
+                let ticker_info = match state.stream_pair() {
                             Some(ti) => ti,
                             None => {
                                 // 从 stream 中提取 ticker_info
@@ -1783,10 +1770,10 @@ impl Dashboard {
                                     }
                                 }
                             }
-                        };
-                        
-                        // 确定 basis
-                        let basis = match &state.content {
+                };
+                
+                // 确定 basis
+                let basis = match &state.content {
                             pane::Content::Kline { chart: Some(c), .. } => {
                                 // 使用 KlineChart 的公共方法获取 basis
                                 c.basis()
@@ -1804,34 +1791,32 @@ impl Dashboard {
                                 });
                                 data::chart::Basis::Time(timeframe)
                             }
-                        };
-                        
-                        let key = unified_data_manager::DataKey::new(ticker_info, fetch, basis);
-                        let result = data_manager.request_data(key.clone(), subscriber_id, &metadata.requirements);
-                        
-                        match result {
-                            unified_data_manager::RequestResult::Cached(data) => {
-                                // 数据已缓存，直接分发给图表
-                                log::debug!("UnifiedDataManager: Using cached data for pane_id={}", pane_id);
-                                return self.distribute_fetched_data(
-                                    main_window,
-                                    pane_id,
-                                    (*data).clone(),
-                                    stream.unwrap_or_else(|| {
-                                        state.streams.find_ready_map(|s| Some(*s)).unwrap()
-                                    }),
-                                );
-                            }
-                            unified_data_manager::RequestResult::Pending => {
-                                // 请求已在进行中，等待完成
-                                log::debug!("UnifiedDataManager: Request already pending for pane_id={}", pane_id);
-                                return Task::none();
-                            }
-                            unified_data_manager::RequestResult::NewRequest(_) => {
-                                // 需要发起新请求，继续执行实际 fetch
-                                log::debug!("UnifiedDataManager: New request needed for pane_id={}", pane_id);
-                            }
-                        }
+                };
+                
+                let key = unified_data_manager::DataKey::new(ticker_info, fetch, basis);
+                let result = self.unified_data_manager.request_data(key.clone(), subscriber_id, &metadata.requirements);
+                
+                match result {
+                    unified_data_manager::RequestResult::Cached(data) => {
+                        // 数据已缓存，直接分发给图表
+                        log::debug!("UnifiedDataManager: Using cached data for pane_id={}", pane_id);
+                        return self.distribute_fetched_data(
+                            main_window,
+                            pane_id,
+                            (*data).clone(),
+                            stream.unwrap_or_else(|| {
+                                state.streams.find_ready_map(|s| Some(*s)).unwrap()
+                            }),
+                        );
+                    }
+                    unified_data_manager::RequestResult::Pending => {
+                        // 请求已在进行中，等待完成
+                        log::debug!("UnifiedDataManager: Request already pending for pane_id={}", pane_id);
+                        return Task::none();
+                    }
+                    unified_data_manager::RequestResult::NewRequest(_) => {
+                        // 需要发起新请求，继续执行实际 fetch
+                        log::debug!("UnifiedDataManager: New request needed for pane_id={}", pane_id);
                     }
                 }
             }
@@ -1910,8 +1895,22 @@ fn kline_fetch_task(
                 let start_time = now.saturating_sub(days_ago * 24 * 60 * 60 * 1000);
                 // 对齐到 interval 边界
                 let aligned_start = (start_time / interval_ms) * interval_ms;
-                Some((aligned_start, now))
+                let calculated_range = Some((aligned_start, now));
+                log::info!(
+                    "kline_fetch_task: Initial load (req_id=None), calculated range=({}, {}), timeframe={:?}, ticker={:?}",
+                    aligned_start,
+                    now,
+                    timeframe,
+                    ticker_info.ticker
+                );
+                calculated_range
             } else {
+                log::debug!(
+                    "kline_fetch_task: Incremental load (req_id={:?}), range={:?}, timeframe={:?}",
+                    req_id,
+                    range,
+                    timeframe
+                );
                 range
             };
             
@@ -1920,6 +1919,12 @@ fn kline_fetch_task(
                     .map_err(|err| err.to_user_message()),
                 move |result| match result {
                     Ok(klines) => {
+                        log::info!(
+                            "kline_fetch_task: Fetched {} klines, req_id={:?}, timeframe={:?}",
+                            klines.len(),
+                            req_id,
+                            timeframe
+                        );
                         let data = FetchedData::Klines {
                             data: klines,
                             req_id,
@@ -1932,6 +1937,11 @@ fn kline_fetch_task(
                         }
                     }
                     Err(err) => {
+                        log::error!(
+                            "kline_fetch_task: Fetch failed, req_id={:?}, error={}",
+                            req_id,
+                            err
+                        );
                         Message::ErrorOccurred(Some(pane_id), DashboardError::Fetch(err.to_string()))
                     }
                 },

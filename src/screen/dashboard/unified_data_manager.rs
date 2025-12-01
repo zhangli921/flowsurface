@@ -149,9 +149,8 @@ impl GlobalRequestDeduplicator {
 
 /// 统一数据管理器
 pub struct UnifiedDataManager {
-    // 原始数据缓存
-    raw_trades_cache: Arc<RwLock<HashMap<DataKey, Arc<Vec<Trade>>>>>,
-    raw_klines_cache: Arc<RwLock<HashMap<DataKey, Arc<Vec<Kline>>>>>,
+    // 原始数据缓存（存储完整的 FetchedData，避免克隆）
+    fetched_data_cache: Arc<RwLock<HashMap<DataKey, Arc<FetchedData>>>>,
     
     // 请求去重
     deduplicator: GlobalRequestDeduplicator,
@@ -166,8 +165,7 @@ pub struct UnifiedDataManager {
 impl UnifiedDataManager {
     pub fn new(max_cache_size: usize) -> Self {
         Self {
-            raw_trades_cache: Arc::new(RwLock::new(HashMap::new())),
-            raw_klines_cache: Arc::new(RwLock::new(HashMap::new())),
+            fetched_data_cache: Arc::new(RwLock::new(HashMap::new())),
             deduplicator: GlobalRequestDeduplicator::new(),
             subscribers: Arc::new(RwLock::new(HashMap::new())),
             max_cache_size,
@@ -191,25 +189,17 @@ impl UnifiedDataManager {
         subscriber: SubscriberId,
         requirements: &DataRequirements,
     ) -> RequestResult {
-        // 1. 检查缓存
-        if requirements.needs_trades {
-            if let Some(cached) = self.raw_trades_cache.read().unwrap().get(&key) {
-                return RequestResult::Cached(Arc::new(FetchedData::Trades {
-                    batch: (**cached).clone(),
-                    until_time: match key.range {
-                        FetchRange::Trades(_, to) => to,
-                        _ => 0,
-                    },
-                }));
-            }
-        }
-        
-        if requirements.needs_klines {
-            if let Some(cached) = self.raw_klines_cache.read().unwrap().get(&key) {
-                return RequestResult::Cached(Arc::new(FetchedData::Klines {
-                    data: (**cached).clone(),
-                    req_id: None,
-                }));
+        // 1. 检查缓存（直接返回 Arc<FetchedData>，避免克隆）
+        if let Some(cached) = self.fetched_data_cache.read().unwrap().get(&key) {
+            // 检查缓存的数据类型是否符合需求
+            let matches_requirement = match (&**cached, requirements) {
+                (FetchedData::Trades { .. }, req) => req.needs_trades,
+                (FetchedData::Klines { .. }, req) => req.needs_klines,
+                (FetchedData::OI { .. }, req) => req.needs_open_interest,
+            };
+            
+            if matches_requirement {
+                return RequestResult::Cached(cached.clone());
             }
         }
         
@@ -238,27 +228,13 @@ impl UnifiedDataManager {
     
     /// 数据到达后更新缓存并返回订阅者列表
     pub fn on_data_fetched(&self, key: DataKey, data: FetchedData) -> Vec<SubscriberId> {
-        // 1. 更新缓存
-        match &data {
-            FetchedData::Trades { batch, .. } => {
-                let mut cache = self.raw_trades_cache.write().unwrap();
-                cache.insert(key.clone(), Arc::new(batch.clone()));
-                
-                // 清理过期缓存
-                if cache.len() > self.max_cache_size {
-                    self.cleanup_cache(&mut cache);
-                }
-            }
-            FetchedData::Klines { data, .. } => {
-                let mut cache = self.raw_klines_cache.write().unwrap();
-                cache.insert(key.clone(), Arc::new(data.clone()));
-                
-                // 清理过期缓存
-                if cache.len() > self.max_cache_size {
-                    self.cleanup_cache(&mut cache);
-                }
-            }
-            _ => {}
+        // 1. 更新缓存（直接存储 Arc<FetchedData>，避免克隆）
+        let mut cache = self.fetched_data_cache.write().unwrap();
+        cache.insert(key.clone(), Arc::new(data));
+        
+        // 清理过期缓存
+        if cache.len() > self.max_cache_size {
+            self.cleanup_cache(&mut cache);
         }
         
         // 2. 获取所有订阅者
@@ -273,7 +249,7 @@ impl UnifiedDataManager {
     /// 清理缓存：移除最久未访问的项
     /// 
     /// 策略：当缓存超过最大大小时，移除最旧的 10% 的项
-    fn cleanup_cache<T>(&self, cache: &mut HashMap<DataKey, Arc<T>>) {
+    fn cleanup_cache(&self, cache: &mut HashMap<DataKey, Arc<FetchedData>>) {
         if cache.len() <= self.max_cache_size {
             return;
         }

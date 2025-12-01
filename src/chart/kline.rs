@@ -34,6 +34,12 @@ use std::hash::{Hash, Hasher};
 use std::cell::RefCell;
 use uuid::Uuid;
 
+// 常量定义
+const ONE_DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const DEFAULT_DAYS_AGO: u64 = 7;
+const MIN_DATAPOINTS_FOR_PROACTIVE_FETCH: usize = 10;
+const MIN_DATAPOINTS_TO_EXTEND: u64 = 100;
+
 // 新架构：可选的 ChartDataManager trait 实现（暂未启用）
 #[cfg(feature = "unified_data_manager")]
 use crate::screen::dashboard::chart_traits::ChartDataManager;
@@ -97,9 +103,39 @@ impl Chart for KlineChart {
             Basis::Time(timeframe) => {
                 let interval = timeframe.to_milliseconds();
 
+                let earliest_raw = chart.x_to_interval(region.x);
+                let latest_raw = chart.x_to_interval(region.x + region.width);
+                
                 let (earliest, latest) = (
-                    chart.x_to_interval(region.x).saturating_sub(interval / 2),
-                    chart.x_to_interval(region.x + region.width).saturating_add(interval / 2),
+                    earliest_raw.saturating_sub(interval / 2),
+                    latest_raw.saturating_add(interval / 2),
+                );
+
+                // 验证计算结果是否合理
+                if Self::is_invalid_timerange(earliest, latest) {
+                    let chart_kind = Self::chart_kind_str(&self.kind);
+                    log::warn!(
+                        "[{}] visible_timerange: Invalid result detected, earliest={}, latest={}, returning None",
+                        chart_kind,
+                        earliest,
+                        latest
+                    );
+                    return None;
+                }
+
+                // 仅在 trace 级别记录详细计算过程
+                log::trace!(
+                    "[{}] visible_timerange: region=({}, {}), translation.x={}, latest_x={}, cell_width={}, earliest_raw={}, latest_raw={}, result=({}, {})",
+                    Self::chart_kind_str(&self.kind),
+                    region.x,
+                    region.width,
+                    chart.translation.x,
+                    chart.latest_x,
+                    chart.cell_width,
+                    earliest_raw,
+                    latest_raw,
+                    earliest,
+                    latest
                 );
 
                 Some((earliest, latest))
@@ -248,6 +284,42 @@ pub struct KlineChart {
 }
 
 impl KlineChart {
+    /// 检查时间范围是否无效
+    fn is_invalid_timerange(earliest: u64, latest: u64) -> bool {
+        (earliest == 0 && latest < ONE_DAY_MS) || earliest > latest
+    }
+
+    /// 获取图表类型字符串（用于日志）
+    fn chart_kind_str(kind: &KlineChartKind) -> &'static str {
+        match kind {
+            KlineChartKind::Footprint { .. } => "Footprint",
+            KlineChartKind::Candles { .. } => "Candles",
+        }
+    }
+
+    /// 计算默认时间范围（当 visible_timerange 无效时使用）
+    fn calculate_default_timerange(
+        kline_earliest: u64,
+        kline_latest: u64,
+        timeframe_ms: u64,
+    ) -> (u64, u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        
+        if kline_latest > 0 {
+            // 如果有数据，使用数据范围扩展（至少 100 根 K 线）
+            let span = timeframe_ms * MIN_DATAPOINTS_TO_EXTEND;
+            (kline_earliest.saturating_sub(span), now)
+        } else {
+            // 如果没有数据，使用当前时间向前推 7 天
+            let start_time = now.saturating_sub(DEFAULT_DAYS_AGO * ONE_DAY_MS);
+            let aligned_start = (start_time / timeframe_ms) * timeframe_ms;
+            (aligned_start, now)
+        }
+    }
+
     pub fn new(
         layout: ViewConfig,
         basis: Basis,
@@ -433,28 +505,104 @@ impl KlineChart {
     }
 
     fn missing_data_task(&mut self) -> Option<Action> {
+        let chart_kind = Self::chart_kind_str(&self.kind);
+        
         match &self.data_source {
             PlotData::TimeBased(timeseries) => {
                 let timeframe_ms = timeseries.interval.to_milliseconds();
-
-                let (visible_earliest, visible_latest) = self.visible_timerange()?;
                 let (kline_earliest, kline_latest) = timeseries.timerange();
+                let datapoint_count = timeseries.datapoints.len();
+
+                log::trace!(
+                    "[{}] missing_data_task: called, datapoints={}, kline_range=({}, {})",
+                    chart_kind,
+                    datapoint_count,
+                    kline_earliest,
+                    kline_latest
+                );
+
+                // 计算可见时间范围，如果无效则使用默认范围
+                let (visible_earliest, visible_latest) = self.visible_timerange()
+                    .filter(|(e, l)| !Self::is_invalid_timerange(*e, *l))
+                    .unwrap_or_else(|| {
+                        Self::calculate_default_timerange(kline_earliest, kline_latest, timeframe_ms)
+                    });
+                
                 let earliest = visible_earliest.saturating_sub(visible_latest - visible_earliest);
 
                 if timeseries.datapoints.is_empty() {
                     let range = FetchRange::Kline(earliest, visible_latest + timeframe_ms);
+                    log::info!(
+                        "[{}] missing_data_task: datapoints empty, requesting range=({}, {})",
+                        chart_kind,
+                        earliest,
+                        visible_latest + timeframe_ms
+                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
                 }
 
                 // priority 1, basic kline data fetch
+                // 检查是否需要加载更早的数据
                 if visible_earliest < kline_earliest {
                     let range = FetchRange::Kline(earliest, kline_earliest);
+                    log::info!(
+                        "[{}] missing_data_task: need earlier data, requesting range=({}, {})",
+                        chart_kind,
+                        earliest,
+                        kline_earliest
+                    );
                     if let Some(action) = request_fetch(&mut self.request_handler, range) {
                         return Some(action);
                     }
                 }
+                
+                // 检查是否需要加载更新的数据（如果可见范围延伸到未来）
+                if kline_latest < visible_latest {
+                    let range = FetchRange::Kline(kline_latest, visible_latest + timeframe_ms);
+                    log::info!(
+                        "[{}] missing_data_task: need later data, requesting range=({}, {})",
+                        chart_kind,
+                        kline_latest,
+                        visible_latest + timeframe_ms
+                    );
+                    if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                        return Some(action);
+                    }
+                }
+                
+                // 如果只有很少的数据（少于 10 根 K 线），且可见范围较大，主动加载更多数据
+                // 这解决了初始加载时只返回一根 K 线的问题
+                let datapoint_count = timeseries.datapoints.len();
+                if datapoint_count > 0 && datapoint_count < 10 {
+                    let data_span = kline_latest.saturating_sub(kline_earliest);
+                    let visible_span = visible_latest.saturating_sub(visible_earliest);
+                    
+                    // 如果可见范围远大于已有数据范围，加载更多数据
+                    if visible_span > data_span * 2 {
+                        // 加载从 earliest 到 visible_latest 的数据
+                        let range = FetchRange::Kline(earliest, visible_latest + timeframe_ms);
+                        log::info!(
+                            "[{}] missing_data_task: datapoints too few ({}), visible_span={}, data_span={}, requesting range=({}, {})",
+                            chart_kind,
+                            datapoint_count,
+                            visible_span,
+                            data_span,
+                            earliest,
+                            visible_latest + timeframe_ms
+                        );
+                        if let Some(action) = request_fetch(&mut self.request_handler, range) {
+                            return Some(action);
+                        }
+                    }
+                }
+                
+                log::debug!(
+                    "[{}] missing_data_task: no data fetch needed, datapoints={}",
+                    chart_kind,
+                    datapoint_count
+                );
 
                 // priority 2, trades fetch
                 let needs_trades = match &self.kind {
