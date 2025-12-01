@@ -3,12 +3,9 @@ pub mod panel;
 pub mod sidebar;
 pub mod tickers_table;
 
-// 新架构模块（暂未启用）
-#[allow(dead_code)]
+// 新架构模块
 pub mod unified_data_manager;
-#[allow(dead_code)]
 pub mod chart_registry;
-#[allow(dead_code)]
 pub mod chart_traits;
 
 pub use sidebar::Sidebar;
@@ -69,10 +66,8 @@ pub struct Dashboard {
     pub streams: UniqueStreams,
     layout_id: uuid::Uuid,
     
-    // 新架构组件（暂未启用）
-    #[allow(dead_code)]
+    // 新架构组件
     unified_data_manager: Option<std::sync::Arc<unified_data_manager::UnifiedDataManager>>,
-    #[allow(dead_code)]
     chart_registry: Option<chart_registry::ChartRegistry>,
 }
 
@@ -107,38 +102,22 @@ pub enum Event {
 }
 
 impl Dashboard {
-    /// 初始化新架构组件
-    /// 
-    /// 默认启用。可以通过环境变量 `FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=false` 来禁用
+    /// 初始化新架构组件（始终启用）
     pub fn init_unified_data_manager(&mut self) {
         // 如果已经初始化，直接返回，避免重复初始化和日志
         if self.unified_data_manager.is_some() {
             return;
         }
         
-        // 检查环境变量（默认启用，除非明确设置为 false）
-        let enabled = std::env::var("FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER")
-            .map(|v| v != "false" && v != "0" && v != "no")
-            .unwrap_or(true);  // 默认启用
+        let data_manager = std::sync::Arc::new(
+            unified_data_manager::UnifiedDataManager::new(1000) // 最大缓存 1000 项
+        );
+        let chart_registry = chart_registry::ChartRegistry::new(data_manager.clone());
         
-        if enabled {
-            let data_manager = std::sync::Arc::new(
-                unified_data_manager::UnifiedDataManager::new(1000) // 最大缓存 1000 项
-            );
-            let chart_registry = chart_registry::ChartRegistry::new(data_manager.clone());
-            
-            self.unified_data_manager = Some(data_manager);
-            self.chart_registry = Some(chart_registry);
-            
-            log::info!("UnifiedDataManager initialized (enabled by default)");
-        } else {
-            log::debug!("UnifiedDataManager disabled via environment variable");
-        }
-    }
-    
-    /// 检查新架构是否已启用
-    pub fn is_unified_data_manager_enabled(&self) -> bool {
-        self.unified_data_manager.is_some()
+        self.unified_data_manager = Some(data_manager);
+        self.chart_registry = Some(chart_registry);
+        
+        log::info!("UnifiedDataManager initialized");
     }
     
     /// 注册图表到 ChartRegistry（如果新架构已启用）
@@ -417,11 +396,9 @@ impl Dashboard {
                     self.panes.restore();
                 }
                 pane::Message::ReplacePane(pane) => {
-                    // 注销图表（如果新架构已启用）
-                    if self.is_unified_data_manager_enabled() {
-                        if let Some(state) = self.get_pane(main_window.id, window, pane) {
-                            self.unregister_chart_by_pane(state.unique_id());
-                        }
+                    // 注销图表
+                    if let Some(state) = self.get_pane(main_window.id, window, pane) {
+                        self.unregister_chart_by_pane(state.unique_id());
                     }
                     if let Some(pane) = self.panes.get_mut(pane) {
                         *pane = pane::State::new();
@@ -922,13 +899,11 @@ impl Dashboard {
         }
 
         if let Some((window, selected_pane)) = self.focus {
-            // 先注销旧的图表（如果新架构已启用）
+            // 先注销旧的图表
             let pane_id = if let Some(state) = self.get_pane(main_window, window, selected_pane) {
                 let id = state.unique_id();
-                if self.is_unified_data_manager_enabled() {
-                    drop(state);  // 释放不可变借用
-                    self.unregister_chart_by_pane(id);
-                }
+                drop(state);  // 释放不可变借用
+                self.unregister_chart_by_pane(id);
                 id
             } else {
                 return Task::none();
@@ -944,10 +919,8 @@ impl Dashboard {
                 let streams = state.set_content_and_streams(vec![ticker_info], content_kind);
                 drop(state);  // 释放可变借用
 
-                // 注册新创建的图表（如果新架构已启用）
-                if self.is_unified_data_manager_enabled() {
-                    self.register_charts_in_pane(main_window, window, selected_pane);
-                }
+                // 注册新创建的图表
+                self.register_charts_in_pane(main_window, window, selected_pane);
 
                 self.streams.extend(streams.iter());
 
@@ -1119,7 +1092,7 @@ impl Dashboard {
         data: FetchedData,
         stream_type: StreamKind,
     ) -> Task<Message> {
-        // 新架构：如果 UnifiedDataManager 已启用，先分发数据
+        // 新架构：分发数据到 UnifiedDataManager
         if let Some(data_manager) = &self.unified_data_manager {
             self.distribute_to_unified_manager(&data, &stream_type);
         }
@@ -1471,171 +1444,6 @@ impl Dashboard {
     }
 }
 
-/// 原有的数据请求逻辑（保留作为后备）
-fn request_fetch_legacy(
-    state: &mut pane::State,
-    layout_id: uuid::Uuid,
-    req_id: uuid::Uuid,
-    fetch: FetchRange,
-    stream: Option<StreamKind>,
-) -> Task<Message> {
-    let pane_id = state.unique_id();
-
-    match fetch {
-        FetchRange::Kline(from, to) => {
-            let kline_stream = {
-                if let Some(s) = stream {
-                    Some((s, pane_id))
-                } else {
-                    state.streams.find_ready_map(|stream| {
-                        if let StreamKind::Kline { .. } = stream {
-                            Some((*stream, pane_id))
-                        } else {
-                            None
-                        }
-                    })
-                }
-            };
-
-            if let Some((stream, pane_uid)) = kline_stream {
-                return kline_fetch_task(
-                    layout_id,
-                    pane_uid,
-                    stream,
-                    Some(req_id),
-                    Some((from, to)),
-                );
-            }
-        }
-        FetchRange::OpenInterest(from, to) => {
-            let kline_stream = {
-                if let Some(s) = stream {
-                    Some((s, pane_id))
-                } else {
-                    state.streams.find_ready_map(|stream| {
-                        if let StreamKind::Kline { .. } = stream {
-                            Some((*stream, pane_id))
-                        } else {
-                            None
-                        }
-                    })
-                }
-            };
-
-            if let Some((stream, pane_uid)) = kline_stream {
-                return oi_fetch_task(layout_id, pane_uid, stream, Some(req_id), Some((from, to)));
-            }
-        }
-        FetchRange::Trades(from_time, to_time) => {
-            log::debug!(
-                "request_fetch_legacy: Starting trades fetch, range: Trades({}, {})",
-                from_time,
-                to_time
-            );
-            let trade_info = state.streams.find_ready_map(|stream| {
-                if let StreamKind::DepthAndTrades { ticker_info, .. } = stream {
-                    Some((*ticker_info, pane_id, *stream))
-                } else {
-                    None
-                }
-            });
-
-            if let Some((ticker_info, pane_id, stream)) = trade_info {
-                let is_binance = matches!(
-                    ticker_info.exchange(),
-                    Exchange::BinanceSpot | Exchange::BinanceLinear | Exchange::BinanceInverse
-                );
-
-                if is_binance {
-                    let data_path = data::data_path(Some("market_data/binance/"));
-
-                    log::debug!(
-                        "request_fetch_legacy: Creating trades fetch task for {:?}, from={}, to={}",
-                        ticker_info,
-                        from_time,
-                        to_time
-                    );
-
-                    let (task, handle) = Task::sip(
-                        fetch_trades_batched(ticker_info, from_time, to_time, data_path),
-                        move |batch| {
-                            log::debug!(
-                                "request_fetch_legacy: Received trades batch, count={}",
-                                batch.len()
-                            );
-                            let data = FetchedData::Trades {
-                                batch,
-                                until_time: to_time,
-                            };
-                            Message::DistributeFetchedData {
-                                layout_id,
-                                pane_id,
-                                data,
-                                stream,
-                            }
-                        },
-                        move |result| match result {
-                            Ok(()) => {
-                                log::debug!(
-                                    "request_fetch_legacy: Trades fetch completed successfully for pane_id={}",
-                                    pane_id
-                                );
-                                Message::ChangePaneStatus(pane_id, pane::Status::Ready)
-                            }
-                            Err(err) => {
-                                log::error!(
-                                    "request_fetch_legacy: Trades fetch failed for pane_id={}, error: {}",
-                                    pane_id,
-                                    err
-                                );
-                                Message::ErrorOccurred(
-                                    Some(pane_id),
-                                    DashboardError::Fetch(err.to_string()),
-                                )
-                            }
-                        },
-                    )
-                    .abortable();
-
-                    if let pane::Content::Kline { chart, .. } = &mut state.content
-                        && let Some(c) = chart
-                    {
-                        c.set_handle(handle.abort_on_drop());
-                    }
-
-                    log::debug!("request_fetch_legacy: Trades fetch task created and returned");
-                    return task;
-                } else {
-                    // 原程序逻辑：如果不是 Binance，直接返回 Task::none()，不进行任何转换
-                    // 这样保持与原程序逻辑一致
-                    log::debug!(
-                        "request_fetch_legacy: Exchange {:?} is not Binance, trades fetch not supported (only Binance supports historical trades download)",
-                        ticker_info.exchange()
-                    );
-                    // 重置 fetching_trades 标志，避免卡住
-                    if let pane::Content::Kline { chart, .. } = &mut state.content {
-                        if let Some(c) = chart {
-                            c.reset_request_handler();
-                        }
-                    }
-                }
-            } else {
-                log::debug!(
-                    "request_fetch_legacy: No DepthAndTrades stream found for trades fetch"
-                );
-                // 如果找不到 stream，重置 fetching_trades 标志，避免超时
-                if let pane::Content::Kline { chart, .. } = &mut state.content {
-                    if let Some(c) = chart {
-                        c.reset_request_handler();
-                    }
-                }
-            }
-        }
-    }
-
-    Task::none()
-}
-
 impl Dashboard {
     /// 从 state 中提取精确的 basis
     fn extract_basis_from_state(state: &pane::State) -> data::chart::Basis {
@@ -1746,27 +1554,188 @@ impl Dashboard {
                                     return Task::none();
                                 }
                                 unified_data_manager::RequestResult::NewRequest(_) => {
-                                    // 需要发起新请求，继续执行原有逻辑
+                                    // 需要发起新请求，继续执行实际 fetch
                                     log::debug!("UnifiedDataManager: New request needed for pane_id={}", pane_id);
                                 }
                             }
                         } else {
-                            // 如果无法从 stream 中获取 ticker_info，记录日志并继续执行原有逻辑
-                            log::debug!("UnifiedDataManager: Cannot extract ticker_info from stream, falling back to legacy");
+                            // 如果无法从 stream 中获取 ticker_info，记录警告
+                            log::warn!("UnifiedDataManager: Cannot extract ticker_info from stream for pane_id={}", pane_id);
                         }
                     }
                 }
             }
         }
         
-        // 执行原有逻辑（需要获取 state）
+        // 执行实际 fetch（需要获取 state）
         if let Some(state) = self.get_mut_pane(main_window, window_id, pane_grid) {
-            request_fetch_legacy(state, layout_id, req_id, fetch, stream)
+            Self::create_fetch_task(state, layout_id, req_id, fetch, stream)
         } else {
-            // 如果无法获取 state，且是 trades fetch，需要重置标志
-            // 但这里我们无法访问 chart，所以这个检查在 request_fetch_legacy 中完成
             Task::none()
         }
+    }
+    
+    /// 创建实际的 fetch 任务
+    fn create_fetch_task(
+        state: &mut pane::State,
+        layout_id: uuid::Uuid,
+        req_id: uuid::Uuid,
+        fetch: FetchRange,
+        stream: Option<StreamKind>,
+    ) -> Task<Message> {
+        let pane_id = state.unique_id();
+
+        match fetch {
+            FetchRange::Kline(from, to) => {
+                let kline_stream = {
+                    if let Some(s) = stream {
+                        Some((s, pane_id))
+                    } else {
+                        state.streams.find_ready_map(|stream| {
+                            if let StreamKind::Kline { .. } = stream {
+                                Some((*stream, pane_id))
+                            } else {
+                                None
+                            }
+                        })
+                    }
+                };
+
+                if let Some((stream, pane_uid)) = kline_stream {
+                    return kline_fetch_task(
+                        layout_id,
+                        pane_uid,
+                        stream,
+                        Some(req_id),
+                        Some((from, to)),
+                    );
+                }
+            }
+            FetchRange::OpenInterest(from, to) => {
+                let kline_stream = {
+                    if let Some(s) = stream {
+                        Some((s, pane_id))
+                    } else {
+                        state.streams.find_ready_map(|stream| {
+                            if let StreamKind::Kline { .. } = stream {
+                                Some((*stream, pane_id))
+                            } else {
+                                None
+                            }
+                        })
+                    }
+                };
+
+                if let Some((stream, pane_uid)) = kline_stream {
+                    return oi_fetch_task(layout_id, pane_uid, stream, Some(req_id), Some((from, to)));
+                }
+            }
+            FetchRange::Trades(from_time, to_time) => {
+                log::debug!(
+                    "Creating trades fetch task, range: Trades({}, {})",
+                    from_time,
+                    to_time
+                );
+                let trade_info = state.streams.find_ready_map(|stream| {
+                    if let StreamKind::DepthAndTrades { ticker_info, .. } = stream {
+                        Some((*ticker_info, pane_id, *stream))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some((ticker_info, pane_id, stream)) = trade_info {
+                    let is_binance = matches!(
+                        ticker_info.exchange(),
+                        Exchange::BinanceSpot | Exchange::BinanceLinear | Exchange::BinanceInverse
+                    );
+
+                    if is_binance {
+                        let data_path = data::data_path(Some("market_data/binance/"));
+
+                        log::debug!(
+                            "Creating trades fetch task for {:?}, from={}, to={}",
+                            ticker_info,
+                            from_time,
+                            to_time
+                        );
+
+                        let (task, handle) = Task::sip(
+                            fetch_trades_batched(ticker_info, from_time, to_time, data_path),
+                            move |batch| {
+                                log::debug!(
+                                    "Received trades batch, count={}",
+                                    batch.len()
+                                );
+                                let data = FetchedData::Trades {
+                                    batch,
+                                    until_time: to_time,
+                                };
+                                Message::DistributeFetchedData {
+                                    layout_id,
+                                    pane_id,
+                                    data,
+                                    stream,
+                                }
+                            },
+                            move |result| match result {
+                                Ok(()) => {
+                                    log::debug!(
+                                        "Trades fetch completed successfully for pane_id={}",
+                                        pane_id
+                                    );
+                                    Message::ChangePaneStatus(pane_id, pane::Status::Ready)
+                                }
+                                Err(err) => {
+                                    log::error!(
+                                        "Trades fetch failed for pane_id={}, error: {}",
+                                        pane_id,
+                                        err
+                                    );
+                                    Message::ErrorOccurred(
+                                        Some(pane_id),
+                                        DashboardError::Fetch(err.to_string()),
+                                    )
+                                }
+                            },
+                        )
+                        .abortable();
+
+                        if let pane::Content::Kline { chart, .. } = &mut state.content
+                            && let Some(c) = chart
+                        {
+                            c.set_handle(handle.abort_on_drop());
+                        }
+
+                        log::debug!("Trades fetch task created and returned");
+                        return task;
+                    } else {
+                        log::debug!(
+                            "Exchange {:?} is not Binance, trades fetch not supported (only Binance supports historical trades download)",
+                            ticker_info.exchange()
+                        );
+                        // 重置 fetching_trades 标志，避免卡住
+                        if let pane::Content::Kline { chart, .. } = &mut state.content {
+                            if let Some(c) = chart {
+                                c.reset_request_handler();
+                            }
+                        }
+                    }
+                } else {
+                    log::debug!(
+                        "No DepthAndTrades stream found for trades fetch"
+                    );
+                    // 如果找不到 stream，重置 fetching_trades 标志，避免超时
+                    if let pane::Content::Kline { chart, .. } = &mut state.content {
+                        if let Some(c) = chart {
+                            c.reset_request_handler();
+                        }
+                    }
+                }
+            }
+        }
+
+        Task::none()
     }
     
     /// 请求数据（支持新架构的统一数据管理）
@@ -1806,8 +1775,9 @@ impl Dashboard {
                                         }) {
                                             Some(ti) => ti,
                                             None => {
-                                                log::warn!("Cannot determine ticker_info for UnifiedDataManager, falling back to legacy");
-                                                return request_fetch_legacy(state, layout_id, req_id, fetch, stream);
+                                                log::warn!("Cannot determine ticker_info for UnifiedDataManager, will create fetch task without cache check");
+                                                // 无法确定 ticker_info，直接创建 fetch 任务
+                                                return Self::create_fetch_task(state, layout_id, req_id, fetch, stream);
                                             }
                                         }
                                     }
@@ -1858,7 +1828,7 @@ impl Dashboard {
                                 return Task::none();
                             }
                             unified_data_manager::RequestResult::NewRequest(_) => {
-                                // 需要发起新请求，继续执行原有逻辑
+                                // 需要发起新请求，继续执行实际 fetch
                                 log::debug!("UnifiedDataManager: New request needed for pane_id={}", pane_id);
                             }
                         }
@@ -1867,8 +1837,8 @@ impl Dashboard {
             }
         }
         
-        // 执行原有逻辑
-        request_fetch_legacy(state, layout_id, req_id, fetch, stream)
+        // 执行实际 fetch
+        Self::create_fetch_task(state, layout_id, req_id, fetch, stream)
     }
 }
 
