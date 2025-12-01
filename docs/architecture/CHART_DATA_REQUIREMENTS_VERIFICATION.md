@@ -347,3 +347,4 @@ impl ChartDataManager for Ladder {
 - `needs_depth: false` 对于 Footprint、Candles、Heatmap 是正确的，因为 depth 通过实时 stream 获取
 - 只有 Ladder 标记为 `needs_depth: true`，因为它需要 depth 数据
 
+

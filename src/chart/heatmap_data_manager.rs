@@ -27,3 +27,4 @@ impl ChartDataManager for HeatmapChart {
     // 其他方法使用默认实现
 }
 
+

@@ -100,3 +100,4 @@ if range.0 == 0 && range.1 < one_day_ms {
 2. **清理日志**：问题解决后，可以考虑将部分调试日志改为 `trace` 级别或移除
 3. **统一初始化**：确保 Footprint 和 Candles 图的初始化逻辑一致
 
+

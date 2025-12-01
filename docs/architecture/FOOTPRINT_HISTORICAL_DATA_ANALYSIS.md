@@ -161,3 +161,4 @@ if let Some(missing_keys) = timeseries.check_kline_integrity(visible_earliest, v
    - 是否有 "insert_hist_klines" 的日志？
    - 是否有数据完整性检查的日志？
 
+

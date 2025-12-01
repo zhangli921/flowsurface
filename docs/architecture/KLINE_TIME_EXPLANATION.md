@@ -127,3 +127,4 @@ let to = klines.last().map(|k| k.time + interval_ms).unwrap_or(0);
 - `flowsurface/data/src/aggr/time.rs:210` - 时间对齐逻辑
 - `flowsurface/src/screen/dashboard.rs:189` - UnifiedDataManager 中的时间范围计算
 
+

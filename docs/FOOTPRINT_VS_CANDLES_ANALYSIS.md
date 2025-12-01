@@ -156,3 +156,4 @@ if let Some(id) = req_id {
 2. **改进 `missing_data_task`**：在数据量不足时，主动触发更多数据加载
 3. **统一 Footprint 和 Candles 的初始化逻辑**：确保两者使用相同的数据加载策略
 
+

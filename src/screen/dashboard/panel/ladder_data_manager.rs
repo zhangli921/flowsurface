@@ -26,3 +26,4 @@ impl ChartDataManager for Ladder {
     // 其他方法使用默认实现
 }
 
+

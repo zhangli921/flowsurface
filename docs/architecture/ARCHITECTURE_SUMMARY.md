@@ -267,3 +267,4 @@ let id = dashboard.chart_registry.register_chart(chart, ChartType::NewType);
 
 这是一个**从顶层设计、保证可扩展性**的架构方案。
 
+

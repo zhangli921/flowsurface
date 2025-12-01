@@ -584,3 +584,4 @@ impl ChartDataManager for VolumeProfileChart {
 // 使用：只需注册即可
 // dashboard.create_volume_profile_chart(VolumeProfileChart::new(...));
 
+

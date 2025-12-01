@@ -485,3 +485,4 @@ impl ChartDataManager for VolumeProfileChart {
 - ✅ **类型安全**：Rust 类型系统保证
 - ✅ **向后兼容**：可以逐步迁移
 
+

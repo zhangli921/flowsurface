@@ -170,3 +170,4 @@ if let Some(registry) = &mut dashboard.chart_registry {
 - [ ] 性能监控和指标
 - [ ] 配置持久化
 
+

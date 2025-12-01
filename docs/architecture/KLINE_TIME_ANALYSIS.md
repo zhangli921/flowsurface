@@ -149,3 +149,4 @@ fn interval_to_x(&self, value: u64) -> f32 {
 
 所以，在 `distribute_to_unified_manager()` 中使用 `k.time + interval_ms` 计算 close time 是**正确的**，与原有程序的逻辑完全一致。
 
+

@@ -181,3 +181,4 @@ pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
 3. 如果新架构有问题，修复或临时禁用
 4. 如果问题仍然存在，添加调试日志进行深入诊断
 
+
