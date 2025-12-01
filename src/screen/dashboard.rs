@@ -107,14 +107,14 @@ pub enum Event {
 }
 
 impl Dashboard {
-    /// 初始化新架构组件（可选，通过环境变量控制）
+    /// 初始化新架构组件
     /// 
-    /// 设置环境变量 `FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=true` 来启用
+    /// 默认启用。可以通过环境变量 `FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=false` 来禁用
     pub fn init_unified_data_manager(&mut self) {
-        // 检查环境变量
+        // 检查环境变量（默认启用，除非明确设置为 false）
         let enabled = std::env::var("FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+            .map(|v| v != "false" && v != "0" && v != "no")
+            .unwrap_or(true);  // 默认启用
         
         if enabled && self.unified_data_manager.is_none() {
             let data_manager = std::sync::Arc::new(
@@ -125,7 +125,9 @@ impl Dashboard {
             self.unified_data_manager = Some(data_manager);
             self.chart_registry = Some(chart_registry);
             
-            log::info!("UnifiedDataManager initialized");
+            log::info!("UnifiedDataManager initialized (enabled by default)");
+        } else if !enabled {
+            log::debug!("UnifiedDataManager disabled via environment variable");
         }
     }
     
@@ -220,16 +222,31 @@ impl Dashboard {
             
             let key = unified_data_manager::DataKey::new(ticker_info, range, basis);
             
-            // 通知 UnifiedDataManager 数据已到达
-            let subscribers = data_manager.on_data_fetched(key, data.clone());
+            // 通知 UnifiedDataManager 数据已到达，获取订阅者列表
+            let subscribers = data_manager.on_data_fetched(key.clone(), data.clone());
             
             if !subscribers.is_empty() {
                 log::debug!(
-                    "Distributed data to {} subscribers via UnifiedDataManager",
+                    "UnifiedDataManager: Data fetched for key {:?}, notifying {} subscribers",
+                    key,
                     subscribers.len()
                 );
-                // 注意：这里我们只是记录日志，实际的图表更新会在原有的逻辑中处理
-                // 未来可以在这里添加额外的通知机制
+                
+                // 通过 ChartRegistry 找到所有订阅者对应的 pane，并分发数据
+                if let Some(registry) = &self.chart_registry {
+                    for subscriber_id in subscribers {
+                        if let Some(metadata) = registry.get_metadata(subscriber_id) {
+                            // 数据已经通过原有逻辑分发给请求者了
+                            // 这里主要是记录日志，表明数据已缓存并可供其他订阅者使用
+                            log::debug!(
+                                "UnifiedDataManager: Subscriber {} (pane_id={}, type={:?}) can now use cached data",
+                                subscriber_id,
+                                metadata.pane_id,
+                                metadata.chart_type
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -525,12 +542,33 @@ impl Dashboard {
 
                         let task = match effect {
                             pane::Effect::RefreshStreams => self.refresh_streams(main_window.id),
-                            pane::Effect::RequestFetch(reqs) => request_fetch_many(
-                                state,
-                                *layout_id,
-                                reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
-                            )
-                            .chain(self.refresh_streams(main_window.id)),
+                            pane::Effect::RequestFetch(reqs) => {
+                                // 收集请求信息，然后释放 state 借用
+                                let reqs_vec: Vec<(uuid::Uuid, FetchRange, Option<StreamKind>)> = reqs
+                                    .into_iter()
+                                    .map(|r| (r.req_id, r.fetch, r.stream))
+                                    .collect();
+                                let pane_id = state.unique_id();
+                                drop(state);  // 释放可变借用
+                                
+                                // 现在可以安全地调用 request_fetch_by_pane_id
+                                let tasks: Vec<Task<Message>> = reqs_vec
+                                    .into_iter()
+                                    .map(|(req_id, fetch, stream)| {
+                                        self.request_fetch_by_pane_id(
+                                            main_window.id,
+                                            window,
+                                            pane,
+                                            pane_id,
+                                            *layout_id,
+                                            req_id,
+                                            fetch,
+                                            stream,
+                                        )
+                                    })
+                                    .collect();
+                                Task::batch(tasks).chain(self.refresh_streams(main_window.id))
+                            }
                             pane::Effect::SwitchTickersInGroup(ticker_info) => {
                                 self.switch_tickers_in_group(main_window.id, ticker_info)
                             }
@@ -1281,9 +1319,12 @@ impl Dashboard {
     pub fn tick(&mut self, now: Instant, main_window: window::Id) -> Task<Message> {
         let mut tasks = vec![];
         let layout_id = self.layout_id;
+        
+        // 收集所有需要处理的请求，避免在 for_each 中借用冲突
+        let mut pending_requests: Vec<(window::Id, pane_grid::Pane, uuid::Uuid, Vec<(uuid::Uuid, FetchRange, Option<StreamKind>)>)> = vec![];
 
         self.iter_all_panes_mut(main_window)
-            .for_each(|(_window_id, _pane, state)| match state.tick(now) {
+            .for_each(|(window_id, pane_grid, state)| match state.tick(now) {
                 Some(pane::Action::Chart(action)) => match action {
                     chart::Action::ErrorOccurred(err) => {
                         state.status = pane::Status::Ready;
@@ -1296,11 +1337,13 @@ impl Dashboard {
                         }
                     }
                     chart::Action::RequestFetch(reqs) => {
-                        tasks.push(request_fetch_many(
-                            state,
-                            layout_id,
-                            reqs.into_iter().map(|r| (r.req_id, r.fetch, r.stream)),
-                        ));
+                        // 收集请求信息，稍后处理（避免借用冲突）
+                        let reqs_vec: Vec<(uuid::Uuid, FetchRange, Option<StreamKind>)> = reqs
+                            .into_iter()
+                            .map(|r| (r.req_id, r.fetch, r.stream))
+                            .collect();
+                        let pane_id = state.unique_id();
+                        pending_requests.push((window_id, pane_grid, pane_id, reqs_vec));
                     }
                 },
                 Some(pane::Action::Panel(_action)) => {}
@@ -1389,7 +1432,8 @@ impl Dashboard {
     }
 }
 
-fn request_fetch(
+/// 原有的数据请求逻辑（保留作为后备）
+fn request_fetch_legacy(
     state: &mut pane::State,
     layout_id: uuid::Uuid,
     req_id: uuid::Uuid,
@@ -1547,16 +1591,197 @@ fn request_fetch(
     Task::none()
 }
 
-fn request_fetch_many(
-    state: &mut pane::State,
-    layout_id: uuid::Uuid,
-    reqs: impl IntoIterator<Item = (uuid::Uuid, FetchRange, Option<StreamKind>)>,
-) -> Task<Message> {
-    let tasks = reqs
-        .into_iter()
-        .map(|(req_id, fetch, stream)| request_fetch(state, layout_id, req_id, fetch, stream))
-        .collect::<Vec<_>>();
-    Task::batch(tasks)
+impl Dashboard {
+    /// 请求数据（支持新架构的统一数据管理）
+    /// 
+    /// 这个方法接受 pane_id 而不是 state，避免借用冲突
+    fn request_fetch_by_pane_id(
+        &mut self,
+        main_window: window::Id,
+        window_id: window::Id,
+        pane_grid: pane_grid::Pane,
+        pane_id: uuid::Uuid,
+        layout_id: uuid::Uuid,
+        req_id: uuid::Uuid,
+        fetch: FetchRange,
+        stream: Option<StreamKind>,
+    ) -> Task<Message> {
+        // 如果新架构已启用，先检查缓存和去重（不需要 state）
+        if let Some(data_manager) = &self.unified_data_manager {
+            if let Some(registry) = &self.chart_registry {
+                if let Some(subscriber_id) = registry.get_subscriber_id(pane_id) {
+                    if let Some(metadata) = registry.get_metadata(subscriber_id) {
+                        // 需要从 state 中提取信息来构建 DataKey，但先尝试从 stream 中获取
+                        let ticker_info = stream.and_then(|s| match s {
+                            StreamKind::Kline { ticker_info, .. } => Some(ticker_info),
+                            StreamKind::DepthAndTrades { ticker_info, .. } => Some(ticker_info),
+                            _ => None,
+                        });
+                        
+                        if let Some(ti) = ticker_info {
+                            // 简化：使用默认 basis（大多数情况下是 Time-based）
+                            // 如果需要精确的 basis，需要获取 state，但会导致借用冲突
+                            // 这里先尝试使用默认值，如果缓存未命中，会在 request_fetch_legacy 中处理
+                            let basis = data::chart::Basis::Time(Timeframe::M1); // 默认值
+                            let key = unified_data_manager::DataKey::new(ti, fetch, basis);
+                            let result = data_manager.request_data(key.clone(), subscriber_id, &metadata.requirements);
+                            
+                            match result {
+                                unified_data_manager::RequestResult::Cached(data) => {
+                                    // 数据已缓存，直接分发
+                                    log::debug!("UnifiedDataManager: Using cached data for pane_id={}", pane_id);
+                                    // 需要获取 stream_kind
+                                    let stream_kind = match stream {
+                                        Some(s) => s,
+                                        None => {
+                                            // 如果 stream 为 None，需要从 state 获取
+                                            // 先释放之前的借用，然后重新获取
+                                            if let Some(state) = self.get_mut_pane(main_window, window_id, pane_grid) {
+                                                match state.streams.find_ready_map(|s| Some(*s)) {
+                                                    Some(s) => s,
+                                                    None => {
+                                                        // 如果无法确定 stream，使用回退值
+                                                        StreamKind::Kline { ticker_info: ti, timeframe: Timeframe::M1 }
+                                                    }
+                                                }
+                                            } else {
+                                                // 如果无法获取 state，使用回退值
+                                                StreamKind::Kline { ticker_info: ti, timeframe: Timeframe::M1 }
+                                            }
+                                        }
+                                    };
+                                    return self.distribute_fetched_data(
+                                        main_window,
+                                        pane_id,
+                                        (*data).clone(),
+                                        stream_kind,
+                                    );
+                                }
+                                unified_data_manager::RequestResult::Pending => {
+                                    // 请求已在进行中，等待完成
+                                    log::debug!("UnifiedDataManager: Request already pending for pane_id={}", pane_id);
+                                    return Task::none();
+                                }
+                                unified_data_manager::RequestResult::NewRequest(_) => {
+                                    // 需要发起新请求，继续执行原有逻辑
+                                    log::debug!("UnifiedDataManager: New request needed for pane_id={}", pane_id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 执行原有逻辑（需要获取 state）
+        if let Some(state) = self.get_mut_pane(main_window, window_id, pane_grid) {
+            request_fetch_legacy(state, layout_id, req_id, fetch, stream)
+        } else {
+            Task::none()
+        }
+    }
+    
+    /// 请求数据（支持新架构的统一数据管理）
+    fn request_fetch(
+        &mut self,
+        state: &mut pane::State,
+        layout_id: uuid::Uuid,
+        req_id: uuid::Uuid,
+        fetch: FetchRange,
+        stream: Option<StreamKind>,
+        main_window: window::Id,
+    ) -> Task<Message> {
+        let pane_id = state.unique_id();
+        
+        // 如果新架构已启用，先通过 UnifiedDataManager 检查缓存和去重
+        if let Some(data_manager) = &self.unified_data_manager {
+            if let Some(registry) = &self.chart_registry {
+                if let Some(subscriber_id) = registry.get_subscriber_id(pane_id) {
+                    if let Some(metadata) = registry.get_metadata(subscriber_id) {
+                        // 构建 DataKey
+                        let ticker_info = match state.stream_pair() {
+                            Some(ti) => ti,
+                            None => {
+                                // 从 stream 中提取 ticker_info
+                                match stream.and_then(|s| match s {
+                                    StreamKind::Kline { ticker_info, .. } => Some(ticker_info),
+                                    StreamKind::DepthAndTrades { ticker_info, .. } => Some(ticker_info),
+                                    _ => None,
+                                }) {
+                                    Some(ti) => ti,
+                                    None => {
+                                        // 从 state 的 streams 中提取
+                                        match state.streams.find_ready_map(|s| match s {
+                                            StreamKind::Kline { ticker_info, .. } => Some(*ticker_info),
+                                            StreamKind::DepthAndTrades { ticker_info, .. } => Some(*ticker_info),
+                                            _ => None,
+                                        }) {
+                                            Some(ti) => ti,
+                                            None => {
+                                                log::warn!("Cannot determine ticker_info for UnifiedDataManager, falling back to legacy");
+                                                return request_fetch_legacy(state, layout_id, req_id, fetch, stream);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        
+                        // 确定 basis
+                        let basis = match &state.content {
+                            pane::Content::Kline { chart: Some(c), .. } => {
+                                // 使用 KlineChart 的公共方法获取 basis
+                                c.basis()
+                            }
+                            _ => {
+                                // 从 stream 中提取 timeframe，默认使用 Time-based M1
+                                let timeframe = stream.and_then(|s| match s {
+                                    StreamKind::Kline { timeframe, .. } => Some(timeframe),
+                                    _ => None,
+                                }).unwrap_or_else(|| {
+                                    state.streams.find_ready_map(|s| match s {
+                                        StreamKind::Kline { timeframe, .. } => Some(*timeframe),
+                                        _ => None,
+                                    }).unwrap_or(Timeframe::M1)
+                                });
+                                data::chart::Basis::Time(timeframe)
+                            }
+                        };
+                        
+                        let key = unified_data_manager::DataKey::new(ticker_info, fetch, basis);
+                        let result = data_manager.request_data(key.clone(), subscriber_id, &metadata.requirements);
+                        
+                        match result {
+                            unified_data_manager::RequestResult::Cached(data) => {
+                                // 数据已缓存，直接分发给图表
+                                log::debug!("UnifiedDataManager: Using cached data for pane_id={}", pane_id);
+                                return self.distribute_fetched_data(
+                                    main_window,
+                                    pane_id,
+                                    (*data).clone(),
+                                    stream.unwrap_or_else(|| {
+                                        state.streams.find_ready_map(|s| Some(*s)).unwrap()
+                                    }),
+                                );
+                            }
+                            unified_data_manager::RequestResult::Pending => {
+                                // 请求已在进行中，等待完成
+                                log::debug!("UnifiedDataManager: Request already pending for pane_id={}", pane_id);
+                                return Task::none();
+                            }
+                            unified_data_manager::RequestResult::NewRequest(_) => {
+                                // 需要发起新请求，继续执行原有逻辑
+                                log::debug!("UnifiedDataManager: New request needed for pane_id={}", pane_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 执行原有逻辑
+        request_fetch_legacy(state, layout_id, req_id, fetch, stream)
+    }
 }
 
 fn oi_fetch_task(

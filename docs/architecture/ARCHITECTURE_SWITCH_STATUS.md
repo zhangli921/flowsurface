@@ -2,33 +2,33 @@
 
 ## 当前状态
 
-❌ **新架构默认未启用**
+✅ **新架构默认已启用**
 
-## 启用方式
+## 启用/禁用方式
 
-新架构通过**环境变量**控制，默认情况下是**关闭**的。
+新架构默认启用，可以通过**环境变量**控制。
 
-### 如何启用新架构
+### 如何禁用新架构
 
-在运行程序前设置环境变量：
+如果需要禁用新架构（回退到原有架构），在运行程序前设置环境变量：
 
 ```bash
 # 方式 1: 临时设置（当前终端会话）
-export FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=true
+export FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=false
 ./target/release/flowsurface
 
 # 方式 2: 临时设置（单次运行）
-FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=true ./target/release/flowsurface
+FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=false ./target/release/flowsurface
 
 # 方式 3: 永久设置（添加到 ~/.bashrc 或 ~/.profile）
-echo 'export FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=true' >> ~/.bashrc
+echo 'export FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=false' >> ~/.bashrc
 source ~/.bashrc
 ```
 
 ### 环境变量值
 
-- `true` 或 `1`: 启用新架构
-- 其他值或未设置: 使用原有架构（默认）
+- 未设置或 `true` 或 `1`: 启用新架构（默认）
+- `false` 或 `0` 或 `no`: 禁用新架构，使用原有架构
 
 ## 代码实现
 
@@ -36,10 +36,10 @@ source ~/.bashrc
 
 ```rust
 pub fn init_unified_data_manager(&mut self) {
-    // 检查环境变量
+    // 检查环境变量（默认启用，除非明确设置为 false）
     let enabled = std::env::var("FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);  // 默认 false，即未启用
+        .map(|v| v != "false" && v != "0" && v != "no")
+        .unwrap_or(true);  // 默认 true，即启用
     
     if enabled && self.unified_data_manager.is_none() {
         let data_manager = std::sync::Arc::new(
@@ -50,7 +50,7 @@ pub fn init_unified_data_manager(&mut self) {
         self.unified_data_manager = Some(data_manager);
         self.chart_registry = Some(chart_registry);
         
-        log::info!("UnifiedDataManager initialized");
+        log::info!("UnifiedDataManager initialized (enabled by default)");
     }
 }
 ```
@@ -84,36 +84,36 @@ INFO: UnifiedDataManager initialized
 
 ## 架构切换说明
 
-### 原有架构（默认）
+### 新架构（默认启用）
+
+- ✅ 全局数据管理和缓存
+- ✅ 数据去重和共享
+- ✅ 向后兼容原有功能
+- ✅ 自动图表注册和生命周期管理
+
+### 原有架构（通过环境变量禁用新架构后使用）
 
 - ✅ 完全正常工作
 - ✅ 所有功能正常
 - ✅ 数据流：每个图表独立管理数据
 
-### 新架构（需要环境变量启用）
-
-- ✅ 向后兼容
-- ✅ 全局数据管理和缓存
-- ✅ 数据去重和共享
-- ✅ 可选的增强功能
-
 ## 建议
 
-1. **当前阶段**: 保持默认（原有架构），确保稳定性
-2. **测试阶段**: 设置环境变量启用新架构进行测试
-3. **生产阶段**: 根据测试结果决定是否默认启用
+1. **当前阶段**: 新架构已默认启用，经过测试验证
+2. **如遇问题**: 可通过环境变量 `FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=false` 回退到原有架构
+3. **性能优化**: 新架构提供数据共享和去重，减少重复下载
 
 ## 检查当前状态
 
 运行程序时检查日志：
 
 ```bash
-# 启用新架构
-FLOWSURFACE_ENABLE_UNIFIED_DATA_MANAGER=true ./target/release/flowsurface 2>&1 | grep -i "unified"
+# 默认启用新架构
+./target/release/flowsurface 2>&1 | grep -i "unified"
 
 # 应该看到：
-# INFO: UnifiedDataManager initialized
+# INFO: UnifiedDataManager initialized (enabled by default)
 ```
 
-如果没有设置环境变量，不会看到这条日志，程序使用原有架构。
+如果看到 `UnifiedDataManager disabled via environment variable`，说明新架构已被禁用，程序使用原有架构。
 

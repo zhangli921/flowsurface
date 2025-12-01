@@ -25,7 +25,10 @@ pub struct DataKey {
 
 impl std::hash::Hash for DataKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // 手动实现 Hash，因为 FetchRange 和 Basis 可能没有实现 Hash
+        // TickerInfo 已经实现了 Hash，直接使用（更高效）
+        self.ticker.hash(state);
+        
+        // 手动实现 FetchRange 的 Hash
         match self.range {
             FetchRange::Kline(from, to) => {
                 state.write_u64(from);
@@ -43,10 +46,20 @@ impl std::hash::Hash for DataKey {
                 state.write_u8(2);
             }
         }
-        // TickerInfo 和 Basis 需要实现 Hash 或手动处理
-        // 简化：使用 ticker 的字符串表示
-        format!("{:?}", self.ticker).hash(state);
-        format!("{:?}", self.basis).hash(state);
+        
+        // 手动实现 Basis 的 Hash（避免字符串格式化，提高性能）
+        match self.basis {
+            Basis::Time(timeframe) => {
+                state.write_u8(0);
+                // Timeframe 是一个枚举，使用其 discriminant（更高效）
+                std::mem::discriminant(&timeframe).hash(state);
+            }
+            Basis::Tick(tick_count) => {
+                state.write_u8(1);
+                // TickCount 是一个 u16 包装类型，直接写入值
+                state.write_u16(tick_count.0);
+            }
+        }
     }
 }
 
@@ -201,14 +214,25 @@ impl UnifiedDataManager {
         }
         
         // 2. 检查是否有进行中的请求（全局去重）
-        if let Some(subscribers) = self.deduplicator.check_pending(&key) {
-            // 添加到订阅列表
+        if let Some(existing_subscribers) = self.deduplicator.check_pending(&key) {
+            // 请求已在进行中，将当前订阅者添加到等待列表
             self.deduplicator.register_request(key.clone(), subscriber);
+            log::debug!(
+                "UnifiedDataManager: Request already pending for key {:?}, subscriber {} added to waiting list (total: {})",
+                key,
+                subscriber,
+                existing_subscribers.len() + 1
+            );
             return RequestResult::Pending;
         }
         
         // 3. 创建新请求
         self.deduplicator.register_request(key.clone(), subscriber);
+        log::debug!(
+            "UnifiedDataManager: New request registered for key {:?}, subscriber {}",
+            key,
+            subscriber
+        );
         RequestResult::NewRequest(key)
     }
     
@@ -247,20 +271,29 @@ impl UnifiedDataManager {
     }
     
     /// 清理缓存：移除最久未访问的项
+    /// 
+    /// 策略：当缓存超过最大大小时，移除最旧的 10% 的项
     fn cleanup_cache<T>(&self, cache: &mut HashMap<DataKey, Arc<T>>) {
-        // 简单实现：移除最旧的 10%
-        let to_remove = cache.len() / 10;
-        if to_remove == 0 {
+        if cache.len() <= self.max_cache_size {
             return;
         }
         
-        // 收集所有键
+        // 移除超过部分的 10%，但至少移除 1 个
+        let to_remove = ((cache.len() - self.max_cache_size) / 10).max(1);
+        
+        // 收集所有键（由于没有访问时间跟踪，简单移除前 to_remove 个）
         let keys: Vec<DataKey> = cache.keys().cloned().collect();
         
-        // 移除前 to_remove 个（简化实现）
+        // 移除前 to_remove 个
         for key in keys.into_iter().take(to_remove) {
             cache.remove(&key);
         }
+        
+        log::debug!(
+            "UnifiedDataManager: Cleaned up {} cache entries, remaining: {}",
+            to_remove,
+            cache.len()
+        );
     }
 }
 
